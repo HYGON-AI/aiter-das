@@ -1,0 +1,10 @@
+# Python bytecode cache directories at any depth.
+**/__pycache__/
+
+# Local editor settings and Hygon scratch directories at any depth.
+**/.vscode/
+**/hygon_tmp/
+
+# Rebuild working copies, logs and wheel packages.
+/build/
+/dist/

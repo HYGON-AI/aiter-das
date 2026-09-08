@@ -1,0 +1,1142 @@
+# AITER算子
+
+# 1\. AITER 简介
+
+AI Tensor Engine for ROCm \(AITER\) 是针对 ROCm（Radeon Open Compute）生态系统推出的核心底层架构与计算引擎，专门用于加速人工智能（尤其是深度学习）中的张量计算。
+
+AITER 作为 AI 张量计算引擎，可通过 C\+\+ / PyTorch API 统一整合 CK、Triton、ASM、HIP 等底层加速能力，最大化 HCU 硬件性能。
+
+## 1\.1 编译安装
+
+1\. 代码仓库初始化
+
+AITER 算子库依赖 CK、moe\_c 子模块，首次使用必须初始化子模块：
+
+```Bash
+git submodule update --init
+```
+
+2\. 清理历史编译产物
+
+若存在旧版本编译 / 安装文件，需先彻底清理，避免冲突：
+
+```Bash
+cd aiter
+rm -rf aiter/jit/aiter_.so
+rm -rf aiter/jit/build
+rm -rf aiter/jit/*.so
+rm -rf aiter/jit/jit/build
+rm -rf build
+rm -rf aiter.egg-info
+rm -rf aiter_meta
+# 卸载旧版 aiter
+pip uninstall aiter -y
+```
+
+3\. 开发模式安装
+
+根据目标 GPU 架构指定编译参数，以 **develop 模式** 安装：
+
+```Bash
+# gfx936 对应 BMZ，gfx938 对应 NMZ
+GPU_ARCHS="gfx936;gfx938" python setup.py develop
+```
+
+4\. 编译whl安装包
+
+```Python
+PYTHONUNBUFFERED=1 GPU_ARCHS="gfx936;gfx938" PREBUILD_KERNELS=1 AITER_PREBUILD_LOG_PROGRESS=1 python setup.py bdist_wheel
+```
+
+上述命令执行成功后会在源码 dist 路径下生成aiter whl安装包；
+
+用户需要快速编译，也可参考rebuild\_aiter\.sh，一键编译。
+
+## 1\.2 运行
+
+1\. 开发模式
+
+在aiter源码中可以直接运行相关的测试程序，比如
+
+```Bash
+python op_tests/ci_tests/test_aiter_moe_with_config_w8a8_channelwise.py
+```
+
+2\. whl包安装模式
+
+可先将测试代码的路径导出为python执行路径，再运行：
+
+```Bash
+export PYTHONPATH=. python op_tests/ci_tests/test_aiter_moe_with_config_w8a8_channelwise.py
+```
+
+或者：
+
+```Bash
+python -m op_tests.ci_tests.test_aiter_moe_with_config_w8a8_channelwise
+```
+
+3\. 环境变量使用
+
+**AITER\_LOG\_MORE**：打印aiter关键内部信息与参数
+
+**AITER\_LOG\_OP\_PARAM**：打印关键算子的参数信息，如aiter\_moe
+
+示例：
+
+```Bash
+AITER_LOG_OP_PARAM=1  python op_tests/ci_tests/test_aiter_moe_with_config_w8a8_channelwise.py
+```
+
+# 2\. MoE
+
+**混合专家模型（Mixture of Experts, MoE）** 是一种通过**稀疏激活**机制实现模型容量大幅扩展的神经网络架构。它的核心思想是：用多个小的"专家"网络替代单一巨大的稠密网络，每次只激活其中少数几个专家来处理输入。核心依托 **Token 路由重排 \+ 两阶段融合GEMM** 实现高效稀疏计算，支持多后端、多精度量化与专家并行，可完整覆盖大模型推理全场景。
+
+MoE 层主要由两部分组成：
+
+- **门控网络（Gating / Router）**
+
+    - 作用：决定每个输入 token 应该交给哪些专家处理。
+
+    - 典型操作：对输入做线性投影 → Softmax → 选出 Top\-K 个专家及其权重。
+
+- **专家网络（Experts）**
+
+    - 通常是结构相同、参数独立的前馈网络（FFN）。
+
+    - 每个专家只处理被分配到的 token，未被激活的专家不参与计算。
+
+**核心优势：稀疏激活**
+
+MoE 可以拥有极大的总参数量（从而具备极高的知识容量和上限），但在实际推理或训练时，只消耗极小的激活参数量计算资源，其余专家处于休眠状态，实现性能与效率的权衡。
+
+## 2\.1 算子调用关系
+
+用户使用的最主要的两个moe接口是**`get_aiter_moe_config`****和****`aiter_moe`**，根据 `get_aiter_moe_config` 返回的 `moe_cfg.solution_type`，`aiter_moe` 会走入以下三条路径之一：
+
+### 路径 A: moe\_c 后端
+
+```
+aiter_moe(...)
+└── moe_c_fused_experts(...)
+    ├── (inplace/outplace 分支)
+    └── fused_experts_impl_marlin(...)
+        ├── moe_align_block_size(...) / moe_sorting_ck(...)
+        │   └── aiter.moe_sorting_fwd(...)     
+        ├── invoke_fused_moe_kernel_marlin(...)
+        │   └── aiter.moe_c_moe_gemm_marlin_w4a16(...)   # W4A16 Marlin kernel (GEMM1)
+        ├── moe_c_silu_and_mul(...)            
+        ├── invoke_fused_moe_kernel_marlin(...)
+        │   └── aiter.moe_c_moe_gemm_marlin_w4a16(...)   # W4A16 Marlin kernel (GEMM2)
+        └── triton_moe_sum(...) / moe_c_moe_sum(...)     # reduce
+```
+
+### 路径 B: ASM 后端
+
+```
+aiter_moe(...)
+└── fused_experts_asm_impl(...)
+    ├── moe_sorting_ck(...)
+    │   └── aiter.moe_sorting_fwd(...)
+    ├── aiter.asm_fmoe_stage1(...)           # ASM GEMM1
+    ├── triton_silu_and_mul(...)             # Triton activation
+    ├── aiter.asm_fmoe_stage2(...)           # ASM GEMM2
+    └── triton_moe_sum(...)                  # Triton reduce
+```
+
+### 路径 C: Triton 后端
+
+```
+aiter_moe(...)
+└── fused_experts_impl(...)                 # from ops.triton.fused_moe
+    ├── moe_sorting_ck(...)
+    │   └── aiter.moe_sorting_fwd(...)
+    ├── invoke_fused_moe_kernel(...)        # from ops.triton.moe_op.fused_moe
+    │   └── fused_moe_kernel(...)           # Triton JIT kernel (GEMM1)
+    ├── _apply_activation(...)              # Triton silu_and_mul
+    ├── invoke_fused_moe_kernel(...)
+    │   └── fused_moe_kernel(...)           # Triton JIT kernel (GEMM2)
+    └── triton_moe_sum(...)                 # Triton JIT reduce
+```
+
+## 2\.2 moe算子介绍
+
+### 2\.2\.1 get\_aiter\_moe\_config
+
+#### 功能描述
+
+本接口是 `aiter/moe.py` 中的 **MoE 后端配置选择器**。它根据输入的问题规模、量化类型、数据类型等，按照预设的优先级策略，自动从 **moe\_c / asm / triton / ck** 四个后端中挑选最优实现，并返回对应的调优配置。
+
+- **算子功能：**
+
+1. **Gating 自动推断**：根据 `activation` 自动判断是否为 GLU\-gated（`silu`/`gelu` = gated，`relu2` = non\-gated），并计算实际的 `intermediate_size`（`n = N1 // 2` 或 `n = N1`）。
+
+2. **后端优先级调度**：不同的 `quant_type` × `dtype` 组合对应不同的后端优先级列表。例如：
+
+    - W4A16 \+ BF16 → 优先尝试 ASM，其次 Triton，最后 moe\_c
+
+    - W8A8 \+ channel\-wise → 优先尝试 moe\_c，其次 Triton
+
+    - W8A8 \+ block\-wise → 优先尝试 ASM，其次 Triton
+
+    - 当指定了spec\_sol\_type参数后，将只考虑其指定的后端，其他后端实现忽略
+
+3. **配置匹配**：依次调用各后端的调优配置查询函数（读 CSV / JSON / kernel map），返回第一个匹配成功的配置。
+
+4. **降级保护**：若所有后端均无可用配置，返回 `(False, AiterMoeConfig)`，由调用方决定是否使用默认配置或报错。
+
+#### 参数说明
+
+| 参数              | 类型/默认值                             | 说明                                                                                     |
+| --------------- | ---------------------------------- | -------------------------------------------------------------------------------------- |
+| `M`             | `int`                              | token 数量，通常为输入序列展平后的 token 数。                                                          |
+| `E`             | `int`                              | 专家数量。                                                                                  |
+| `N1`            | `int`                              | GEMM1 输出维度。GLU/gated 场景为 `2 * intermediate_size`；非 gated 场景为 `intermediate_size`。      |
+| `N2`            | `int`                              | GEMM2 输出维度，通常为 `hidden_size`。                                                         |
+| `K`             | `int`                              | GEMM1 输入维度，通常为 `hidden_size`；GEMM2 的 K 通常为 `moe_intermediate_size / TP`。              |
+| `top_k`         | `int`                              | Router 为每个 token 选择的专家数量。                                                              |
+| `block_size`    | `int`                              | 量化 block size；`0` 或空值通常表示 channel-wise，非 0 时生成 `block_shape=[0, block_size]`。          |
+| `dtype`         | `torch.dtype`                      | 输入/计算 dtype，主要用于后端配置匹配，如 `torch.float16`、`torch.bfloat16`。                            |
+| `quant_type`    | `str`                              | 量化类型，支持 `w16a16`、`w4a16`、`int8_w8a8`、`fp8_w8a8`、`w4a8`、`int8_w8a16`。  |
+| `activation`    | `str = "silu"`                     | 激活函数名称；会参与 gated 自动判断，支持 `silu`、`gelu`、`relu2`、`swigluoai`、`swiglustep`、`gelu_tanh` 等。 |
+| `gated`         | `Optional[bool] = None`            | 是否为 GLU/gated 结构；`None` 时根据 `activation` 自动推断。                                         |
+| `spec_sol_type` | `Optional[MoeSolutionType] = None` | 指定后端时只尝试该后端；未指定时按量化类型和 dtype 的优先级选择。                                                   |
+| `use_shuffle`   | `int = 0`                          | ASM 后端配置查询和 `need_shuffle` 判断使用的 shuffle 开关。                                           |
+
+返回值：
+
+| 返回项       | 类型               | 说明                                    |
+| --------- | ---------------- | ------------------------------------- |
+| `status`  | `bool`           | `True` 表示找到可用后端配置；`False` 表示未匹配到可用配置。 |
+| `moe_cfg` | `AiterMoeConfig` | 后端选择结果和后端私有配置；调用方应先检查 `status`。       |
+
+接口返回的`AiterMoeConfig`结构如下：
+
+```Python
+class AiterMoeConfig:
+    """
+    Attributes:
+        quant_type: The quantization type this config was obtained for.
+        solution_type: Which backend to use (MoeSolutionType constant), or
+            None if no solution was found.
+        config: Backend-specific config dict (opaque to the caller).
+        need_shuffle: Whether the backend requires weight shuffling via
+            :func:`aiter_moe_shfl_weight` before calling :func:`aiter_moe`.
+    """
+    quant_type: Optional[str] = None
+    solution_type: Optional[str] = None
+    config: Optional[Dict[str, Any]] = None
+    need_shuffle: bool = False
+```
+
+| 字段              | 类型/默认值                            | 说明                                                     |
+| --------------- | --------------------------------- | ------------------------------------------------------ |
+| `quant_type`    | `Optional[str] = None`            | 该配置对应的量化类型。                                            |
+| `solution_type` | `Optional[str] = None`            | 被选中的后端，取值来自 `MoeSolutionType`；无可用方案时为 `None`。          |
+| `config`        | `Optional[Dict[str, Any]] = None` | 后端私有调优配置，例如 ASM 的 `SOL_ID1/SOL_ID2` 或 Triton block 配置。 |
+| `need_shuffle`  | `bool = False`                    | 调用 `aiter_moe` 前是否需要先调用 `aiter_moe_shfl_weight` 重排权重。  |
+
+#### 调用示例
+
+```Python
+"""Test get_aiter_moe_config for channel-wise w8a8 (block_size=0)."""
+    status, moe_cfg = get_aiter_moe_config(
+        M=m,
+        E=e,
+        N1=2 * n,
+        N2=k,
+        K=k,
+        top_k=topk,
+        block_size=0,
+        dtype=dtype,
+        quant_type=quant_type,
+        spec_sol_type=None
+    )
+    
+    #获取config后需要判断配置是否有效
+    *if* not status:
+        aiter.logger.info(
+            f"[aiter_moe_w4a8] SKIP {*m*=}, {N1=}, {N2=}, {K=}, {*e*=}, {*topk*=}: "
+            f"no backend available"
+        )
+        *return* None
+```
+
+### 2\.2\.2 aiter\_moe\_shfl\_weight
+
+#### 功能描述
+
+根据 `get_aiter_moe_config` 返回的 `AiterMoeConfig`的need\_shuffle及config，对专家权重进行shuffle重排，以提高moe算子性能。
+
+- **算子功能：**
+
+1. 根据后端类型与量化类型，对权重进行shuffle/marlin；
+
+#### 参数说明
+
+| 参数           | 类型/默认值                                      | 说明                                                                      |
+| ------------ | ------------------------------------------- | ----------------------------------------------------------------------- |
+| `w1`         | `Optional[torch.Tensor]`                    | GEMM1 权重，通常形如 `[E, N1, K]` 或对应量化/pack 后布局；为 `None` 时跳过。                 |
+| `w2`         | `Optional[torch.Tensor]`                    | GEMM2 权重，通常形如 `[E, N2, intermediate_size]` 或对应量化/pack 后布局；为 `None` 时跳过。 |
+| `moe_config` | `AiterMoeConfig`                            | `get_aiter_moe_config` 返回的配置，用于决定 MOE_C/ASM/CK/TRITON 的权重重排方式。          |
+| 返回值          | `Tuple[Optional[Tensor], Optional[Tensor]]` | 返回 `(shuffled_w1, shuffled_w2)`；Triton 后端通常原样返回。                        |
+
+#### 调用示例
+
+```Python
+if moe_cfg.need_shuffle:
+    w1_input, w2_input = aiter_moe_shfl_weight(
+        data["w1_qweight"], data["w2_qweight"], moe_cfg
+    )
+```
+
+即：应判断`get_aiter_moe_config` 返回的 need\_shuffle，如果需要对权重重排，才需要调用此接口。
+
+### 2\.2\.3 aiter\_moe
+
+#### 功能描述
+
+根据 `get_aiter_moe_config` 返回的 `AiterMoeConfig`，自动选择并调用对应的后端（moe\_c / asm / triton / ck）执行 MoE 计算。
+
+- **算子功能：**
+
+1. **后端路由**：根据 `moe_config.solution_type` 分发到四个后端之一：
+
+    - `MoeSolutionType.MOE_C` → `moe_c_fused_experts`
+
+    - `MoeSolutionType.ASM` → `fused_experts_asm_impl`
+
+    - `MoeSolutionType.TRITON` → `fused_experts_impl`
+
+    - `MoeSolutionType.CK` → `run_fused_experts_ck_impl`
+
+2. **量化类型转换**：将 `moe_config.quant_type` 转换为各后端需要的布尔标志（`use_int4_w4a16`、`use_int8_w8a8`、`use_fp8_w8a8` 等）。
+
+3. **参数透传**：将输入张量、量化参数、EP 参数、activation 等统一透传给选定的后端实现。
+
+4. **特殊处理**：
+
+    - Triton 路径下，若 `block_shape is None` 且为 W8A8/W8A16/FP8，自动设置 `per_channel_quant=True`。
+
+    - ASM/CK 路径下，从 `moe_config.config` 中提取 `solution_id` 传给底层 kernel。
+
+#### 参数说明
+
+| 参数                           | 类型/默认值                         | 说明                                                                         |
+| ---------------------------- | ------------------------------ | -------------------------------------------------------------------------- |
+| `hidden_states`              | `torch.Tensor`                 | 输入 token 激活，通常为 `[M, hidden_size]`，必须与 `w1` 的 K 维匹配。                       |
+| `w1`                         | `torch.Tensor`                 | GEMM1 专家权重，通常为 `[E, N1, K]`；gated 场景 `N1=2*intermediate_size`。             |
+| `w2`                         | `torch.Tensor`                 | GEMM2 专家权重，通常为 `[E, hidden_size, intermediate_size]` 或后端要求的量化布局。           |
+| `topk_weights`               | `torch.Tensor`                 | Router 权重，形状 `[M, top_k]`，与 `topk_ids` 形状一致。                               |
+| `topk_ids`                   | `torch.Tensor`                 | Router 选择的专家 id，形状 `[M, top_k]`。                                           |
+| `moe_config`                 | `AiterMoeConfig`               | `get_aiter_moe_config` 的返回配置；`solution_type/quant_type` 为空会抛 `ValueError`。 |
+| `inplace`                    | `Optional[bool] = False`       | 是否复用 `hidden_states` 作为输出。                                                 |
+| `activation`                 | `str = "silu"`                 | GEMM1 后的激活函数，也影响 gated/非 gated 处理。                                         |
+| `w1_scale`, `w2_scale`       | `Optional[Tensor] = None`      | 权重量化 scale，按量化模式可为 per-channel、per-block 或 tensor-wise。                    |
+| `w1_zp`, `w2_zp`             | `Optional[Tensor] = None`      | 权重量化 zero point；对部分 W4/W8 路径有效。                                            |
+| `a1_scale`, `a2_scale`       | `Optional[Tensor] = None`      | 激活量化 scale，分别对应 GEMM1 输入和 GEMM2 输入。                                        |
+| `block_shape`                | `Optional[list] = None`        | block-wise 量化分组信息；`None` 表示 channel-wise。                                  |
+| `global_num_experts`         | `int = -1`                     | 全局专家数量；`-1` 时一般使用本地权重中的专家数。                                                |
+| `expert_map`                 | `Optional[Tensor] = None`      | Expert Parallel 场景的全局 expert 到本地 expert 映射。                                |
+| `routed_scaling_factor`      | `Optional[float] = 1.0`        | Router 权重聚合时的缩放因子。                                                         |
+| `use_weight_shuffle`         | `bool = False`                 | 指示传入权重是否已经按后端要求 shuffle，主要影响 ASM/CK 路径。                                    |
+| `output_dtype`               | `Optional[torch.dtype] = None` | 输出 dtype；为空时使用 `hidden_states.dtype`。                                      |
+| `gemm1_alpha`, `gemm1_limit` | `Optional[float] = None`       | 部分激活函数或 fused 路径的 GEMM1 后处理参数。                                             |
+| 返回值                          | `torch.Tensor`                 | MoE 输出，通常形状为 `[M, hidden_size]`。                                           |
+
+#### 调用示例
+
+```Python
+return aiter_moe(mortal_input, w1, w2, topk_weights, topk_ids, moe_config, inplace, activation, w1_scale, w2_scale, w1_zp, w2_zp, 
+                     a1_scale, a2_scale, block_shape, global_num_experts, expert_map, routed_scaling_factor, output_dtype=hidden_states.dtype)
+```
+
+#### **注意事项**
+
+**必须先调用 ****`get_aiter_moe_config`****，**如果 `moe_config.solution_type` 或 `quant_type` 为 `None`，函数会直接抛 `ValueError`。
+
+### 2\.2\.4 应用示例
+
+以下为完整调用测试文件，请参考：
+
+#### w8a8 channelwise
+
+op\_tests/ci\_tests/test\_aiter\_moe\_with\_config\_w8a8\_channelwise.py
+
+可以参考使用aiter源码的op\_tests/ci\_tests/路径test\_aiter\_moe\_with\_config\*文件，修改测试case的输入来验证MOE算子性能，如下执行方式：
+
+```Bash
+# 方法1
+cd aiter
+PYTHONPATH=. python op_tests/ci_tests/test_aiter_moe_with_config_w8a8_channelwise.py
+
+# 方法2
+python -m op_tests.ci_tests.test_aiter_moe_with_config_w8a8_channelwise
+```
+
+## **2\.3  aiter\_moe内部调用算子**
+
+### moe\_c\_fused\_experts
+
+#### 功能描述
+
+- **算子功能：**
+
+aiter 中 **moe\_c 后端**的 Fused MoE（混合专家模型）核心执行函数。负责将输入 token 根据其 top\-k 路由结果，分发到对应专家进行两阶段矩阵乘法（Gate → Activation → Down），最后聚合输出。
+
+- **计算流程**：
+
+```
+moe_c_fused_experts
+    ├── inplace_fused_experts         # if inplace=True
+    │       └── fused_experts_impl
+    └── outplace_fused_experts        # if inplace=False
+            ├── fused_experts_impl_marlin   # W4A16 / W8A8通道级 / W4A8通道级 / FP8通道级
+            └── fused_experts_impl          # 其他（块量化、W8A16等）
+```
+
+#### 参数说明
+
+| 参数                                       | 类型/默认值                         | 说明                                                                                                      |
+| ---------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------- |
+| `hidden_states`, `w1`, `w2`              | `torch.Tensor`                 | 输入激活和两阶段专家权重。`hidden_states` 通常为 `[M, K]`，`w1/w2` 按后端量化布局存放。                                            |
+| `topk_weights`, `topk_ids`               | `torch.Tensor`                 | Router 输出的专家权重和索引，二者形状一致，通常为 `[M, top_k]`。                                                  |
+| `MODE1`, `MODE2`                         | `int = 1`                      | moe_c 内部 GEMM1/GEMM2 kernel 模式。                                                                         |
+| `BM`, `BN`, `BK`, `kloops`, `nloops`     | `int = 1`                      | GEMM1 调优参数，对应 M/N/K 分块和循环展开。                                                                            |
+| `BN2`, `BK2`, `kloops2`, `nloops2`       | `int = 1`                      | GEMM2 调优参数。                                                                                             |
+| `inplace`                                | `bool = False`                 | 是否走 `inplace_fused_experts` 并将结果写回输入。                                                                   |
+| `activation`                             | `Optional[str]`                | 激活函数，为空时默认为 `silu`。                                                               |
+| `is_gated`                               | `Optional[bool]`               | 是否 gated。                                                                           |
+| `use_fp8_w8a8`, `use_int8_w8a8`, `use_int8_w4a8`, `use_int8_w8a16`, `use_int4_w4a16`, `use_int4_w4a16_base`| `bool = False`               | 量化开关 |
+| `global_num_experts`, `expert_map`       | `int`, `Optional[Tensor]`      | 全局专家数量和 EP 映射。                                                                                          |
+| `w1_scale`, `w2_scale`, `w1_zp`, `w2_zp` | `Optional[Tensor]`             | 权重量化 scale 和 zero point。                                                                                |
+| `a1_scale`, `a2_scale`                   | `Optional[Tensor]`             | 激活量化 scale。                                                                                             |
+| `block_shape`                            | `Optional[List[int]]`          | block-wise 量化分组信息。                                                                                      |
+| `routed_scaling_factor`                  | `Optional[float] = 1.0`        | 聚合输出时应用的 routing 缩放。                                                                                    |
+| `gemm1_alpha`, `gemm1_limit`             | `Optional[float] = None`       | GEMM1 后激活/裁剪相关参数。                                                                                       |
+| `compute_dtype`                          | `Optional[torch.dtype] = None` | 内部计算 dtype，未指定时由后端路径推断。                                                                                 |
+| 返回值                                      | `torch.Tensor`                 | MoE 输出；`inplace=True` 时返回写回后的 `hidden_states`。                                                          |
+
+#### 调用示例
+
+```Python
+if moe_config.solution_type == MoeSolutionType.MOE_C:
+        from .fused_moe_c import moe_c_fused_experts
+
+        return moe_c_fused_experts(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            use_int4_w4a16=use_int4_w4a16,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w4a8=use_int8_w4a8,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w1_zp=w1_zp,
+            w2_zp=w2_zp,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            block_shape=block_shape,
+        )
+
+```
+
+#### 注意事项
+
+在 **moe\_c 后端** 的测试/推理路径中调用`moe_layout_shuffle_gemm1`和`moe_layout_shuffle_gemm2`等shuffle函数，如果不做此 shuffle 直接传入 `moe_c_fused_experts`，底层 Marlin/CUDA kernel 会按错误的内存偏移读取权重，导致**结果错误**。
+
+### fused\_experts\_asm\_impl
+
+#### 功能描述
+
+- **算子功能：**
+
+aiter 中 **ASM（汇编）后端**的 Fused MoE 核心执行函数。通过调用 HCU 底层 ASM 优化 kernel（`asm_fmoe_stage1`、`asm_fmoe_stage2`、`asm_fmoe_a8` 等）来完成混合专家模型的高性能前向计算。
+
+- **计算流程**：
+
+```
+fused_experts_asm_impl
+    ├── moe_sorting_ck()           *# aiter.moe_sorting_fwd，token 排序对齐*
+    ├── 量化输入 (如果需要)            *# per_token_quant_hip / per_token_group_quant_int8 / per_block_quant_wrapper*
+    ├── asm_fmoe_stage1 / asm_fmoe_a8  *# Stage1 GEMM: hidden_states × w1*
+    ├── triton_silu_and_mul            *# 激活函数*
+    ├── 量化中间结果 (如果需要)         *# per_token_quant_hip / per_token_group_quant_int8*
+    ├── asm_fmoe_stage2 / asm_fmoe_a8  *# Stage2 GEMM: intermediate × w2*
+    └── triton_moe_sum                 *# 按 topk_weights 聚合*
+```
+
+#### 参数说明
+
+| 参数                                       | 类型/默认值                    | 说明                                                                                |
+| ---------------------------------------- | ------------------------- | --------------------------------------------------------------------------------- |
+| `hidden_states`, `w1`, `w2`              | `torch.Tensor`            | ASM 后端输入激活和专家权重。                                                                  |
+| `topk_weights`, `topk_ids`               | `torch.Tensor`            | Router 权重和 expert id，形状必须一致。                                                      |
+| `dtype`                                  | `torch.dtype`             | 输出 dtype；源码会据此设置 ASM 输出类型。                                                        |
+| `inplace`                                | `bool = False`            | ASM 路径当前会创建输出张量，接口保留 inplace 语义。                                                  |
+| `activation`                             | `Optional[str]`                | 激活函数，为空时默认为 `silu`。                                                               |
+| `is_gated`                               | `Optional[bool]`               | 是否 gated。                                                                           |
+| `use_fp8_w8a8`, `use_int8_w8a8`, `use_int8_w4a8`, `use_int8_w8a16`, `use_int4_w4a16`, `use_int4_w4a16_base`| `bool = False`               | 量化开关 |
+| `per_channel_quant`                      | `bool = False`            | `block_shape is None` 时常用于 W8A8/FP8 channel-wise 路径。                              |
+| `global_num_experts`, `expert_map`       | `int`, `Optional[Tensor]` | 全局专家数和 EP 映射。                                                                     |
+| `w1_scale`, `w2_scale`, `w1_zp`, `w2_zp` | `Optional[Tensor]`        | 权重量化 scale 和 zero point。                                                          |
+| `a1_scale`, `a2_scale`                   | `Optional[Tensor]`        | 激活量化 scale。                                                                       |
+| `block_shape`                            | `Optional[list[int]]`     | block-wise 量化分组；W4A8 ASM 当前要求类似 `[0, 64]` 的配置。                                    |
+| `use_persist`, `persist_cu`              | `bool`, `Optional[int]`   | persistent kernel 相关开关和 CU 数。                                                     |
+| `use_shuffle`                            | `Optional[int] = 0`       | 是否使用 ASM shuffle 权重路径。                                                            |
+| `solution_id`                            | `Optional[str] = None`    | ASM 调优方案 id，通常来自 `moe_config.config` 的 `SOL_ID1+SOL_ID2`。                         |
+| `routed_scaling_factor`                  | `Optional[float] = 1.0`   | routing 聚合缩放因子。                                                                   |
+| `gemm1_alpha`, `gemm1_limit`             | `Optional[float] = None`  | GEMM1 后激活/裁剪参数。                                                                   |
+| 返回值                                      | `torch.Tensor`            | ASM MoE 输出，形状通常为 `[M, hidden_size]`。                                              |
+
+#### 调用示例
+
+```Python
+if moe_config.solution_type == MoeSolutionType.ASM:
+        from .fused_moe_asm_wna16 import fused_experts_asm_impl
+
+        cfg = moe_config.config
+        solution_id = f"{cfg['SOL_ID1']}+{cfg['SOL_ID2']}"
+        return fused_experts_asm_impl(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            dtype=hidden_states.dtype,
+            use_int4_w4a16=use_int4_w4a16,
+            use_int8_w8a8=use_int8_w8a8,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w1_zp=w1_zp,
+            w2_zp=w2_zp,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            block_shape=block_shape,
+            solution_id=solution_id,
+        )
+```
+
+### fused\_experts\_impl
+
+#### 功能描述
+
+实现了 MoE 层的端到端融合前向传播，与moe\_c\_fused\_experts和fused\_experts\_asm\_impl类似，但会调用triton后端。
+
+#### 参数说明
+
+| 参数                                       | 类型/默认值                         | 说明                                                                                |
+| ---------------------------------------- | ------------------------------ | --------------------------------------------------------------------------------- |
+| `hidden_states`, `w1`, `w2`              | `torch.Tensor`                 | Triton 后端输入激活和两阶段专家权重。                                                            |
+| `topk_weights`, `topk_ids`               | `torch.Tensor`                 | Router 输出，形状必须一致。                                                                 |
+| `output_dtype`                           | `Optional[torch.dtype] = None` | 输出 dtype；为空时使用 `hidden_states.dtype`。                                             |
+| `inplace`                                | `bool = False`                 | 是否复用输入输出；`no_combine=True` 时不支持 inplace。                                          |
+| `activation`                             | `Optional[str]`                | 激活函数，为空时默认为 `silu`。                                                               |
+| `is_gated`                               | `Optional[bool]`               | 是否 gated。                                                                           |
+| `b1`, `b2`                               | `Optional[Tensor] = None`      | GEMM1/GEMM2 bias。                                                                 |
+| `apply_router_weight_on_input`           | `bool = False`                 | 是否在 GEMM 前把 router 权重作用到输入上。                                                      |
+| `use_fp8_w8a8`, `use_int8_w8a8`, `use_int8_w4a8`, `use_int8_w8a16`, `use_int4_w4a16`, `use_int4_w4a16_base`| `bool = False`               | 量化开关 |
+| `per_channel_quant`                      | `bool = False`                 | channel-wise 量化开关；`aiter_moe` 会为部分 W8/FP8 channel-wise 路径自动置位。                    |
+| `global_num_experts`, `expert_map`       | `int`, `Optional[Tensor]`      | 全局专家数和 EP 映射。                                                                     |
+| `w1_scale`, `w2_scale`, `w1_zp`, `w2_zp` | `Optional[Tensor]`             | 权重量化 scale 和 zero point。                                                          |
+| `a1_scale`, `a2_scale`                   | `Optional[Tensor]`             | 激活量化 scale。                                                                       |
+| `block_shape`                            | `Optional[List[int]] = None`   | block-wise 量化分组。                                                                  |
+| `no_combine`                             | `bool = False`                 | 为 `True` 时输出保留 `[M, top_k, hidden_size]`，不做 top-k 聚合。                             |
+| `routed_scaling_factor`                  | `Optional[float] = 1.0`        | top-k 聚合缩放因子。                                                                     |
+| `gemm1_alpha`, `gemm1_limit`             | `Optional[float] = None`       | GEMM1 后激活/裁剪参数。                                                                   |
+| 返回值                                      | `torch.Tensor`                 | `no_combine=False` 时通常为 `[M, hidden_size]`；否则为 `[M, top_k, hidden_size]`。         |
+
+#### 调用示例
+
+```Python
+return fused_experts_impl(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        output_dtype=output_dtype,
+        inplace=False,
+        activation=activation,
+        is_gated=is_gated,
+        b1=b1,
+        b2=b2,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        use_int4_w4a8=use_int4_w4a8,
+        per_channel_quant=per_channel_quant,
+        global_num_experts=global_num_experts,
+        expert_map=expert_map,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        block_shape=block_shape,
+        no_combine=no_combine,
+        routed_scaling_factor=routed_scaling_factor,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
+    )
+```
+
+# 3\. Norm
+
+## 3\.1 RMSNorm算子介绍
+
+RMSNorm（Root Mean Square Layer Normalization，均方根层归一化）是一种简化版的 Layer Normalization，与 LayerNorm 不同，RMSNorm 只使用均方根（RMS）来缩放输入，不再减去均值（去中心化）。
+
+### 3\.1\.1 head_rms_norm
+
+### 功能描述
+
+head_rms_norm 是一种 RMSNorm 变体，针对每个 attention/head 或专家分片做归一化。比全维的 RMSNorm/LayerNorm 更符合多头结构，不计算均值。
+它对输入张量 input 的最后一个维度计算 RMS（根均方值），然后利用 RMS 对激活做归一化：
+  normed = input / sqrt(mean(input^2) + eps)
+归一化后再乘以 weight 并加上 bias（若有），结果保持和输入相同形状。
+
+### 参数说明：
+
+| 参数                                      | 类型/默认值                         | 说明                                                                                |
+| ---------------------------------------- | ------------------------------ | --------------------------------------------------------------------------------- |
+| input                                    |  `torch.Tensor`                 | 输入张量                        |
+| weight                                   |  `torch.Tensor`                 | 权重                            |
+| epsilon                                  | `float`                         |常数                            |
+| norm_head_dim                            |  `int`                          |head维度                        |
+| 返回值                                    |  `torch.Tensor`                 | 归一化结果                      |
+
+#### 调用示例
+
+```Python
+out = head_rms_norm(input, weight, eps, head_dim)
+```
+
+### 3\.1\.2 rmsnorm_forward_autograd
+
+### 功能描述
+
+对输入 x 做 RMSNorm，输出归一化结果，并返回 rstd 供反向传播使用
+
+### 参数说明：
+
+| 参数                                      | 类型/默认值                         | 说明                                                                                |
+| ---------------------------------------- | ------------------------------ | --------------------------------------------------------------------------------- |
+| x                                        |  `torch.Tensor`                 | 前向输入                          |
+| weight                                   |  `torch.Tensor`                 | 权重，可学习缩放参数                            |
+| epsilon                                  | `float`                         | 常数，防止除0                           |
+| training                                 | `bool = True`                   | true 时保存 rstd 供反向使用，false 时 rstd 为空张量；默认为true     |
+| 返回值                                    |  `torch.Tensor`                 | 归一化结果,  rstd                     |
+
+#### 调用示例
+
+```Python
+out = rmsnorm_forward_autograd(x, weight, EPS, training=False)
+```
+
+### 3\.1\.3 rmsnorm_backward_autograd
+
+### 功能描述
+
+和rmsnorm_forward_autograd配套，根据输出的梯度 grad，计算 RMSNorm 反向传播对输入的梯度和对权重的梯度
+ 
+### 参数说明：
+
+| 参数                                      | 类型/默认值                         | 说明                                                                                |
+| ---------------------------------------- | ------------------------------ | --------------------------------------------------------------------------------- |
+| grad                                        | `torch.Tensor`                 | 损失对输出的梯度                          |
+| x                                           | `torch.Tensor`                 | 前向时的原始输入                            |
+| rstd                                    | `torch.Tensor`                 | 前向计算的 1/RMS(x)，避免反向重复计算     |
+| weight                                      | `torch.Tensor`                 | 前向的权重                     |
+| 返回值                                    |  `torch.Tensor`                 | 对输入的梯度,  对权重的梯度                    |
+
+#### 调用示例
+
+```Python
+dx, dweight = rmsnorm_backward_autograd(grad_out, x, rstd, weight)
+```
+
+### 3\.1\.4 fused_add_rms_norm_cu
+
+### 功能描述
+
+推理专用，融合 Add + RMSNorm，将 input 加到 residual 上，结果写回 residual；再对融合后的 residual 做 RMS Norm，然后逐元素乘以 weight，结果写回 input。
+
+### 参数说明：
+
+| 参数                                      | 类型/默认值                         | 说明                                                                                |
+| ---------------------------------------- | ------------------------------ | --------------------------------------------------------------------------------- |
+| input                                    |  `torch.Tensor`                 | 输入：原始数据 / 输出：归一化后的结果                     |
+| residual                                 |  `torch.Tensor`                 | 输入：残差连接值 / 输出：更新后的残差                   |
+| weight                                   |  `torch.Tensor`                 | 权重                            |
+| epsilon                                  |  `float`                         | 常数，防止除零                            |
+
+
+#### 调用示例
+
+```Python
+aiter.fused_add_rms_norm_cu(input, residual, weight, eps)
+    output = input
+    residual_out = residual
+    return output, residual_out
+```
+
+## 3\.2 融合RMSNorm和RoPE算子介绍
+
+融合 RMSNorm 和 RoPE 算子面向 Attention 中 Q/K 张量的推理预处理，一次完成以下计算：
+
+1. 对输入张量的最后一个维度执行 RMSNorm；
+2. 将归一化结果逐元素乘以 RMSNorm weight；
+3. 将相邻两个元素组成复数，并应用旋转位置编码（Rotary Position Embedding，RoPE）；
+4. 将 FP32 中间计算结果转换回 BF16 输出。
+
+算子支持函数式 Torch dispatcher、Meta kernel 和 `torch.compile`。输入的 batch、sequence 和 head 维度可以使用动态 shape，也支持 fused-QKV 经 `chunk` 和 `unflatten` 后产生的非连续视图，但最后一个维度必须连续。
+
+公开调用链如下：
+
+```text
+torch.ops.aiter.fused_rmsnorm_rope
+-> Torch dispatcher
+-> AITER C++ 实现
+-> HIP kernel
+```
+
+该算子仅用于推理，没有注册 backward 实现。调用方应在 `torch.inference_mode()` 环境中使用。
+
+### 3\.2\.1 fused_rmsnorm_rope_op
+
+### 功能描述
+
+对单个 Q 或 K 张量执行融合 RMSNorm 和 RoPE，并由算子内部分配输出张量。推荐通过 `aiter.fused_rmsnorm_rope_op` 或 `torch.ops.aiter.fused_rmsnorm_rope` 调用。
+
+计算过程可表示为：
+
+```text
+normalized = input * rsqrt(mean(input^2, dim=-1) + eps)
+scaled = normalized * input_weight
+output = RoPE(scaled, freqs)
+```
+
+### 参数说明
+
+| 参数 | 类型/默认值 | 说明 |
+| --- | --- | --- |
+| `input` | `torch.Tensor` | 输入张量，shape 为 `[batch, sequence, num_head, 128]`，dtype 为 `torch.bfloat16`，要求 `stride(-1) == 1`。 |
+| `input_weight` | `torch.Tensor` | RMSNorm 权重，shape 为 `[128]`，dtype 为 `torch.bfloat16`，要求连续。 |
+| `freqs` | `torch.Tensor` | RoPE 频率，shape 为 `[至少 sequence, 128]`，dtype 为 `torch.float32`，要求连续；最后一维按实部、虚部交替排列。 |
+| `eps` | `float = 1e-6` | RMSNorm 数值稳定常数，必须大于或等于 0。 |
+| 返回值 | `torch.Tensor` | 输出张量，shape 和 dtype 与 `input` 相同。 |
+
+### 调用示例
+
+通过 AITER Python API 调用：
+
+```Python
+import torch
+import aiter
+
+with torch.inference_mode():
+    output = aiter.fused_rmsnorm_rope_op(
+        input,
+        input_weight,
+        freqs,
+        eps=1e-6,
+    )
+```
+
+通过 Torch dispatcher 直接调用：
+
+```Python
+with torch.inference_mode():
+    output = torch.ops.aiter.fused_rmsnorm_rope(
+        input,
+        input_weight,
+        freqs,
+        1e-6,
+    )
+```
+
+### 3\.2\.2 fused_qk_rmsnorm_rope
+
+### 功能描述
+
+在一次 kernel launch 中分别对 Q 和 K 执行融合 RMSNorm 和 RoPE。Q 和 K 使用各自的 RMSNorm weight，并共享同一份 RoPE freqs。
+
+该接口用于减少 Q/K 分别调用单输入算子产生的 kernel launch 开销，推荐通过 `aiter.fused_qk_rmsnorm_rope` 或 `torch.ops.aiter.fused_qk_rmsnorm_rope` 调用。
+
+### 参数说明
+
+| 参数 | 类型/默认值 | 说明 |
+| --- | --- | --- |
+| `q` | `torch.Tensor` | Q 输入张量，shape 为 `[batch, sequence, num_head, 128]`，dtype 为 `torch.bfloat16`，要求 `stride(-1) == 1`。 |
+| `k` | `torch.Tensor` | K 输入张量，shape、dtype 和 device 必须与 `q` 相同，要求 `stride(-1) == 1`。 |
+| `q_weight` | `torch.Tensor` | Q 的 RMSNorm 权重，shape 为 `[128]`，dtype 为 `torch.bfloat16`，要求连续。 |
+| `k_weight` | `torch.Tensor` | K 的 RMSNorm 权重，shape 为 `[128]`，dtype 为 `torch.bfloat16`，要求连续。 |
+| `freqs` | `torch.Tensor` | Q/K 共享的 RoPE 频率，shape 为 `[至少 sequence, 128]`，dtype 为 `torch.float32`，要求连续。 |
+| `eps` | `float = 1e-6` | RMSNorm 数值稳定常数，必须大于或等于 0。 |
+| 返回值 | `Tuple[torch.Tensor, torch.Tensor]` | 返回 `(q_output, k_output)`，两个输出分别与 `q` 和 `k` 的 shape、dtype 相同。 |
+
+### 调用示例
+
+```Python
+import torch
+import aiter
+
+with torch.inference_mode():
+    q_output, k_output = aiter.fused_qk_rmsnorm_rope(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        freqs,
+        eps=1e-6,
+    )
+```
+
+### 3\.2\.3 fused-QKV非连续视图
+
+### 功能描述
+
+启用 QKV projection 融合后，Q、K、V 通常由同一个张量通过 `chunk` 得到。此时 Q 和 K 不是完整连续张量，但最后一个维度仍然连续。融合算子可以直接读取此类视图，不需要调用 `contiguous()` 产生额外复制。
+
+### 调用示例
+
+```Python
+q, k, v = (
+    tensor.unflatten(-1, (num_heads, head_dim))
+    for tensor in fused_qkv.chunk(3, dim=-1)
+)
+
+assert not q.is_contiguous()
+assert not k.is_contiguous()
+assert q.stride(-1) == 1
+assert k.stride(-1) == 1
+
+with torch.inference_mode():
+    q_output, k_output = aiter.fused_qk_rmsnorm_rope(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        freqs,
+        eps=1e-6,
+    )
+```
+
+若最后一个维度不连续，算子会明确报错，不会在 AITER 内静默 fallback。
+
+### 3\.2\.4 torch.compile支持
+
+函数式算子提供 Meta kernel，可以保留在 FX graph 中，并支持 `torch.compile(fullgraph=True)`。
+
+### 调用示例
+
+```Python
+@torch.inference_mode()
+def fn(q, k, q_weight, k_weight, freqs):
+    return torch.ops.aiter.fused_qk_rmsnorm_rope(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        freqs,
+        1e-6,
+    )
+
+compiled_fn = torch.compile(
+    fn,
+    fullgraph=True,
+    dynamic=False,
+)
+
+q_output, k_output = compiled_fn(
+    q,
+    k,
+    q_weight,
+    k_weight,
+    freqs,
+)
+```
+
+### 3\.2\.5 兼容out接口
+
+为兼容已有调用，AITER 保留预分配 output 的旧接口：
+
+```Python
+output = torch.empty_like(input)
+aiter.fused_rmsnorm_rope(
+    input,
+    input_weight,
+    freqs,
+    output,
+)
+```
+
+旧接口将结果写入调用方提供的 `output`，不返回新的张量。新代码推荐使用函数式接口 `aiter.fused_rmsnorm_rope_op`。
+
+### 3\.2\.6 fuse_rms_mrope
+
+### 功能描述
+
+RMSNorm + Multimodal RoPE (M-RoPE) 融合算子，对 Q/K 按 head 做归一化后再施加旋转位置编码，减少中间写回。
+
+### 参数说明：
+
+| 参数                                      | 类型/默认值                         |说明                                                                                |
+| ---------------------------------------- | ------------------------------ | --------------------------------------------------------------------------------- |
+| q  |  `torch.Tensor`                 | Query，in-place 输出   |
+| k  |  `torch.Tensor`                 | Key，in-place 输出 |
+| cos / sin |  `torch.Tensor`                 | 三维位置的旋转表，第 0 维依次为 t / h / w（时间、高度、宽度）   |
+| mrope_section |  `list`                 | 划分 half-dim 上哪些通道用哪路位置编码  |
+|   head_size |  `int`                        | 每个 attention head 的维度  |
+|   is_interleaved  |  `bool`                        | M-RoPE 通道布局：False 为连续分段 [t|h|w]；True 为按 %3 交错（h→1，w→2，其余用 t）   |
+|   weight_q / weight_k |  `torch.Tensor`                 | Q/K 各自 RMSNorm 的 γ（scale）  |
+|   residual_q / residual_k  |  `torch.Tensor`                 | Norm 前残差（可选）    |
+|   epsilon  |  `float`                        | RMSNorm 数值稳定项，默认 1e-6  |
+
+#### 调用示例
+
+```Python
+fuse_rms_mrope(
+        q_opt, k_opt, cos, sin, mrope_section, head_size,
+        is_interleaved, weight_q, weight_k, residual_q_opt, residual_k_opt, epsilon
+    )
+```
+
+# 4\. Activition
+
+### 4\.1\.1 moe_swiglu_dynamic_quant_wrapper
+
+### 功能描述
+
+针对 MoE 模型中 SwiGLU 激活函数的融合算子，一次性完成：
+1. SwiGLU 激活计算
+2. 按 expert 的 smooth 缩放
+3. 按 token 的动态 int8 量化
+ 
+### 参数说明：
+
+| 参数                                      | 类型/默认值                         | 说明                                                                          |
+| ---------------------------------------- | ------------------------------ | --------------------------------------------------------------------------------- |
+| scatter_tokens                                    |  `torch.Tensor`                 | 主输入张量，前 d 列是 gate 投影（送入 silu），后 d 列是 up 投影     |
+| smooth                                            |  `torch.Tensor`                 | 每个 expert 的平滑缩放因子                 |
+| experts_tokens_count                              |  `torch.Tensor`                 | 每个 expert 分到的 token 数量                         |
+| experts_tokens_start                              |  `torch.Tensor`                 | 每个 expert 的 token 起始索引                         |
+| beta                                              |  `float`                        | 保留参数                                            |
+| 返回值：output                                     |  `torch.Tensor`                 | 输出张量（预分配），存放量化后的 SwiGLU 结果            |
+| 返回值：scales                                     |  `torch.Tensor`                 | 每个 token 的量化缩放因子（预分配）                   |
+
+#### 调用示例
+
+```Python
+output, scales = moe_swiglu_dynamic_quant_wrapper(scatter_tokens, smooth, experts_tokens_count, experts_tokens_start)
+```
+
+# 5\. Quant
+
+### 5\.1\.1 per_token_group_quant_fp8
+
+### 功能描述
+
+per_token_group_quant_fp8 是一个 逐 token 分组 FP8 动态量化 kernel。它将输入的浮点张量按 group_size 分组，在每组内计算absmax（最大绝对值），以此推导该组的 scale（缩放因子），然后将组内所有元素量化到 FP8 格式。
+
+### 参数说明：
+
+| 参数                                      | 类型/默认值                         | 说明                                                                          |
+| ---------------------------------------- | ------------------------------ | --------------------------------------------------------------------------------- |
+|  out	                                   |   `torch.Tensor`               | 输出：量化后的 FP8 张量，shape 与 input 相同，dtype 为 float8_e4m3fn 或 float8_e5m2    |
+|  input                                   |   `torch.Tensor`               | 输入：待量化的浮点张量，支持多种浮点类型（通过 VLLM_DISPATCH_FLOATING_TYPES 分发）       |
+|  scales                                  |   `torch.Tensor`               | 输出：每组的 scale 因子，shape 为 input.shape[:-1] + (hidden_size / group_size,)，dtype 为 float32    |
+|  group_size	                           |   `int`                        | 分组大小。必须满足：≥16、16 的倍数、2 的幂、≤16384，且 hidden_size（最后一维）必须被 group_size 整除      |
+|  eps	                                   |   `float`                      | 最小值保护（默认 1e-5），防止全零组导致 scale=0，max_val = max(absmax, eps)   |
+|  use_ue8m0	                           |   `bool`	                    | scale 对齐模式。默认 False，使用原始浮点 scale；若 True，scale 被量化为 2 的幂次（exp2(ceil(log2(scale)))），便于用 UE8M0 格式表示 scale  |
+
+#### 调用示例
+
+```Python
+aiter.per_token_group_quant_fp8(out_q, x, out_s, group_size, eps, use_ue8m0)
+return out_q, out_s
+```
+
+# 5\. MQA
+
+### 5\.1\.1 mqa_logits
+
+### 功能描述
+
+用于计算 Multi-Query Attention (MQA) 中的 logits（注意力分数矩阵）：
+1. Q × K^T：对每个 head 独立计算 Q 和 K 的点积（相当于 batched GEMV / GEMM）
+2. ReLU 激活：对点积结果应用 ReLU
+3. 加权求和：用 Weights 对各 head 结果加权累加
+4. Mask 处理：根据 KS/KE（cumulative sequence length start/end）对无效位置填充 -inf
+
+### 参数说明：
+
+| 参数                                      | 类型/默认值                         | 说明                                                                          |
+| ---------------------------------------- | ------------------------------ | --------------------------------------------------------------------------------- |
+|   Q	                                   |    `torch.Tensor`	            |    query 张量                                                              |
+|   K	                                   |    `torch.Tensor`	            |   key/value 张量；MQA 中所有 head 共享同一个 K        |              
+|   Weights	                               |    `torch.Tensor`	            |    每个 query 对每个 head 的权重，用于 head 加权求和      |
+|   KS	                                   |    `torch.Tensor`	              |    每个 query 对应的 KV 区间起始位置（inclusive）     |
+|   KE	                                   |    `torch.Tensor`                |    每个 query 对应的 KV 区间结束位置（exclusive）         |
+|   q_seq_len	                           |    `int`	                                |    query 序列长度                                    |
+|   kv_seq_len	                           |    `int`	                                |    KV 序列长度                                        |
+|   num_heads	                           |    `int`	                                |    注意力头数                                         |
+|   head_dim	                           |    `int`	                                |    头维度                                             |
+|   KV_scale	                           |    `torch.Tensor 或 None`	            |    可选的 FP8 反量化缩放因子，每通道作用                     |
+|   clean_logits	                       |    `bool`	                            |    默认 true，控制是否对 logits 做清理/清零操作             |
+|   D_out	                               |    `torch.Tensor 或 None`	                    |    可选的输出缓冲区；若传 None 则内部分配            |
+
+#### 调用示例
+
+```Python
+logits = mqa_logits(
+    Q, K, weights, KS, KE,
+    q_seq_len, kv_seq_len, num_heads, head_dim,
+)
+```
+
+# 6. FLA
+
+FLA（Flash Linear Attention）相关算子面向 vLLM / SGLang 前端的 gated delta-rule 推理路径。当前 HIP 实现对外提供 `chunk_gated_delta_rule_fwd` 系列接口，参数名与 Triton 参考实现对齐，便于一行替换调用。
+
+## 6.1 chunk_gated_delta_rule_fwd 算子介绍
+
+`chunk_gated_delta_rule_fwd` 是 FLA Triton `chunk_gated_delta_rule_fwd_h` 的 HIP 实现，按 chunk 递推 gated delta-rule 隐状态，并可选写出 `v_new` 与 `final_state`。
+
+公开 Python API：
+
+- `aiter.chunk_gated_delta_rule_fwd_vllm_hip_blockdim64`：对齐 vLLM Triton API，返回 `(h, v_new, final_state)`
+- `aiter.chunk_gated_delta_rule_fwd_sglang_hip_blockdim64`：对齐 SGLang Triton API，原地更新 `initial_state`，返回 `(h, v_new)`
+- 兼容别名：`aiter.chunk_gated_delta_rule_fwd`、`aiter.chunk_gated_delta_rule_fwd_sglang`
+
+JIT 模块为 `module_cpp_api`（见 `aiter/jit/optCompilerConfig.json`）。当前支持的 shape 特化：`headDimK == 128`、`headDimV == 128`、`chunk_size == 64`、`transpose_state_layout=True`。元素类型为 fp16/bf16，状态以 fp32 累加；gate 张量 `g` / `gk` 必须为 fp32。
+
+### 6.1.1 chunk_gated_delta_rule_fwd_vllm_hip_blockdim64
+
+#### 功能描述
+
+- **算子功能：** 执行 vLLM 风格的 chunk gated delta-rule 前向，写出 chunk 级隐状态 `h`，并按需返回 `v_new` 与 `final_state`。
+- **对应 Triton：** `aiter.ops.triton.fla.vllm.chunk_delta_h.chunk_gated_delta_rule_fwd_h`
+- **兼容别名：** `aiter.chunk_gated_delta_rule_fwd`
+
+#### 参数说明
+
+| 参数 | 类型/默认值 | 说明 |
+| --- | --- | --- |
+| `k` | `torch.Tensor` | Key，shape 为 `(B, T, Hg, K)`；varlen 时为 packed `(total_k, Hg, K)`。dtype 为 fp16/bf16，最后一维连续。 |
+| `w` | `torch.Tensor` | 权重相关输入，shape 为 `(B, T, H, K)` 或 packed `(total_k, H, K)`，dtype 与 `k` 相同。 |
+| `u` | `torch.Tensor` | Value 侧输入，shape 为 `(B, T, H, V)` 或 packed `(total_k, H, V)`，dtype 与 `k` 相同。 |
+| `g` | `Optional[Tensor] = None` | 可选 gate，shape 为 `(B, T, H)` 或 `(total_k, H)`，**必须为 fp32**。 |
+| `gk` | `Optional[Tensor] = None` | 可选 key-wise gate，shape 为 `(B, T, H, K)` 或 `(total_k, H, K)`，**必须为 fp32**。 |
+| `initial_state` | `Optional[Tensor] = None` | 初始状态，shape 为 `(N, H, K, V)` 或 `(N, H, V, K)`（由 `transpose_state_layout` 决定）。 |
+| `initial_state_indices` | `Optional[Tensor] = None` | 初始状态索引，shape 为 `(N,)`，dtype 为 `int32`，需连续。 |
+| `output_final_state` | `bool = True` | 是否输出 `final_state`；为 `False` 时对应返回项为 `None`。 |
+| `chunk_size` | `int = 64` | chunk 大小；当前仅支持 `64`。 |
+| `save_new_value` | `bool = True` | 是否写出 `v_new`；为 `False` 时对应返回项为 `None`。 |
+| `cu_seqlens` | `Optional[Tensor] = None` | varlen 累积序列长度，shape 为 `(B+1,)`；dtype 必须为 `int32` 或 `int64`（HIP 的 `IndexT` 仅由此决定）。 |
+| `chunk_indices` | `Optional[Tensor] = None` | varlen meta，shape 为 `(NT, 2)`；dtype 必须为 `int32` 或 `int64`，**不必与 `cu_seqlens` 一致**。HIP 仅用 `size(0)` 取 NT（host 侧），kernel 不读其元素。建议上层预计算并缓存。 |
+| `chunk_offsets` | `Optional[Tensor] = None` | varlen meta，exclusive cumsum；dtype **必须为 `int64`**（`torch.int64` / `at::kLong`，不允许 int32）。varlen 场景必填；缺省或空时 wrapper 会补齐。 |
+| `use_exp2` | `bool = False` | 是否使用 `exp2` 形式的指数计算。 |
+| `transpose_state_layout` | `bool = True` | 状态布局是否转置；当前仅支持 `True`。 |
+| 返回值 | `Tuple[Tensor, Optional[Tensor], Optional[Tensor]]` | `(h, v_new, final_state)`；当 `save_new_value=False` 或 `output_final_state=False` 时对应项为 `None`。 |
+
+#### 调用示例
+
+```Python
+# 建议由上层框架预先准备并缓存 varlen meta：
+# from aiter.ops.triton.fla.vllm.chunk_delta_h import (
+#     prepare_chunk_indices, prepare_chunk_offsets,
+# )
+# chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+# chunk_offsets = prepare_chunk_offsets(cu_seqlens, chunk_size)
+
+import aiter
+
+h, v_new, final_state = aiter.chunk_gated_delta_rule_fwd_vllm_hip_blockdim64(
+    k, w, u, g=g, gk=gk,
+    initial_state=initial_state, initial_state_indices=initial_state_indices,
+    output_final_state=output_final_state, chunk_size=chunk_size,
+    save_new_value=save_new_value, cu_seqlens=cu_seqlens,
+    chunk_indices=chunk_indices,
+    chunk_offsets=chunk_offsets,
+    use_exp2=use_exp2,
+    transpose_state_layout=True,
+)
+# 兼容别名：aiter.chunk_gated_delta_rule_fwd(...) 等价
+```
+
+### 6.1.2 chunk_gated_delta_rule_fwd_sglang_hip_blockdim64
+
+#### 功能描述
+
+- **算子功能：** 执行 SGLang 风格的 chunk gated delta-rule 前向；`initial_state` **原地更新**为最终状态，接口只返回 `(h, v_new)`。
+- **对应 Triton：** `aiter.ops.triton.fla.sglang.chunk_delta_h.chunk_gated_delta_rule_fwd_h`
+- **兼容别名：** `aiter.chunk_gated_delta_rule_fwd_sglang`
+- **强制要求：** 必须提供 `initial_state` 与 `int32` 的 `initial_state_indices`；`transpose_state_layout` 必须为 `True`。
+
+#### 参数说明
+
+| 参数 | 类型/默认值 | 说明 |
+| --- | --- | --- |
+| `k` / `w` / `u` | `torch.Tensor` | 与 vLLM 接口相同；dtype 为 fp16/bf16。 |
+| `g` / `gk` | `Optional[Tensor] = None` | 可选 gate，**必须为 fp32**。 |
+| `initial_state` | `Tensor`（必填） | 初始状态，shape 为 `(state_rows, H, V, K)`；算子原地写回最终状态。 |
+| `initial_state_indices` | `Tensor`（必填） | shape `(N,)`，dtype `int32`，需连续；HIP 不校验 `length==N` 或索引越界（与 SGLang 一致，由调用方保证）。 |
+| `output_final_state` | `bool = True` | 保留与 Triton API 对齐的开关；状态通过原地写回 `initial_state` 体现。 |
+| `chunk_size` | `int = 64` | 当前仅支持 `64`。 |
+| `save_new_value` | `bool = True` | 是否写出 `v_new`；为 `False` 时对应返回项为 `None`。 |
+| `cu_seqlens` | `Optional[Tensor] = None` | 同 vLLM：`(B+1,)`，dtype 为 `int32` 或 `int64`。 |
+| `chunk_indices` | `Optional[Tensor] = None` | 同 vLLM：`(NT, 2)`，dtype 为 `int32` 或 `int64`，可与 `cu_seqlens` 不一致；仅用于 host 侧取 NT。 |
+| `chunk_offsets` | `Optional[Tensor] = None` | 同 vLLM：exclusive cumsum，dtype **必须为 `int64`**；varlen 必填，缺省时 wrapper 补齐。 |
+| `use_exp2` | `bool = False` | 是否使用 `exp2` 形式的指数计算。 |
+| `transpose_state_layout` | `bool = True` | 当前仅支持 `True`。 |
+| 返回值 | `Tuple[Tensor, Optional[Tensor]]` | `(h, v_new)`；`final_state` 已原地写回 `initial_state`。 |
+
+#### 调用示例
+
+```Python
+# 建议由上层框架预先准备并缓存 varlen meta：
+# from aiter.ops.triton.fla.sglang.chunk_delta_h import (
+#     prepare_chunk_indices, prepare_chunk_offsets,
+# )
+# chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+# chunk_offsets = prepare_chunk_offsets(cu_seqlens, chunk_size)
+
+import aiter
+
+h, v_new = aiter.chunk_gated_delta_rule_fwd_sglang_hip_blockdim64(
+    k, w, u, g=g, gk=gk,
+    initial_state=state, initial_state_indices=initial_state_indices,
+    output_final_state=output_final_state, chunk_size=chunk_size,
+    save_new_value=save_new_value, cu_seqlens=cu_seqlens,
+    chunk_indices=chunk_indices,
+    chunk_offsets=chunk_offsets,
+    use_exp2=use_exp2,
+    transpose_state_layout=True,
+)
+# 兼容别名：aiter.chunk_gated_delta_rule_fwd_sglang(...) 等价
+```
+
+#### 注意事项
+
+1. **参数对齐：** 关键字参数名与 Triton API 一致；HIP wrapper 额外支持可选的 `chunk_offsets`，并默认 `transpose_state_layout=True`。
+2. **返回差异：** vLLM 返回 `(h, v_new, final_state)`；SGLang 原地更新 `initial_state`，只返回 `(h, v_new)`。
+3. **Varlen meta 类型约束：**
+   - `cu_seqlens`：`int32` 或 `int64`；HIP 仅据此分发 `IndexT`。
+   - `chunk_indices`：`int32` 或 `int64`，**允许与 `cu_seqlens` dtype 不一致**；HIP 只读 `size(0)` 得到 NT，不读元素内容，也不按该 dtype 分发 kernel。
+   - `chunk_offsets`：**仅接受 `int64`**；为 exclusive 整数 cumsum。传入 `int32` 会直接 `TORCH_CHECK` 失败。
+   - 优先由 vLLM/SGLang 等上层准备并跨层复用；若缺失或为空，HIP wrapper 会在当次调用内补齐（内部 helper，不对外导出）。
+4. **Kernel 路径：** launcher 在 BV16 / BV32 间自动选择；当估计 BV32 block 数 `ceil(V/32) * N * H` 达到阈值（48 blocks，即 `V=128` 时约 `N * H >= 12`）时走 BV32，否则回退 BV16。
+5. **测试与源码：** 详见 `csrc/fla/README.md`；可运行 `op_tests/test_chunk_gated_hip_vllm.py` 与 `op_tests/test_chunk_gated_hip_sglang.py` 做数值对照。
