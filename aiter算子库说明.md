@@ -943,6 +943,53 @@ fuse_rms_mrope(
 output, scales = moe_swiglu_dynamic_quant_wrapper(scatter_tokens, smooth, experts_tokens_count, experts_tokens_start)
 ```
 
+### 4\.1\.2 add_swiglu
+
+#### 功能描述
+
+融合两个同形状张量的逐元素加法与 split-half SwiGLU，支持一阶自动求导。
+适用于 LoRA 主干投影输出与增量相加后执行激活的场景；不是 GEMM epilogue，
+也不是交错布局或带裁剪的 SwiGLU 变体。等价参考表达式为：
+
+```Python
+gate, up = (base + delta).chunk(2, dim=-1)
+out = torch.nn.functional.silu(gate) * up
+```
+
+#### 参数说明
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `base` | `torch.Tensor` | 连续的 FP16/BF16 CUDA/HIP 张量，shape 为 `(..., 2 * D)`，至少二维，`D > 0`。 |
+| `delta` | `torch.Tensor` | 与 `base` 的 shape、dtype、device 相同，且连续。不支持广播或隐式类型转换。 |
+| 返回值 | `torch.Tensor` | shape 为 `(..., D)`，dtype、device 与输入一致。 |
+
+#### 调用示例
+
+```Python
+import torch
+from aiter.ops.triton.add_swiglu import add_swiglu
+
+base = torch.randn(128, 512, device="cuda", dtype=torch.bfloat16)
+delta = torch.randn_like(base).requires_grad_()
+out = add_swiglu(base, delta)
+out.float().sum().backward()
+```
+
+#### 注意事项与测试
+
+- 不修改输入，支持空的前导维度及任一或两个输入求导；不支持高阶梯度，未承诺 fullgraph compile/export 兼容性。
+- 显式保留加法、SiLU 等中间结果的输入 dtype 舍入边界；指数等运算仍可能与其他后端不同，不保证逐位一致。
+- 反向保存两个输入并重算加法，不额外保存相加结果；峰值显存收益取决于实际张量生命周期。
+- 上层应分别传入 `base`、`delta`，保留 LoRA scaling、dtype 和模块 hooks 语义。
+- BW1000/gfx936 用户验证：独立测试 25 项、DiffSynth 集成测试 4 项通过；实际训练反馈 loss 无异常，单步约减少 0.3 s。该结果为特定工作负载反馈，不是通用性能保证。
+
+在已配置 AITER 的环境中，选择空闲卡执行（下例为卡 1）：
+
+```Bash
+HIP_VISIBLE_DEVICES=1 python -m pytest -q -s op_tests/test_add_swiglu_training.py
+```
+
 # 5\. Quant
 
 ### 5\.1\.1 per_token_group_quant_fp8
