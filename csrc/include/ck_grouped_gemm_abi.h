@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 // Pure-C public header for the CK grouped-GEMM C ABI.
 //
 // This header is intentionally free of C++, CK template, and torch/extension.h

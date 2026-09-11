@@ -1,8 +1,15 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+#
+# Modified by Hygon in 2026: FP8/blockscale reference validation and AITER integration.
+
 # Note: will remove this file after BU, just for verify. !!!!!!!!!!!!!!!
 
-# SPDX-License-Identifier: MIT
  
 import torch
+import functools
+from aiter.ops.triton.moe_op_silu_fused import fused_moe_silu as triton_moe_silu
 import pytest
 from typing import Dict, Optional
 import aiter
@@ -984,27 +991,29 @@ def test_fused_moe(
     )
     # config will be auto selected in triton_moe
     # config = None
-    _triton_moe = triton_moe_silu if silu_fused else triton_moe
+    if silu_fused and int8_w8a8:
+        raise NotImplementedError("The fused-SiLU test backend does not support INT8 W8A8")
+    _triton_moe = triton_moe_silu if silu_fused else functools.partial(triton_moe, sorted_weights=None)
     triton_out_device = triton_out.to("cuda")
     triton_out_silu_device = triton_out_silu.to("cuda")
 
     _triton_moe(
-        a.to("cuda"),
-        b.to("cuda"),
-        triton_out_silu_device if silu_fused else triton_out_device,
-        a_scale.to("cuda"),
-        b_scale.to("cuda"),
-        b_zp,
-        topk_weights.to("cuda"),
-        topk_ids,
-        sorted_token_ids.to("cuda"),
-        expert_ids.to("cuda"),
-        num_tokens_post_padded.to("cuda"),
-        routed_weight,
-        top_k,
-        torch_to_triton_dtype[dtype],
+        A=a.to("cuda"),
+        B=b.to("cuda"),
+        C=triton_out_silu_device if silu_fused else triton_out_device,
+        A_scale=a_scale.to("cuda"),
+        B_scale=b_scale.to("cuda"),
+        B_zp=b_zp,
+        topk_weights=topk_weights.to("cuda"),
+        topk_ids=topk_ids,
+        sorted_token_ids=sorted_token_ids.to("cuda"),
+        expert_ids=expert_ids.to("cuda"),
+        num_tokens_post_padded=num_tokens_post_padded.to("cuda"),
+        mul_routed_weight=routed_weight,
+        top_k=top_k,
+        compute_type=torch_to_triton_dtype[dtype],
         use_fp8_w8a8=fp8_w8a8,
-        use_int8_w8a8=int8_w8a8,
+        **({"use_int4_w4a16": False} if silu_fused else {"use_int8_w8a8": int8_w8a8}),
         use_int8_w8a16=int8_w8a16,
         block_shape=block_shape,
         config=config,
@@ -1174,22 +1183,22 @@ def test_fused_moe_int4_w4a16(
     #         else triton_moe_set_use_persistent_kernel(False)
     #     )
 
-    _triton_moe = triton_moe_silu if silu_fused else triton_moe
+    _triton_moe = triton_moe_silu if silu_fused else functools.partial(triton_moe, sorted_weights=None)
     _triton_moe(
-        a,
-        b,
-        triton_out_silu if silu_fused else triton_out,
-        None,
-        b_scale,
-        b_zp,
-        topk_weights,
-        topk_ids,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        routed_weight,
-        top_k,
-        torch_to_triton_dtype[dtype],
+        A=a,
+        B=b,
+        C=triton_out_silu if silu_fused else triton_out,
+        A_scale=None,
+        B_scale=b_scale,
+        B_zp=b_zp,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        mul_routed_weight=routed_weight,
+        top_k=top_k,
+        compute_type=torch_to_triton_dtype[dtype],
         use_fp8_w8a8=False,
         use_int8_w8a16=False,
         use_int4_w4a16=True,
@@ -1290,22 +1299,22 @@ def test_fused_moe_int4_w4a8(
     )
 
     a_quant, a_scale = per_block_quant_wrapper((1, group_size))(per_token_quant_hip)(a)
-    _triton_moe = triton_moe
+    _triton_moe = functools.partial(triton_moe, sorted_weights=None)
     _triton_moe(
-        a_quant,
-        b,
-        triton_out,
-        a_scale,
-        b_scale,
-        b_zp,
-        topk_weights,
-        topk_ids,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        routed_weight,
-        top_k,
-        torch_to_triton_dtype[dtype],
+        A=a_quant,
+        B=b,
+        C=triton_out,
+        A_scale=a_scale,
+        B_scale=b_scale,
+        B_zp=b_zp,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        mul_routed_weight=routed_weight,
+        top_k=top_k,
+        compute_type=torch_to_triton_dtype[dtype],
         use_int4_w4a8=True,
         block_shape=[0, group_size],
         config=config,

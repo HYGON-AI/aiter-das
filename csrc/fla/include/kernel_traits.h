@@ -75,26 +75,26 @@ struct chunk_gated_delta_rule_fwd_traits
     constexpr static int kThreads = kNWarps * 64;
 
     // --- LDS partitioning ---
-    // GemmA uses direct-to-LDS W/K tiles.  The gfx938 BV64 path keeps the
-    // authoritative FP32 state in VGPRs and aliases the low 8 KiB of W with
-    // the chunk-local U/V image:
+    // The gfx938 BV64/BV128 paths keep authoritative FP32 state in VGPRs
+    // and alias W with the chunk-local U/V image:
     //
     //   [ 0 KiB, 16 KiB): W current, then U/V
     //   [16 KiB, 32 KiB): K current
     //
     // This exact 32-KiB footprint is what permits two 256-thread CTAs to
     // reside on a 64-KiB CU.  BV16/BV32 retain their established layouts.
-    constexpr static int kMicroBlockV = kBlockV == 64 ? 32 : kBlockV;
+    constexpr static bool kAliasWUV = kBlockV == 64 || kBlockV == 128;
+    constexpr static int kMicroBlockV = kAliasWUV ? 32 : kBlockV;
     constexpr static int kVTileStride = kMicroBlockV == 16 ? 32 : kMicroBlockV;
     constexpr static int kHLowStride = kBlockK;
     constexpr static int h_state_smem_size = 0;
-    constexpr static int v_tile_smem_size = kBlockV == 64
+    constexpr static int v_tile_smem_size = kAliasWUV
         ? 0
         : kBlockT * kVTileStride * sizeof(Element);
-    constexpr static int h_low_smem_size = kBlockV == 64
+    constexpr static int h_low_smem_size = kAliasWUV
         ? 0
         : kMicroBlockV * kHLowStride * sizeof(Element);
-    // BV32 reads W from GMEM.  BV16 and the new BV64 path stage W in LDS.
+    // BV32 reads W from GMEM; the other variants stage W in LDS.
     constexpr static int w_smem_size =
         kBlockV == 32 ? 0 : kBlockT * kBlockK * sizeof(Element);
     constexpr static int k_k_tile_smem_size =
@@ -108,12 +108,12 @@ struct chunk_gated_delta_rule_fwd_traits
         v_tile_smem_size + h_low_smem_size + w_smem_size + k_smem_size +
         projection_smem_size;
     static_assert(smem_size <= 65535, "smem size must be <= 64KB");
-    static_assert(kBlockV != 64 || smem_size == 32 * 1024,
-                  "BV64 must retain its exact two-CTA 32-KiB LDS budget");
+    static_assert(!kAliasWUV || smem_size == 32 * 1024,
+                  "BV64/BV128 require exactly 32 KiB of LDS");
 
-    // Force the BV64 compiler allocation budget to match the LDS residency
-    // target.  Other variants preserve their historical one-block contract.
-    constexpr static int kMinBlocksPerCU = kBlockV == 64 ? 2 : 1;
+    // Compiler allocation hint for the two-CTA residency target. Actual
+    // occupancy also depends on the final register allocation and hardware.
+    constexpr static int kMinBlocksPerCU = kAliasWUV ? 2 : 1;
 
     // --- per-warp work distribution for GemmA (w @ h) ---
     constexpr static int kShapeOuterW = kBlockT / kNWarps;  // e.g. 64 / 4 = 16

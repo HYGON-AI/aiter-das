@@ -1,4 +1,9 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+#
+# Modified by Hygon in 2026: expert-position buffers, ASM interfaces and reduction integration.
+
  
 import torch
 import torch.nn.functional as F

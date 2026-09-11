@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Hygon Info Technologies Ltd.
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 #include "rocm_ops.hpp"
 #include "fused_rmsnorm_rope.h"

@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 
 : "${DTK_PKG:?DTK_PKG must point to the DTK archive mounted on the Runner}"
 : "${TORCH_VERSION:?TORCH_VERSION must be set}"
 
 cp -f "${DTK_PKG}" /opt/
-cd /opt
+cd /opt || exit 1
 tar -xzf "$(basename "${DTK_PKG}")"
 rm -rf dtk
 mv dtk-* dtk
 source /opt/dtk/env.sh
 
-cd "${CI_PROJECT_DIR:?CI_PROJECT_DIR must be set by GitLab}"
+cd "${CI_PROJECT_DIR:?CI_PROJECT_DIR must be set by GitLab}" || exit 1
 
 # Install the newest AICC package available on the Runner's shared storage.
 # Its absence is non-fatal because some Runners include AICC already.
@@ -51,7 +53,7 @@ if [[ -n "${latest_aicc_run}" ]]; then
   echo "Selected AICC timestamp: ${latest_aicc_timestamp}"
 
   cp "${latest_aicc_run}" "/opt/${aicc_installer}"
-  cd /opt
+  cd /opt || exit 1
   chmod +x "${aicc_installer}"
 
   # GitLab Runner enables pipefail. When the installer exits, `yes` may get
@@ -72,7 +74,7 @@ else
   echo "No AICC installer found; continuing with the existing environment."
 fi
 
-cd "${CI_PROJECT_DIR:?CI_PROJECT_DIR must be set by GitLab}"
+cd "${CI_PROJECT_DIR:?CI_PROJECT_DIR must be set by GitLab}" || exit 1
 
 python -m pip install packaging -i https://pypi.tuna.tsinghua.edu.cn/simple/
 python -m pip install zmq -i https://pypi.tuna.tsinghua.edu.cn/simple/

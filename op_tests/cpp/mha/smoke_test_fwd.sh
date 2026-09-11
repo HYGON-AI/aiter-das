@@ -1,6 +1,6 @@
+#!/bin/bash
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
- #!/bin/bash
 EXE="$(find . -name benchmark_mha_fwd -type f | head -n 1)"
 KNAME=1
 

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 # Shared helpers for HCU C ABI test builds.
 # Real linker args (e.g. -lamdhip64) stay unchanged; only user-facing errors are sanitized.
 

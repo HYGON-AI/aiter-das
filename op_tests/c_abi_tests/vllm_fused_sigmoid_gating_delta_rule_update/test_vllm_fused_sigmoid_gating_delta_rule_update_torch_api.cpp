@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 #include "aiter_c_ops.h"
 
@@ -51,8 +52,12 @@ void run_case(const torch::jit::Module& fixture,
     };
 
     auto initial_state = load(fixture, name("initial_state")).clone();
+    auto A_log = load(fixture, name("A_log"));
+    require(
+        A_log.scalar_type() == torch::kFloat,
+        std::string(prefix) + " A_log fixture must be fp32");
     auto outputs = aiter::native::vllm_fused_sigmoid_gating_delta_rule_update(
-        load(fixture, name("A_log")),
+        A_log,
         load(fixture, name("a")),
         load(fixture, name("b")),
         load(fixture, name("dt_bias")),

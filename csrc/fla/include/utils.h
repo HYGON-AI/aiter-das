@@ -325,7 +325,7 @@ fla_store_v_tile_m32x16_bv16_swizzled(Element *tile_base, const int t_local,
 }
 
 template <typename Element, int BT, int BK, int kNWarps,
-          bool CheckBounds = false>
+          bool CheckBounds = false, int ColumnBegin = 0, int ColumnEnd = -1>
 __device__ __forceinline__ void
 fla_prefetch_w_to_lds(Element *w_lds_base, const Element *w_gmem_src,
                       const int stride_src, const int valid_t = BT)
@@ -340,6 +340,9 @@ fla_prefetch_w_to_lds(Element *w_lds_base, const Element *w_gmem_src,
     constexpr int kIteratorColumn = BK / (kLanesInColumn * kElemsPerAccess);
     constexpr int kIteratorRow =
         kElemsPerThread / (kIteratorColumn * kElemsPerAccess);
+    constexpr int kColumnEnd = ColumnEnd < 0 ? kIteratorColumn : ColumnEnd;
+    static_assert(ColumnBegin >= 0 && ColumnBegin < kColumnEnd &&
+                  kColumnEnd <= kIteratorColumn);
 
     using AccessType = __uint128_t;
 
@@ -359,7 +362,7 @@ fla_prefetch_w_to_lds(Element *w_lds_base, const Element *w_gmem_src,
 
     const fla_i32x4 buffer_rsrc = fla_make_uniform_buffer_rsrc(vec_ptr);
 #pragma unroll
-    for (int ic = 0; ic < kIteratorColumn; ++ic) {
+    for (int ic = ColumnBegin; ic < kColumnEnd; ++ic) {
         const int col_iterator_offset =
             ic * kLanesInColumn * kElemsPerAccess * sizeof(Element);
 #pragma unroll
@@ -436,7 +439,7 @@ fla_read_w_stage_bv64(Element *w_lds_base, const int t_stage,
 }
 
 template <typename Element, int BT, int BK, int kNWarps,
-          bool CheckBounds = false>
+          bool CheckBounds = false, int IterBegin = 0, int IterEnd = -1>
 __device__ __forceinline__ void
 fla_prefetch_k_to_lds(Element *k_lds_base, const Element *k_gmem_src,
                       const int stride_src, const int valid_t = BT)
@@ -451,6 +454,9 @@ fla_prefetch_k_to_lds(Element *k_lds_base, const Element *k_gmem_src,
     constexpr int kIteratorColumn = 1;
     constexpr int kIteratorRow =
         kElemsPerThread / (kIteratorColumn * kElemsPerAccess);
+    constexpr int kIterEnd = IterEnd < 0 ? kIteratorRow : IterEnd;
+    static_assert(IterBegin >= 0 && IterBegin < kIterEnd &&
+                  kIterEnd <= kIteratorRow);
 
     using AccessType = __uint128_t;
 
@@ -471,7 +477,7 @@ fla_prefetch_k_to_lds(Element *k_lds_base, const Element *k_gmem_src,
 
     const fla_i32x4 buffer_rsrc = fla_make_uniform_buffer_rsrc(vec_ptr);
 #pragma unroll
-    for (int ir = 0; ir < kIteratorRow; ++ir) {
+    for (int ir = IterBegin; ir < kIterEnd; ++ir) {
         const int row_iterator_offset =
             ir * kLanesInRow * kNWarps * stride_src * sizeof(Element);
         const int lds_offset =
@@ -543,6 +549,80 @@ fla_read_k_stage_alt_asm(Element *k_lds_base, const int k_stage)
         sizeof(fla_u32x4);
     auto *src_ptr = k_lds_base + in_partition_offset / sizeof(Element);
     return fla_ds_read_m32x16_alt_asm<Element>(src_ptr);
+}
+
+// Compact BV128 U/V image: T64 x V128 occupies exactly 16 KiB. Each V8
+// stays contiguous; the two-bit XOR serves BOTH the split ds_read_b128
+// phases and the consecutive-eight-lane write/matrix-read phases.
+__device__ __forceinline__ int fla_uv_index_bv128(const int t, const int v)
+{
+    const int r = t & 15;
+    const int g = (v >> 3) ^ ((r >> 1) & 3);
+    const int point = 256 * (t >> 4) + 64 * (r & 3) +
+        ((16 * (r >> 2) + g + 4 * (r & 1)) & 63);
+    return 8 * point + (v & 7);
+}
+
+// Iterations [0,2) and [2,4) overwrite the low/high 8-KiB W halves only
+// after their GEMM0 readers have finished. The m0 wrap matches K D2L;
+// swizzling the GMEM V8 group creates the compact U image directly.
+template <int Begin, int End, typename Element, typename Index,
+          bool CheckBounds>
+__device__ __forceinline__ void fla_prefetch_u_bv128_to_lds(
+    Element *uv_lds, const Element *u_chunk, const Index row_stride,
+    const int valid_t)
+{
+    static_assert(Begin >= 0 && Begin < End && End <= 4);
+    static_assert(sizeof(Element) == 2);
+    const int wave = threadIdx.x / 64;
+    const int lane = threadIdx.x & 63;
+    const int base = static_cast<int>(reinterpret_cast<uintptr_t>(uv_lds));
+    const fla_i32x4 rsrc = fla_make_uniform_buffer_rsrc(u_chunk);
+#pragma unroll
+    for (int it = Begin; it < End; ++it) {
+        const int t = 16 * it + 4 * (lane >> 4) + wave;
+        const int v8 = (lane & 15) ^ ((t >> 1) & 3);
+        int offset = static_cast<int>((Index(t) * row_stride + 8 * v8) *
+                                      sizeof(Element));
+        if constexpr (CheckBounds) {
+            offset = t < valid_t ? offset : -1;
+        }
+        const int target = __builtin_amdgcn_readfirstlane(
+            base + 4096 * it + 1024 * wave + ((4 * (wave & 1)) << 16));
+        fla_buffer_load_dwordx4_to_lds_inline(rsrc, target, offset);
+    }
+}
+
+template <typename Element>
+__device__ __forceinline__ fla_u32x4 fla_read_u_bv128(
+    Element *uv_lds, const int t_stage)
+{
+    const int lane = threadIdx.x & 63;
+    const int t = 16 * t_stage + (lane & 15);
+    const int v = 32 * (threadIdx.x / 64) + 8 * (lane >> 4);
+    return fla_ds_read_b128(uv_lds + fla_uv_index_bv128(t, v));
+}
+
+template <typename Element>
+__device__ __forceinline__ void fla_store_v_bv128(
+    Element *uv_lds, const int t_stage, const fla_u32x4 packed)
+{
+#if defined(__gfx938__)
+    const int lane = threadIdx.x & 63;
+    const int t = 16 * t_stage + (lane & 15);
+    const int v = 32 * (threadIdx.x / 64) + 8 * (lane >> 4);
+    *reinterpret_cast<fla_u32x4 *>(uv_lds + fla_uv_index_bv128(t, v)) = packed;
+#endif
+}
+
+template <typename Element>
+__device__ __forceinline__ fla_u32x4 fla_read_v_alt_bv128(
+    Element *uv_lds, const int t_stage)
+{
+    const int lane = threadIdx.x & 63;
+    const int t = 16 * t_stage + lane / 4;
+    const int v = 32 * (threadIdx.x / 64) + 8 * (lane & 3);
+    return fla_ds_read_m32x16_alt(uv_lds + fla_uv_index_bv128(t, v));
 }
 
 // Four-wave BV64 GEMM1: wave_id selects BV, so every wave iterates over all

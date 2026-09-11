@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 #include <torch/all.h>
 #include <ATen/hip/HIPContext.h>

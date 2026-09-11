@@ -1,4 +1,7 @@
 #! /bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
 git submodule update --init
 pip3 install -r requirements.txt --trusted-host 10.68.20.101
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-// Copyright (c) 2026 Hygon Info Technologies Ltd.
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
  
 #pragma once
 #include "ck_tile/core.hpp"

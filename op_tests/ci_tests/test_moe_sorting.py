@@ -1,3 +1,5 @@
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 import torch
 from typing import Tuple
 import aiter

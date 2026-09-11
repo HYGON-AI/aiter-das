@@ -1,3 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+#
+# Apache-2.0 applies to the incorporated upstream portions;
+# MIT applies to the AITER/Hygon contributions.
+# See LICENSE and LICENSE.Apache-2.0.
+#
+# Modified by Hygon in 2026: MHC TileLang kernel extraction, integration and launch parameters.
+
 import math
 
 import tilelang

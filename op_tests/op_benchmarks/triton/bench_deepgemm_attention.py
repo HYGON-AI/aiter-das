@@ -4,6 +4,7 @@ import argparse
 
 import torch
 import os
+import shutil
 
 import triton
 
@@ -392,12 +393,22 @@ def run_benchmark(args: argparse.Namespace):
 
             src = os.path.join(triton_cache_dir, cache_key)
             dst = os.path.join(aot_kernel_dir, aot_name)
+            cache_root = os.path.realpath(triton_cache_dir)
+            output_root = os.path.realpath(aot_kernel_dir)
+            src = os.path.abspath(src)
+            dst = os.path.abspath(dst)
+            if (os.path.dirname(src) != cache_root or os.path.dirname(dst) != output_root
+                    or os.path.islink(src) or os.path.islink(dst)):
+                raise ValueError("AOT cache paths must be direct, non-symlink children of their roots")
             if os.path.exists(dst):
-                os.system(f"rm -rf {dst}")
-            os.system(f"mv {src} {dst}")
+                shutil.rmtree(dst)
+            shutil.move(src, dst)
             print(f"Moved cache from {src} to {dst}")
 
-            os.system("zip -r paged_mqa_logits_aot_kernel paged_mqa_logits")
+            artifact_root = os.path.dirname(output_root)
+            shutil.make_archive("paged_mqa_logits_aot_kernel", "zip",
+                                root_dir=os.path.dirname(artifact_root),
+                                base_dir=os.path.basename(artifact_root))
 
         return flops
 

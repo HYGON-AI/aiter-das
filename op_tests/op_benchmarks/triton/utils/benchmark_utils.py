@@ -146,7 +146,9 @@ def print_vgpr(fun, table_start="result-table-name"):
         sys.stdout = temp_file
         sys.stderr = temp_file
 
-        os.environ["ROGON_ENABLE_DUMP"] = "1"
+        # HCU Triton uses this legacy compiler option to dump assembly.
+        # The option name does not identify the GPU vendor.
+        os.environ["AMDGCN_ENABLE_DUMP"] = "1"
         os.environ["TRITON_ALWAYS_COMPILE"] = "1"
         os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
         fun()  # run the function

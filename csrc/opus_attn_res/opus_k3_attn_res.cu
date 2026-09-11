@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2026, Hygon Info Technologies Ltd. All rights reserved.
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 //
 // Kimi K3 AttnRes（gfx936/gfx946）。只保留生产路径上的六个 kernel，ID 从 0 重新编号。
 //

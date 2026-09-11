@@ -1,3 +1,5 @@
+// Modified by Hygon Information Technology Co., Ltd.
+// Changes: adapted HIP headers and stream handling for Hygon GPUs.
 /*
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.
  

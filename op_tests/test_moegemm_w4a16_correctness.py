@@ -2,6 +2,7 @@ import pytest
 import torch
 import itertools
 import math
+import json
 
 from aiter import dtypes
 from op_tests.utility.scalar_type import ScalarType, scalar_types
@@ -1233,6 +1234,8 @@ def fused_experts_impl(
         out_hidden_states = torch.empty_like(hidden_states)
 
     if use_mxfp4_w4a4:
+        from vllm.model_executor.layers.quantization.utils.mxfp4_utils import dequant_mxfp4
+
         # Weight has to be dequantized for mxfp4 emulation.
         w1 = dequant_mxfp4(w1, w1_scale, hidden_states.dtype)
         w1_scale = None

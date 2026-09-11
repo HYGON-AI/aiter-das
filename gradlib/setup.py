@@ -1,3 +1,5 @@
+# Modified by Hygon Information Technology Co., Ltd.
+# Changes: set build targets to gfx936 and gfx938.
 """
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.
  

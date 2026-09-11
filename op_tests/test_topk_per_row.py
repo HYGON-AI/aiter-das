@@ -1,4 +1,5 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Correctness + perf summary for topk_per_row (k=2048).
 
 Run: python op_tests/test_topk_per_row.py

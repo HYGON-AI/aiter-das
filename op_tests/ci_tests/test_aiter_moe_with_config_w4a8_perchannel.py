@@ -1,6 +1,9 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 # Test for get_aiter_moe_config and aiter_moe with w8a8
 
 import torch
+from aiter.ops.triton.fused_moe import triton_moe_sum
 import pandas as pd
 
 

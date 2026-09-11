@@ -158,6 +158,17 @@ void run_chunk_gated_delta_rule_fwd_bf16_state_fp32_bv64(
 void run_chunk_gated_delta_rule_fwd_bf16_state_bf16_bv64(
     Delta_rule_params &params, hipStream_t stream, ExpMode exp_mode);
 
+// gfx938 BV128 instances, selected by auto on the tuned 72-CU target or
+// explicitly with AITER_FLA_FORCE_BV=128 on supported gfx938 devices.
+void run_chunk_gated_delta_rule_fwd_fp16_state_fp32_bv128(
+    Delta_rule_params &params, hipStream_t stream, ExpMode exp_mode);
+void run_chunk_gated_delta_rule_fwd_fp16_state_bf16_bv128(
+    Delta_rule_params &params, hipStream_t stream, ExpMode exp_mode);
+void run_chunk_gated_delta_rule_fwd_bf16_state_fp32_bv128(
+    Delta_rule_params &params, hipStream_t stream, ExpMode exp_mode);
+void run_chunk_gated_delta_rule_fwd_bf16_state_bf16_bv128(
+    Delta_rule_params &params, hipStream_t stream, ExpMode exp_mode);
+
 }  // namespace FLA_NAMESPACE
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

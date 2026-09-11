@@ -39,6 +39,7 @@
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -54,12 +55,15 @@
 
 static inline int ceildiv(int a, int b) { return (a + b - 1) / b; }
 
-static bool fla_is_gfx938_device()
+// Empirical selection for the 72-CU gfx938 target. P=N*H gives 8P/4P/2P/P
+// CTAs for BV16/32/64/128. These count-only thresholds favor common workloads;
+// AITER_FLA_FORCE_BV allows fixed-shape tuning without extra auto branches.
+static int fla_select_bv_gfx938_72(int64_t p)
 {
-    // PyTorch's HIP build keeps the device-property compatibility API under
-    // at::cuda (the HIPContext header aliases the CUDA-facing interface).
-    const auto *props = at::cuda::getCurrentDeviceProperties();
-    return props != nullptr && std::strncmp(props->gcnArchName, "gfx938", 6) == 0;
+    if (p <= 9) return 16;
+    if (p <= 18) return 32;
+    if (p <= 36) return 64;
+    return 128;
 }
 
 static void check_same_device(const at::Tensor &reference,
@@ -212,7 +216,7 @@ static void set_params_chunk_gated_delta_rule_fwd(
 // run_chunk_gated_delta_rule_fwd
 //
 // Lightweight host dispatcher. Heavy template instantiations are split into
-// eight flat TUs under csrc/fla/instances/, keyed by
+// flat TUs under csrc/fla/instances/, keyed by
 // (input dtype, state dtype, BV).
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void run_chunk_gated_delta_rule_fwd(
@@ -230,9 +234,8 @@ void run_chunk_gated_delta_rule_fwd(
                            : FLA_NAMESPACE::ExpMode::Natural);
 
     // Development/A-B override. "auto" (or unset) uses the runtime selector;
-    // 16/32 force the established paths, while 64 is allowed only for the
-    // gfx938 BV64 implementations. This is intentionally host-only and does
-    // not change the public Python ABI.
+    // 16/32 force the established paths; 64/128 require gfx938.
+    // This is host-only and does not change the public Python ABI.
     const char *force_bv_env = std::getenv("AITER_FLA_FORCE_BV");
     int force_bv = 0;
     if (force_bv_env != nullptr && std::strcmp(force_bv_env, "auto") != 0 &&
@@ -243,35 +246,55 @@ void run_chunk_gated_delta_rule_fwd(
             force_bv = 32;
         } else if (std::strcmp(force_bv_env, "64") == 0) {
             force_bv = 64;
+        } else if (std::strcmp(force_bv_env, "128") == 0) {
+            force_bv = 128;
         } else {
             TORCH_CHECK(false,
-                        "AITER_FLA_FORCE_BV must be auto, 0, 16, 32, or 64; got ",
+                        "AITER_FLA_FORCE_BV must be auto, 0, 16, 32, 64, or 128; got ",
                         force_bv_env);
         }
     }
 
-    constexpr int kBlockV64 = 64;
-    // The current BV64 body is gfx938-only. The threshold is expressed in
-    // logical BV64 CTAs (ceil(V/64) * N * H); it is tuned on the 72-CU target
-    // and deliberately leaves smaller launches on BV16/BV32.
-    constexpr int kBV64MinLaunchBlocks = 128;
-    const bool bv64_arch_eligible = fla_is_gfx938_device();
-    // BV64 now follows the same gate/state/output/index feature axes as
-    // BV16/BV32. Architecture, layout, head shape, and launch parallelism are
-    // the remaining runtime eligibility gates.
-    const bool bv64_target_eligible =
-        bv64_arch_eligible && params.transpose_state_layout &&
+    // The device guard in the public wrapper has already selected k's device.
+    const auto *props = at::cuda::getCurrentDeviceProperties();
+    const bool wide_target_eligible =
+        props != nullptr && std::strncmp(props->gcnArchName, "gfx938", 6) == 0 &&
+        params.transpose_state_layout &&
         params.K == 128 && params.V == 128;
-    const int bv64_grid_x = ceildiv(params.V, kBlockV64);
-    const bool use_bv64 =
-        bv64_target_eligible && force_bv != 16 && force_bv != 32 &&
-        (force_bv == 64 ||
-         bv64_grid_x * params.N * params.H >= kBV64MinLaunchBlocks);
-
-    TORCH_CHECK(force_bv != 64 || bv64_target_eligible,
-                "AITER_FLA_FORCE_BV=64 requires gfx938, "
+    TORCH_CHECK((force_bv != 64 && force_bv != 128) || wide_target_eligible,
+                "AITER_FLA_FORCE_BV=", force_bv, " requires gfx938, "
                 "transpose_state_layout=true, and K=V=128");
-    if (use_bv64) {
+    int selected_bv = force_bv;
+    if (selected_bv == 0) {
+        const int64_t p = int64_t(params.N) * params.H;
+        // Preserve the established selector on devices not covered by tuning.
+        selected_bv = wide_target_eligible && 2 * p >= 128 ? 64
+                    : (4 * p >= 48 ? 32 : 16);
+        if (wide_target_eligible && props->multiProcessorCount == 72) {
+            selected_bv = fla_select_bv_gfx938_72(p);
+        }
+    }
+    if (selected_bv == 128) {
+        if (params.is_bf16) {
+            if (state_is_bf16) {
+                FLA_NAMESPACE::run_chunk_gated_delta_rule_fwd_bf16_state_bf16_bv128(
+                    params, stream, exp_mode);
+            } else {
+                FLA_NAMESPACE::run_chunk_gated_delta_rule_fwd_bf16_state_fp32_bv128(
+                    params, stream, exp_mode);
+            }
+        } else {
+            if (state_is_bf16) {
+                FLA_NAMESPACE::run_chunk_gated_delta_rule_fwd_fp16_state_bf16_bv128(
+                    params, stream, exp_mode);
+            } else {
+                FLA_NAMESPACE::run_chunk_gated_delta_rule_fwd_fp16_state_fp32_bv128(
+                    params, stream, exp_mode);
+            }
+        }
+        return;
+    }
+    if (selected_bv == 64) {
         if (params.is_bf16) {
             if (state_is_bf16) {
                 FLA_NAMESPACE::run_chunk_gated_delta_rule_fwd_bf16_state_bf16_bv64(
@@ -292,13 +315,7 @@ void run_chunk_gated_delta_rule_fwd(
         return;
     }
 
-    constexpr int kBlockV32 = 32;
-    constexpr int kBV32MinLaunchBlocks = 48;
-    const int bv32_grid_x = ceildiv(params.V, kBlockV32);
-    const bool use_bv32 =
-        force_bv == 32 ||
-        (force_bv != 16 &&
-         bv32_grid_x * params.N * params.H >= kBV32MinLaunchBlocks);
+    const bool use_bv32 = selected_bv == 32;
 
     if (params.is_bf16) {
         if (state_is_bf16) {

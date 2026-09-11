@@ -29,6 +29,11 @@ from aiter.jit.utils.chip_info import get_gfx, get_cu_num
 from functools import lru_cache
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
+try:
+    from boltops.fused_moe.triton.quant import dynamic_per_token_quant_fp8_i8
+except ImportError:
+    dynamic_per_token_quant_fp8_i8 = None
+
 
 def moe_sorting_ck(
     topk_ids,
@@ -75,6 +80,18 @@ def moe_sorting_ck(
     )
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert, moe_buf
 
+
+def per_token_quant_boltops_int8(x: torch.Tensor):
+    if dynamic_per_token_quant_fp8_i8 is None:
+        return per_token_quant_int8(x)
+    shape = x.shape
+    x_2d = x.reshape(-1, shape[-1])
+    x_q_2d = torch.empty_like(x_2d, dtype=torch.int8)
+    scale_1d = torch.empty((x_2d.shape[0],), dtype=torch.float32, device=x.device)
+    dynamic_per_token_quant_fp8_i8(x_q_2d, x_2d, scale_1d)
+    return x_q_2d.reshape_as(x), scale_1d.reshape(*shape[:-1], 1)
+
+
 #@staticmethod
 def run_fused_experts_asm_impl(hidden_states: torch.Tensor,
                    w1: torch.Tensor,
@@ -102,7 +119,8 @@ def run_fused_experts_asm_impl(hidden_states: torch.Tensor,
                    use_persist: bool = False,
                    persist_cu: Optional[int] = 0,
                    use_shuffle: Optional[int] = 0,
-                   solution_id: Optional[str] = None)-> torch.Tensor:
+                   solution_id: Optional[str] = None,
+                   padded_k: Optional[int] = None)-> torch.Tensor:
     return fused_experts_asm_impl(
                     hidden_states,
                     w1,
@@ -131,7 +149,8 @@ def run_fused_experts_asm_impl(hidden_states: torch.Tensor,
                     use_persist,
                     persist_cu,
                     use_shuffle,
-                    solution_id
+                    solution_id,
+                    padded_k=padded_k,
                 )
 
 def fused_moe_fake(
@@ -161,14 +180,16 @@ def fused_moe_fake(
     use_persist: bool = False,
     persist_cu: Optional[int] = 0,
     use_shuffle: Optional[int] = 0,
-    solution_id: Optional[str] = None
+    solution_id: Optional[str] = None,
+    padded_k: Optional[int] = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
     dtype = dtype
     # E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     # FIXME: W2.size must be same as hidden_dim
-    moe_buf = torch.empty((M, w2.size(1)), dtype=dtype, device=device)
+    output_dim = hidden_states.shape[1]
+    moe_buf = torch.empty((M, output_dim), dtype=dtype, device=device)
     return moe_buf
     
 
@@ -205,7 +226,8 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
                        solution_id: Optional[str] = None,
                        routed_scaling_factor: Optional[float] = 1.0,
                        gemm1_alpha: Optional[float] = None,
-                       gemm1_limit: Optional[float] = None)-> torch.Tensor:
+                       gemm1_limit: Optional[float] = None,
+                       padded_k: Optional[int] = None)-> torch.Tensor:
     
 
     activation, is_gated = normalize_moe_activation(activation, is_gated)
@@ -216,11 +238,18 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
     if use_shuffle:
         assert use_fp8_w8a8 or use_int8_w8a8 or (not use_int4_w4a16 and not use_int4_w4a16), "[ERROR]ASM Fused MoE only support f8 now."
 
+    real_model_dim = hidden_states.shape[1]
+    padded_model_dim = int(padded_k) if padded_k is not None else real_model_dim
+    if padded_model_dim < real_model_dim:
+        raise ValueError(
+            f"padded_k={padded_model_dim} must be >= hidden size {real_model_dim}"
+        )
+
     if use_int4_w4a16 or use_int8_w4a8:
         assert hidden_states.shape[1] // 2 == w1.shape[
             2], "Hidden size mismatch"
     else:
-        assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
+        assert padded_model_dim == w1.shape[2], "Hidden size mismatch"
 
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
@@ -233,6 +262,8 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
     num_tokens, _ = hidden_states.shape
     E, N, _ = w1.shape
     _, model_dim, inter_dim = w2.shape
+    if padded_k is not None:
+        assert model_dim == padded_model_dim, "Padded hidden size mismatch"
     if global_num_experts == -1:
         global_num_experts = E
     top_k_num = topk_ids.shape[1]
@@ -240,9 +271,21 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
     # https://github.com/vllm-project/vllm/issues/5938
     # need to change according to token
     CHUNK_SIZE = 65536
+
+    if use_int8_w8a8 and per_channel_quant:
+        arch = get_gfx()
+        first_stage_solution = solution_id
+        if first_stage_solution is None:
+            first_stage_solution = get_moe_asm_solution(arch, min(num_tokens, CHUNK_SIZE), N/2, w1.size(2), E, top_k_num, MoeQuantType.INT8_W8A8_C, use_shuffle)
+        sol_id1 = str(first_stage_solution).split("+", 1)[0]
+        if sol_id1 in {"default", "10000", "10001", "10002", "11000", "11001"}:
+            dtype_size = 4 if dtype == torch.float32 else 2 if dtype in (torch.float16, torch.bfloat16) else 1
+            max_chunk_by_srd = (2**31 - 1) // max(top_k_num * N * dtype_size, 1)
+            CHUNK_SIZE = min(CHUNK_SIZE, max(1, max_chunk_by_srd))
+
     M = min(num_tokens, CHUNK_SIZE)
 
-    out_hidden_states = torch.empty((num_tokens, model_dim), dtype=dtype, device=hidden_states.device)
+    out_hidden_states = torch.empty((num_tokens, real_model_dim), dtype=dtype, device=hidden_states.device)
     for chunk in range((num_tokens // CHUNK_SIZE) + 1):
         begin_chunk_idx, end_chunk_idx = (chunk * CHUNK_SIZE,
                                           min((chunk + 1) * CHUNK_SIZE,
@@ -256,6 +299,14 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
 
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
+        if padded_k is not None:
+            if curr_hidden_states.shape[1] != padded_model_dim:
+                padded_hidden_states = curr_hidden_states.new_empty(
+                    (tokens_in_chunk, padded_model_dim)
+                )
+                padded_hidden_states[:, :curr_hidden_states.shape[1]] = curr_hidden_states
+                padded_hidden_states[:, curr_hidden_states.shape[1]:].zero_()
+                curr_hidden_states = padded_hidden_states
 
         d_rows = curr_hidden_states.size(0) * top_k_num
         d_w1_cols = w1.size(1)
@@ -299,7 +350,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
             else:
                 config = decode_sol_w4a16(solution_id)
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert, moe_buf = (
-                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
+                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
             )
             if print_log():
                 print(f"Asm Moe Size: chunk:{chunk}, arch:{arch}, quant:{MoeQuantType.INT4_W4A16}, tokens:{tokens_in_chunk}, inter_dim:{int(N/2)}, model_dim:{w1.size(2)*2}, expert:{E}, topk:{top_k_num}")
@@ -426,7 +477,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
                 config["PERSIST_GROUP2"] = persist_cu
 
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert, moe_buf = (
-                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
+                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
             )
             if print_log():
                 print(f"Asm Moe Size: chunk:{chunk}, arch:{arch}, quant:{MoeQuantType.INT8_W8A8_C}, tokens:{tokens_in_chunk}, inter_dim:{int(N/2)}, model_dim:{w1.size(2)}, expert:{E}, topk:{top_k_num}")
@@ -437,7 +488,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
 
             if curr_hidden_states.dtype == torch.float16 or curr_hidden_states.dtype == torch.bfloat16:
                 # input_q,input_scale = per_token_quant_hip(curr_hidden_states)
-                input_q,input_scale = per_token_quant_int8(curr_hidden_states)
+                input_q,input_scale = per_token_quant_boltops_int8(curr_hidden_states)
             else:
                 input_q,input_scale = curr_hidden_states,a1_scale
             aiter.asm_fmoe_a8(d_w1_out,
@@ -468,7 +519,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
             )
 
             # bridge_q,bridge_scale = per_token_quant_hip(d_silu)
-            bridge_q,bridge_scale = per_token_quant_int8(d_silu)
+            bridge_q,bridge_scale = per_token_quant_boltops_int8(d_silu)
             aiter.asm_fmoe_a8(d_w2_out,
                     bridge_q, 
                     w2, 
@@ -498,7 +549,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
                 config["PERSIST_GROUP2"] = persist_cu
 
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert, moe_buf = (
-                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
+                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
             )
             if print_log():
                 print(f"Asm Moe Size: chunk:{chunk}, arch:{arch}, quant:{MoeQuantType.INT4_W4A8}, tokens:{tokens_in_chunk}, inter_dim:{int(N/2)}, model_dim:{w1.size(2)*2}, expert:{E}, topk:{top_k_num}")
@@ -573,7 +624,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
                 config["PERSIST_GROUP2"] = persist_cu
 
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert, moe_buf = (
-                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
+                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
             )
             if print_log():
                 print(f"Asm Moe Size: chunk:{chunk}, arch:{arch}, quant:{MoeQuantType.INT8_W8A8}, tokens:{tokens_in_chunk}, inter_dim:{int(N/2)}, model_dim:{w1.size(2)}, expert:{E}, topk:{top_k_num}")
@@ -645,7 +696,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
                 config["PERSIST_GROUP2"] = persist_cu
 
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert, moe_buf = (
-                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
+                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
             )
             if print_log():
                 print(f"Asm Moe Size: chunk:{chunk}, arch:{arch}, quant:{MoeQuantType.F8_W8A8_C}, tokens:{tokens_in_chunk}, inter_dim:{int(N/2)}, model_dim:{w1.size(2)}, expert:{E}, topk:{top_k_num}")
@@ -715,7 +766,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
                 config["PERSIST_GROUP2"] = persist_cu
 
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert, moe_buf = (
-                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
+                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
             )
             if print_log():
                 print(f"Asm Moe Size: chunk:{chunk}, arch:{arch}, quant:{MoeQuantType.F8_W8A8}, tokens:{tokens_in_chunk}, inter_dim:{int(N/2)}, model_dim:{w1.size(2)}, expert:{E}, topk:{top_k_num}")
@@ -788,7 +839,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
                 config["PERSIST_GROUP2"] = persist_cu
 
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert, moe_buf = (
-                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
+                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
             )
             if print_log():
                 print(f"Asm Moe Size: chunk:{chunk}, arch:{arch}, quant:{MoeQuantType.NO_QUANT}, tokens:{tokens_in_chunk}, inter_dim:{int(asm_inter_dim)}, model_dim:{w1.size(2)}, expert:{E}, topk:{top_k_num}")

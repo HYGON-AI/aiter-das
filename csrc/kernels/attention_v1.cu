@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+
  
 #include <torch/all.h>
 #include <ATen/hip/HIPContext.h>

@@ -1528,14 +1528,8 @@ def fused_moe_kernel(
                     else:
                         accumulator += tl.dot(a1, b1) * (a_scale_1[:, None] * b_scale_1)
                 else:
-                    if use_fp8_w8a8:
-                        # acc used to enable fp8_fast_accum
-                        accumulator = tl.dot(a, b, acc=accumulator)
-                    else:
-                        accumulator += tl.dot(a, b)
                     tl.static_assert(False, "Not implemented")
             else:
-                accumulator += tl.dot(a, b)
                 tl.static_assert(False, "Not implemented")
 
             # Advance the ptrs to the next K block.
@@ -2002,14 +1996,8 @@ def fused_moe_splitk_kernel(
                     else:
                         accumulator += tl.dot(a1, b1) * (a_scale_1[:, None] * b_scale_1)
                 else:
-                    if use_fp8_w8a8:
-                        # acc used to enable fp8_fast_accum
-                        accumulator = tl.dot(a, b, acc=accumulator)
-                    else:
-                        accumulator += tl.dot(a, b)
                     tl.static_assert(False, "Not implemented")
             else:
-                accumulator += tl.dot(a, b)
                 tl.static_assert(False, "Not implemented")
 
             # Advance the ptrs to the next K block.
@@ -2444,14 +2432,8 @@ def fused_moe_persistent_kernel(
                             else:
                                 accumulator += tl.dot(a1, b1) * (a_scale_1[:, None] * b_scale_1)
                         else:
-                            if use_fp8_w8a8:
-                                # acc used to enable fp8_fast_accum
-                                accumulator = tl.dot(a, b, acc=accumulator)
-                            else:
-                                accumulator += tl.dot(a, b)
                             tl.static_assert(False, "Not implemented")
                     else:
-                        accumulator += tl.dot(a, b)
                         tl.static_assert(False, "Not implemented")
 
                     # Advance the ptrs to the next K block.
@@ -2640,7 +2622,7 @@ def fused_moe(
             use_mxfp4_w4a4=use_mxfp4_w4a4,
             block_shape=block_shape,
             is_bottom=mul_routed_weight)
-        config = moe_config_func(M)
+        config = moe_config_func(total_tokens)
 
     if "USE_MLS_LOAD" not in config:
         config["USE_MLS_LOAD"] = False

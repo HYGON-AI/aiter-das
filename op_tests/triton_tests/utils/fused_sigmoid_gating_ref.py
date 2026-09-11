@@ -1,4 +1,13 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+#
+# Includes flash-linear-attention code under MIT, distributed through
+# vLLM with Apache-2.0 notices; both sets of terms are retained.
+# See LICENSE and LICENSE.Apache-2.0.
+#
+# Modified by Hygon in 2026: extract and rename the sigmoid-gating reference and adapt imports.
+
 
 import torch
 import triton

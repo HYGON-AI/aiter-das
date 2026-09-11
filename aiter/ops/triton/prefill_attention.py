@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Modified by Hygon Information Technology Co., Ltd.
+# Changes: updated file-header metadata and formatting.
  
 # Copyright (C) 2023-2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");

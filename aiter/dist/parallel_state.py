@@ -1,7 +1,9 @@
 # Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (C) 2023-2025 The vLLM team.
+# Adapted from
+# https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/parallel_state.py
 # Copyright (C) 2022-2026, NVIDIA CORPORATION. All rights reserved.
-# Copyright (c) 2026 Hygon Info Technologies Ltd.
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """vLLM distributed state.
 It takes over the control of the distributed environment from PyTorch.
 The typical workflow is:

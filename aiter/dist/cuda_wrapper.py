@@ -1,3 +1,5 @@
+# Modified by Hygon Information Technology Co., Ltd.
+# Changes: updated runtime API reference comments.
 '''
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (c) 2024, The vLLM team.
@@ -77,25 +79,25 @@ def find_loaded_library(lib_name) -> Optional[str]:
 
 class CudaRTLibrary:
     exported_functions = [
-        # ​cudaError_t cudaSetDevice ( int  device )
+        # cudaError_t cudaSetDevice ( int  device )
         Function("cudaSetDevice", cudaError_t, [ctypes.c_int]),
         # cudaError_t 	cudaDeviceSynchronize ( void )
         Function("cudaDeviceSynchronize", cudaError_t, []),
-        # ​cudaError_t cudaDeviceReset ( void )
+        # cudaError_t cudaDeviceReset ( void )
         Function("cudaDeviceReset", cudaError_t, []),
 
         # const char* 	cudaGetErrorString ( cudaError_t error )
         Function("cudaGetErrorString", ctypes.c_char_p, [cudaError_t]),
 
-        # ​cudaError_t 	cudaMalloc ( void** devPtr, size_t size )
+        # cudaError_t 	cudaMalloc ( void** devPtr, size_t size )
         Function("cudaMalloc", cudaError_t,
                  [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]),
-        # ​cudaError_t 	cudaFree ( void* devPtr )
+        # cudaError_t 	cudaFree ( void* devPtr )
         Function("cudaFree", cudaError_t, [ctypes.c_void_p]),
-        # ​cudaError_t cudaMemset ( void* devPtr, int  value, size_t count )
+        # cudaError_t cudaMemset ( void* devPtr, int  value, size_t count )
         Function("cudaMemset", cudaError_t,
                  [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]),
-        # ​cudaError_t cudaMemcpy ( void* dst, const void* src, size_t count, cudaMemcpyKind kind ) # noqa
+        # cudaError_t cudaMemcpy ( void* dst, const void* src, size_t count, cudaMemcpyKind kind ) # noqa
         Function("cudaMemcpy", cudaError_t, [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, cudaMemcpyKind
         ]),
@@ -103,7 +105,7 @@ class CudaRTLibrary:
         # cudaError_t cudaIpcGetMemHandle ( cudaIpcMemHandle_t* handle, void* devPtr ) # noqa
         Function("cudaIpcGetMemHandle", cudaError_t,
                  [ctypes.POINTER(cudaIpcMemHandle_t), ctypes.c_void_p]),
-        # ​cudaError_t cudaIpcOpenMemHandle ( void** devPtr, cudaIpcMemHandle_t handle, unsigned int  flags ) # noqa
+        # cudaError_t cudaIpcOpenMemHandle ( void** devPtr, cudaIpcMemHandle_t handle, unsigned int  flags ) # noqa
         Function("cudaIpcOpenMemHandle", cudaError_t, [
             ctypes.POINTER(ctypes.c_void_p), cudaIpcMemHandle_t, ctypes.c_uint
         ]),

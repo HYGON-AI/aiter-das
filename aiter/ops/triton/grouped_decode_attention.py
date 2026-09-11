@@ -4,6 +4,7 @@
 
 import os
 import json
+import ast
 import logging
 import functools
 from typing import Optional
@@ -396,19 +397,12 @@ def _fwd_grouped_kernel_stage1(
 
 
 def create_tuple(k):
-    if k[0] != '(' and k[-1] != ')':
+    if not (k.startswith("(") and k.endswith(")")):
         return k
-
-    s = k[1:-1]
-    entries = s.split(", ")
-    ret = []
-    for e in entries:
-        if e[0] == "'" or e[0] == '"':
-            ret.append(e[1:-1])
-        else:
-            ret.append(eval(e))
-    ret_t = tuple(ret)
-    return ret_t
+    value = ast.literal_eval(k)
+    if not isinstance(value, tuple):
+        raise ValueError(f"Expected a tuple configuration key: {k!r}")
+    return value
 
 
 def _load_config(path):

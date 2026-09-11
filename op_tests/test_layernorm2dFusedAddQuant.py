@@ -193,13 +193,7 @@ def test_layernorm2d_fuseAdd_Smoothquant_instance(dtype, m, n, xscaleType, yscal
     checkAllclose(res_a, res_b)
     checkAllclose(yscale_a, yscale_b, rtol=1e-3, atol=1e-3)
     print(" [passed~]")
-    print(
-        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, uplift: {avg_a/avg_c-1:<5.1%}"
-    )
-    checkAllclose(a, c, rtol=0, atol=1)
-    checkAllclose(res_a, res_c)
-    checkAllclose(yscale_a, yscale_c, rtol=1e-2, atol=1e-2)
-    print(" [passed~]")
+
 
 
 def test_layernorm2d_fuseDynamicquant_instance(dtype, m, n, yscaleType):

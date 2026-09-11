@@ -130,8 +130,8 @@ template <typename T, typename StateT, int kBlockV>
 void run_chunk_gated_delta_rule_fwd_k128_v128_bv(
     Delta_rule_params &params, hipStream_t stream, ExpMode exp_mode)
 {
-    static_assert(kBlockV == 16 || kBlockV == 32,
-                  "generic chunk_gated_delta_rule_fwd dispatch only supports BV16/BV32");
+    static_assert(kBlockV == 16 || kBlockV == 32 || kBlockV == 128,
+                  "generic chunk_gated_delta_rule_fwd dispatch supports BV16/BV32/BV128");
 
     BOOL_SWITCH(params.use_g, Use_G_, [&] {
     BOOL_SWITCH(params.use_gk, Use_GK_, [&] {

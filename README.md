@@ -1,4 +1,34 @@
+# AITER for Hygon GPUs
+
+## Upstream attribution and licensing
+
+This project is derived from [ROCm/aiter](https://github.com/ROCm/aiter), upstream branch `main`.
+The fixed upstream reference for this compliance review is commit
+[`552f4b85124b77b22db40223209ac1e19140d4d6`](https://github.com/ROCm/aiter/tree/552f4b85124b77b22db40223209ac1e19140d4d6).
+Later upstream imports and Hygon changes are recorded in the Git history; this reference does not
+claim that every file is identical to that commit.
+
+The original upstream MIT license and copyright notice are preserved in [LICENSE](LICENSE).
+Third-party portions retain their original licenses, including Apache-2.0 where indicated in the source.
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for upstream and component attribution, licenses, dependencies, and the separate list of source files whose provenance remains unresolved.
+
+Modified by Hygon Information Technology Co., Ltd. for Hygon GPU support.
+Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+This contribution notice applies to Hygon's original additions and substantive modifications,
+including GPU kernels, operator integration, communication, and JIT/build support.
+Hygon's original contributions are provided under the MIT license, subject to the original
+licenses of incorporated third-party code. Original upstream and third-party ownership is retained.
+
 ## Installation
+Python 3.10 or newer is required. The build tools addressed by the compliance review
+are pinned to `setuptools==79.0.1`, `setuptools_scm==10.2.1`, and `ninja==1.11.1`.
+For the commands below, which disable build isolation or dependency installation,
+install the pinned tools in the active Python environment first:
+
+```bash
+python -m pip install "setuptools==79.0.1" "setuptools_scm[toml]==10.2.1" "ninja==1.11.1"
+```
+
 method build for develop:
 ```
 git submodule update --init

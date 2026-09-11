@@ -155,7 +155,7 @@ def make_inputs(args: argparse.Namespace) -> dict[str, Any]:
     k = k.view(1, num_tokens, args.num_k_heads, args.head_k_dim).contiguous()
     v = v.view(1, num_tokens, args.num_v_heads, args.head_v_dim).contiguous()
 
-    A_log = randn((args.num_v_heads,), dtype, args.input_scale)
+    A_log = randn((args.num_v_heads,), torch.float32, args.input_scale)
     a = randn((ab_tokens, args.num_v_heads), dtype, args.input_scale)
     b = randn((ab_tokens, args.num_v_heads), dtype, args.input_scale)
     dt_bias = randn((args.num_v_heads,), dtype, args.input_scale)

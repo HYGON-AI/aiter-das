@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 // For C++ functions exported from aiter .so module, the visibility attribute.
 
 #pragma once

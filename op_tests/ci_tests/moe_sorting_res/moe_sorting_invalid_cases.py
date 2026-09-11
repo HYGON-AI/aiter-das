@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Focused regression checks for skipped routes and asynchronous sorting outputs."""
 import numpy as np
 import torch

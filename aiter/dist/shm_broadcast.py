@@ -1,8 +1,10 @@
+# Modified by Hygon Information Technology Co., Ltd. for Hygon GPU support.
 '''
+ * Copyright © Advanced Micro Devices, Inc. All rights reserved.
  * SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  
  * Copyright (c) 2024, The vLLM team.
- * Copyright (c) 2026 Hygon Info Technologies Ltd.
+ * Copyright (c) 2026 Hygon Information Technology Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.

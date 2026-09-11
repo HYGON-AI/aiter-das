@@ -7,13 +7,14 @@ import random
 import itertools
 import argparse
 from typing import Optional
+from op_tests.triton_tests.test_chunked_pa_prefill import _get_alibi_slopes
 from aiter.ops.triton.chunked_pa_prefill import _kernel_paged_attention_2d
 from aiter.ops.triton.chunked_pa_prefill import paged_attention_2d as paged_attention_2d_ori
 
 _is_hip = True
 
 version = triton.__version__.split(".")
-major_version, minor_version = eval(version[0]), eval(version[1])
+major_version, minor_version = int(version[0]), int(version[1])
 os.environ["AMDGCN_USE_BUFFER_OPS"] = "1"
 
 def seed_everything(seed):

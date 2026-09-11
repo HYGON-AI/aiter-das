@@ -92,7 +92,7 @@ publish:
     - TORCH_VER="${TORCH_VERSION}"
     - COMMIT_ID="$(git rev-parse --short=6 HEAD)"
     - CIUpload REPAIR --dtk_version ${DTK_VER} --torch_version ${TORCH_VER} --git_commit ${COMMIT_ID} --outputdir output -f dist/*manylinux*.whl
-    - CIUpload --devpi_url "${DEVPI_URL}" --devpi_user "${devpi_nightly_user}" --devpi_password "${devpi_nightly_password}" --dtk_pkg_name "$(basename "${DTK_PKG}")" -f output/*.whl
+    - CIUpload NIGHTLY --password ${devpi_nightly_password} --dtk_pkg_name $(basename ${DTK_PKG}) -f output/*.whl --record
   artifacts:
     paths:
       - output/*.whl

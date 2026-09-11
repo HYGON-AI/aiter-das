@@ -25,14 +25,15 @@ def scale_mm(
     # scale_type=0, scalar  scale
     # scale_type=1, channel scale
     # scale_type=2, block   scale
+    if inp.dim() >= 3:
+        raise NotImplementedError("scale_mm does not support inputs with 3 or more dimensions")
+
     global extensions_created
     if otype is None:
         otype = inp.dtype
     if extensions_created == False:
         hipb_create_extension()
         extensions_created = True
-    if inp.dim() >= 3:
-        assert(False, "not support 3dim input")
 
     inp_view = inp
     return hipb_mm(inp_view, weights.t(), -1, bias, otype, scale_a, scale_b, scale_c, scale_type)

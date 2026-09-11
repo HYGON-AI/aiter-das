@@ -264,7 +264,7 @@ def benchmark_one_shape(
 ) -> None:
     td = generate_big_fuse_test_data(n1=n1, mhc_mult=mhc_mult, hidden_size=hidden_size)
 
-    def fwd_fn() -> None:
+    def fwd_fn(td=td) -> None:
         mhc_pre_big_fuse(
             td["residual"],
             td["fn"],
@@ -329,7 +329,7 @@ def benchmark_one_shape(
                 parts.append(f"{name}={m:.3f}")
         print(f"    Profiler buckets mean (ms, eager):  {'  '.join(parts)}")
 
-    del td
+    del fwd_fn, td
     torch.cuda.empty_cache()
 
 

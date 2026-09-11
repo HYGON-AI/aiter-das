@@ -1,3 +1,4 @@
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 import os
 import functools
@@ -77,7 +78,7 @@ def get_gfx():
     if kfd_gfx:
         return kfd_gfx
     raise RuntimeError(
-        "cannot determine GPU arch (rocminfo/amdgpu-arch empty). "
+        "cannot determine HCU architecture from rocminfo or KFD sysfs. "
         "Set GPU_ARCHS, e.g. GPU_ARCHS=gfx938"
     )
 

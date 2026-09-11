@@ -1,4 +1,8 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# Modified by Hygon in 2026: use the default routing configuration only when config is None.
+
  
 from typing import Optional
 import functools

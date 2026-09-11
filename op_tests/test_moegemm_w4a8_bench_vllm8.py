@@ -1278,14 +1278,8 @@ def fused_moe_kernel(
                     accumulator += tl.dot(a1, b1) * a_scale_1[:,
                                                         None] * b_scale_1[None, :]
                 else:
-                    if use_fp8_w8a8:
-                        # acc used to enable fp8_fast_accum
-                        accumulator = tl.dot(a, b, acc=accumulator)
-                    else:
-                        accumulator += tl.dot(a, b)
                     tl.static_assert(False, "Not implemented")
             else:
-                accumulator += tl.dot(a, b)
                 tl.static_assert(False, "Not implemented")
 
             # Advance the ptrs to the next K block.

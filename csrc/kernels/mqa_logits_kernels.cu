@@ -1,4 +1,5 @@
 // Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: MIT
 
 #include <stdio.h>
 #include <limits>
@@ -25,6 +26,7 @@
 
 #include "aiter_hip_common.h"
 #include "rocm_ops.hpp"
+#include "paged_mqa_logits.h"
 
 #define fp8 uint8_t
 using half_t = __half;
@@ -1256,7 +1258,8 @@ void _mqa_logits_128x128x32_TN_impl(
     globalWorkSize[0][0] = totalWorkGroups0; // gridDim.x = size_m / 256
     globalWorkSize[0][1] = totalWorkGroups1; // gridDim.y = size_n / 256
 
-    const uint64_t tensor2dSizeC = 1 * std::max(size_m, strideC1J) * std::max(size_n, strideC2K);
+    const uint64_t tensor2dSizeC = std::max<uint64_t>(size_m, strideC1J) *
+                                   std::max<uint64_t>(size_n, strideC2K);
     uint64_t tensor2dSizeA = 1;
     uint64_t tensor2dSizeAStride = 0;
     uint64_t tensor2dSizeAOffset = 0;
@@ -1665,4 +1668,6 @@ torch::Tensor mqa_logits(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     MQA_LOGITS_PYBIND;
+    m.def("paged_mqa_logits_opus", &paged_mqa_logits_opus,
+          "gfx938/gfx946 FP8 paged MQA Opus launch (output preallocated)");
 }

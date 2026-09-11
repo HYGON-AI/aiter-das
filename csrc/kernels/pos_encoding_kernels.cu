@@ -1,3 +1,4 @@
+// Modified by Hygon Information Technology Co., Ltd. for Hygon GPU support.
 /*
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.
  

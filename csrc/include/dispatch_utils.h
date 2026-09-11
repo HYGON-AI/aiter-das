@@ -1,3 +1,4 @@
+// Modified by Hygon Information Technology Co., Ltd. for Hygon GPU support.
 /*
  * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
    * Copyright (C) 2024-2025, The vLLM team.

@@ -48,7 +48,7 @@ HCUTUNE_KEY_V2 = [
 ]
 
 version = triton.__version__.split(".")
-major_version, minor_version = eval(version[0]), eval(version[1])
+major_version, minor_version = int(version[0]), int(version[1])
 
 
 def input_helper(

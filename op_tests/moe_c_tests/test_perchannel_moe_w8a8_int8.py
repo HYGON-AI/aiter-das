@@ -1,3 +1,4 @@
+# Modified by Hygon Information Technology Co., Ltd.: quality and safety fixes.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from https://github.com/sgl-project/sglang/pull/3730
@@ -5,6 +6,7 @@ import itertools
 import unittest
 import triton
 import torch
+from aiter.ops.triton.fused_moe import triton_moe_sum
 
 # from vllm.model_executor.layers.activation import SiluAndMul
 from aiter.fused_moe_c  import moe_c_fused_experts,moe_c_fused_experts_bench,fused_experts_impl_channelwise_w8a8,moe_align_block_size,moe_kernel_prepare_input

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Benchmark multi-node CustomAllreduce Fabric against RCCL all-reduce."""
 
 import argparse

@@ -319,14 +319,41 @@ def _build_coverage_case(
             SglangChunkGatedCase(seqlen=130, dtype=torch.bfloat16, varlen=True),
             id="varlen_tail_bf16",
         ),
+        pytest.param(
+            SglangChunkGatedCase(
+                batch=4,
+                seqlen=129,
+                heads=32,
+                grouped_heads=16,
+                dtype=torch.float16,
+                state_dtype=torch.bfloat16,
+                state_scale=0.05,
+                use_gk=True,
+            ),
+            id="padded_p128_fp16_bf16_state_tail",
+        ),
+        pytest.param(
+            SglangChunkGatedCase(
+                seqlen=390,
+                heads=128,
+                grouped_heads=64,
+                dtype=torch.bfloat16,
+                state_dtype=torch.bfloat16,
+                state_scale=0.05,
+                varlen=True,
+                state_index_mode="random",
+            ),
+            id="varlen_p384_bf16_state_tail",
+        ),
     ],
 )
 def test_chunk_gated_delta_rule_fwd_boundary_cases_match_triton_sglang(
-    case: SglangChunkGatedCase,
+    monkeypatch: pytest.MonkeyPatch, case: SglangChunkGatedCase,
 ) -> None:
     if not torch.cuda.is_available():
         pytest.skip("ROCm/HIP CUDA-compatible device required")
 
+    monkeypatch.delenv("AITER_FLA_FORCE_BV", raising=False)
     _assert_case_close(case, _build_case(case))
 
 
@@ -481,6 +508,7 @@ def test_chunk_gated_delta_rule_fwd_model_shape_matches_triton_sglang(
 @pytest.mark.parametrize("shape", SHORT_MEDIUM_SHAPES)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_chunk_gated_delta_rule_fwd_coverage_short_medium_sglang(
+    monkeypatch: pytest.MonkeyPatch,
     use_g: bool,
     use_gk: bool,
     shape: CoverageShape,
@@ -489,6 +517,7 @@ def test_chunk_gated_delta_rule_fwd_coverage_short_medium_sglang(
     if not torch.cuda.is_available():
         pytest.skip("ROCm/HIP CUDA-compatible device required")
 
+    monkeypatch.delenv("AITER_FLA_FORCE_BV", raising=False)
     case, tensors = _build_coverage_case(
         shape, dtype=dtype, use_g=use_g, use_gk=use_gk
     )

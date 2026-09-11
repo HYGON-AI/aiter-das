@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 from __future__ import annotations
 
@@ -55,7 +56,7 @@ def run_case(
     num_tokens = num_reqs * seq_len
     state_rows = num_tokens + 4
 
-    A_log = randn((value_heads,), dtype, 0.05)
+    A_log = randn((value_heads,), torch.float32, 0.05)
     a = randn((num_tokens, value_heads), dtype, 0.1)
     b = randn((num_tokens, value_heads), dtype, 0.1)
     dt_bias = randn((value_heads,), dtype, 0.05)

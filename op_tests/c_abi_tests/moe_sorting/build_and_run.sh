@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 set -euo pipefail
 
 # 同时支持 develop（pip install -e）与安装版（pip install）环境。

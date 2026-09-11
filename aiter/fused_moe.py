@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-# Copyright (c) 2026 Hygon Info Technologies Ltd.
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
  
 import torch
+import torch.nn.functional as F
+from einops import rearrange
 import os
 from typing import Optional
 import functools
@@ -221,64 +223,7 @@ def fused_moe_1stage(
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
 ):
-    if quant_type == QuantType.No and ActivationType.Silu and not isG1U1:
-        # pure bf16
-        aiter.ck_moe(
-            hidden_states,
-            w1,
-            w2,
-            topk_weight,
-
-        )
-        aiter.fmoe(
-            moe_buf,
-            hidden_states,
-            w1,
-            w2,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            topk,
-        )
-
-    else:
-        assert False, "quant pass not support!"
-        # quant_type = (
-        #     QuantType.per_1x128 if quant_type == QuantType.per_128x128 else quant_type
-        # )
-        # quant_func = get_quant(quant_type)
-        # a1, a1_scale = quant_func(hidden_states, scale=a1_scale, quant_dtype=q_dtype_a)
-        # if quant_type == QuantType.per_1x128:
-        #     a1 = a1.view_as(hidden_states)
-        #     a1_scale = a1_scale.view(hidden_states.shape[0], -1).t().contiguous()
-        #     fmoe_func = functools.partial(
-        #         aiter.fmoe_fp8_blockscale_g1u1,
-        #         fc_scale_blkn=128,
-        #         fc_scale_blkk=128,
-        #     )
-        # elif isG1U1:
-        #     fmoe_func = aiter.fmoe_g1u1
-        # else:
-        #     fmoe_func = aiter.fmoe_int8_g1u0
-
-        # fmoe_func(
-        #     moe_buf,
-        #     a1,
-        #     w1,
-        #     w2,
-        #     sorted_ids,
-        #     sorted_weights,
-        #     sorted_expert_ids,
-        #     num_valid_ids,
-        #     topk,
-        #     a1_scale,
-        #     w1_scale,
-        #     w2_scale,
-        #     fc2_smooth_scale=None,
-        #     activation=activation,
-        # )
-    return moe_buf
+    raise NotImplementedError("The legacy fused_moe_1stage path is not implemented in this checkout")
 
 
 @functools.lru_cache(maxsize=1024)
@@ -316,116 +261,7 @@ def get_2stage_cfgs(
     activation,
     doweight_stage1,
 ):
-    def get_cfg_2stages(tune_file):
-        import pandas as pd
-
-        cfg_2stages = pd.read_csv(tune_file)
-        cfg_2stages = cfg_2stages.set_index(
-            [
-                "token",
-                "model_dim",
-                "inter_dim",
-                "expert",
-                "topk",
-                "act_type",
-                "dtype",
-                "q_dtype_a",
-                "q_dtype_w",
-                "q_type",
-                "use_g1u1",
-                "doweight_stage1",
-            ]
-        ).to_dict("index")
-        return cfg_2stages
-
-    global cfg_2stages
-    config_path = f"{AITER_ROOT_DIR}/aiter/configs/"
-    tune_file = os.path.join(config_path, "tuned_fmoe.csv")
-    untune_file = os.path.join(config_path, "untuned_fmoe.csv")
-    profile_file = os.path.join(config_path, "profile_fmoe.csv")
-    if cfg_2stages is None:
-        cfg_2stages = get_cfg_2stages(tune_file)
-    keys = (
-        token,
-        model_dim,
-        inter_dim,
-        expert,
-        topk,
-        str(activation),
-        str(dtype),
-        str(q_dtype_a),
-        str(q_dtype_w),
-        str(q_type),
-        use_g1u1,
-        doweight_stage1,
-    )
-
-    def MainFunc():
-        with open(untune_file, "a") as f:
-            q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
-            f.write(
-                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
-            )
-        logger.info("\033[34m Start tuning fmoe")
-        os.system(
-            f"{PY} {get_asm_dir()}/fmoe_2stages/tune.py -i {untune_file} -o {tune_file} -o2 {profile_file} --last"
-        )
-
-    def FinalFunc():
-        logger.info("\033[0m")
-
-    cfg = cfg_2stages.get(keys, None)
-    if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
-        lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
-        mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
-        cfg_2stages = get_cfg_2stages(tune_file)
-        cfg = cfg_2stages.get(keys, None)
-        if cfg is None:
-            logger.warning(f"Fmoe tuning not support for {keys}")
-
-    if cfg is None:
-        block_m = get_block_size_M(token, topk, expert, inter_dim)
-        ksplit = 0
-        tag = ""
-    else:
-        block_m = cfg["block_m"]
-        ksplit = cfg["ksplit"]
-        tag = cfg["tag"]
-
-    # war
-    if q_dtype_w in [dtypes.bf16, dtypes.fp16, torch.uint32]:
-        tag = "ck"
-
-    logger.info(f"[fused_moe] using {'default' if cfg is None else tag} for {keys} ")
-
-    if "ck" in tag:
-        return (
-            functools.partial(
-                ck_stage1,
-                activation=activation,
-            ),
-            aiter.ck_moe_stage2,
-            block_m,
-            ksplit,
-        )
-
-    # TODO: remove when stage2 support more size
-    tmpList = [32, 64, 128]
-    if block_m not in tmpList:
-        tag = ""
-        block_m = ([el for el in tmpList if block_m < el] + [128])[0]
-
-    return (
-        functools.partial(
-            asm_stage1,
-            kernelName=tag,
-            activation=activation,
-            quant_type=q_type,
-        ),
-        aiter.ck_moe_stage2,
-        block_m,
-        ksplit,
-    )
+    raise NotImplementedError("The legacy two-stage CK/ASM adapters are not implemented in this checkout")
 
 
 @functools.lru_cache()

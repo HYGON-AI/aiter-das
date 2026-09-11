@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Multi-node functional test for the custom-allreduce fabric transport.
 
 Launch one torchrun agent on each four-GPU node. For two nodes use ``--nnodes=2``

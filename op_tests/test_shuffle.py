@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
 from aiter.ops.shuffle import ck_shuffle_weight
 import torch
 import numpy as np

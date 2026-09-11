@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 #include "grouped_gemm.cpp"
 #include "grouped_gemm_fp16.cpp"

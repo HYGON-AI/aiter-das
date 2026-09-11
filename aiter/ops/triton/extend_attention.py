@@ -1,3 +1,5 @@
+# Modified by Hygon Information Technology Co., Ltd.
+# Changes: adapted kernel dispatch, cached-kernel loading, and tuning configuration.
 # Copyright (C) 2023-2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +21,7 @@ It supports page size = 1 and prefill with KV cache (i.e. extend).
 
 import functools
 import json
+import ast
 from typing import Any, Optional
 import torch
 import triton
@@ -1208,19 +1211,12 @@ def _fwd_kernel_v2_decode(
 
 
 def create_tuple(k):
-    if k[0] != '(' and k[-1] != ')':
+    if not (k.startswith("(") and k.endswith(")")):
         return k
-
-    s = k[1:-1]
-    entries = s.split(", ")
-    ret = []
-    for e in entries:
-        if e[0] == "'" or e[0] == '"':
-            ret.append(e[1:-1])
-        else:
-            ret.append(eval(e))
-    ret_t = tuple(ret)
-    return ret_t
+    value = ast.literal_eval(k)
+    if not isinstance(value, tuple):
+        raise ValueError(f"Expected a tuple configuration key: {k!r}")
+    return value
 
 
 def _load_config():

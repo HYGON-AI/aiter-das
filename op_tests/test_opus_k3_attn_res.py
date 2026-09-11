@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2026, Hygon Info Technologies Ltd. All rights reserved.
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Correctness and performance checks for Kimi K3 Opus AttnRes.
 
 ``OpusK3AttnResKernel``（``kernelId``）：

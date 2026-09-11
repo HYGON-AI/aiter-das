@@ -1,3 +1,4 @@
+# Modified by Hygon Information Technology Co., Ltd.: quality and safety fixes.
 """
 Copyright (c) 2024 by SageAttention team.
 
@@ -20,6 +21,7 @@ import triton.language as tl
 from triton.utils.hcutuner import get_gpu_label
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 import functools
+import json
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
@@ -158,7 +160,7 @@ def _get_config(key, head_dim):
         default_config = {
             "BLOCK_M": 128,
             "BLOCK_N": 64,
-            "STAGE": 1,
+            "STAGE": 3,
             "waves_per_eu": 1,
             "matrix_instr_nonkdim": 16,
             "kpack": 2,
@@ -171,7 +173,7 @@ def _get_config(key, head_dim):
         return config[key]
 
 
-def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.float16, return_lse=False):
+def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.float16, return_lse=False, config=None):
     o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
 
     if tensor_layout == "HND":
@@ -205,14 +207,13 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.f
 
     grid = lambda META: (triton.cdiv(qo_len, META['BLOCK_M']), h_qo, b   )
 
-    keys = [qo_len, kv_len, h_qo, num_kv_groups]
-    config, path = _get_config(*keys, head_dim)
-    assert config is not None, "ERROR: optimal config not found"
+    if config is None:
+        key = str((qo_len, kv_len, h_qo, num_kv_groups))
+        config = _get_config(key, head_dim)
+    # This kernel always runs the history pass followed by the causal diagonal pass.
+    config = {**config, "STAGE": 3}
 
-    fn = _attn_causal_fwd[grid] if not has_kernel_cache(path) else \
-            functools.partial(run_saved_kernel, _attn_causal_fwd, path, grid=grid)
-
-    fn(
+    _attn_causal_fwd[grid](
         q, k, v, q_scale, k_scale, o, lse,
         stride_bz_q, stride_h_q, stride_seq_q, 
         stride_bz_k, stride_h_k, stride_seq_k,  

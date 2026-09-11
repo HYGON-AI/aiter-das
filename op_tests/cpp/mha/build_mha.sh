@@ -1,6 +1,6 @@
+#!/bin/bash
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
- #!/bin/bash
 
 if [ $# -ge 1 ] ; then
     FMA_API=$1  # build fwd/bwd

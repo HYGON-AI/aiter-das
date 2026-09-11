@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
 import logging
 import os
 import torch
@@ -291,6 +293,25 @@ def _try_get_asm_config(
 
         arch = get_gfx()
         asm_token = min(m, 65536)  # 与chunksize取小
+        config_model_dim = k
+        config_use_shuffle = use_shuffle
+        padded_k = None
+        if quant_type in (MoeQuantType.W8A8, MoeQuantType.FP8_W8A8):
+            padded_k = k if k % 64 == 0 else ((k + 63) // 64) * 64
+            if padded_k != k:
+                config_model_dim = padded_k
+                config_use_shuffle = 1
+
+        def maybe_record_asm_padding(config: Dict[str, Any]) -> Dict[str, Any]:
+            if padded_k is not None and padded_k != k:
+                config = dict(config)
+                config.update({
+                    "ORIGINAL_K": k,
+                    "PADDED_K": padded_k,
+                    "USE_SHUFFLE": config_use_shuffle,
+                })
+            return config
+
         if quant_type == MoeQuantType.W4A16:
             from .fused_moe_asm_wna16 import decode_sol_w4a16, decode_sol_w4a16_gw32
             if block_size == 32:
@@ -320,15 +341,15 @@ def _try_get_asm_config(
                 arch=arch,
                 token=asm_token,
                 inter_dim=n,
-                model_dim=k,
+                model_dim=config_model_dim,
                 expert=e,
                 topk=top_k,
                 quant_type=asm_quant_type,
-                use_shuffle=use_shuffle,
+                use_shuffle=config_use_shuffle,
             )
             if solution == "default":
                 return None
-            return decode_sol_0(solution)
+            return maybe_record_asm_padding(decode_sol_0(solution, config_use_shuffle))
 
         if quant_type == MoeQuantType.FP8_W8A8:
             from .fused_moe_asm_wna16 import decode_sol_0
@@ -337,15 +358,15 @@ def _try_get_asm_config(
                 arch=arch,
                 token=asm_token,
                 inter_dim=n,
-                model_dim=k,
+                model_dim=config_model_dim,
                 expert=e,
                 topk=top_k,
                 quant_type=asm_quant_type,
-                use_shuffle=use_shuffle,
+                use_shuffle=config_use_shuffle,
             )
             if solution == "default":
                 return None
-            return decode_sol_0(solution)
+            return maybe_record_asm_padding(decode_sol_0(solution, config_use_shuffle))
 
         if quant_type == MoeQuantType.W16A16:
             from .fused_moe_asm_wna16 import decode_sol_0
@@ -517,7 +538,7 @@ def get_aiter_moe_config(
             return True, AiterMoeConfig(
                 quant_type=quant_type,
                 solution_type=spec_sol_type,
-                need_shuffle=((spec_sol_type == MoeSolutionType.MOE_C and (quant_type not in (MoeQuantType.W4A16, MoeQuantType.WFP4A16))) or (spec_sol_type == MoeSolutionType.ASM and bool(use_shuffle))),
+                need_shuffle=((spec_sol_type == MoeSolutionType.MOE_C and (quant_type not in (MoeQuantType.W4A16, MoeQuantType.WFP4A16))) or (spec_sol_type == MoeSolutionType.ASM and bool(config.get("USE_SHUFFLE", use_shuffle)))),
                 need_shuffle_scale=((spec_sol_type == MoeSolutionType.MOE_C) and (quant_type in (MoeQuantType.W4A16, MoeQuantType.WFP4A16))),
                 config=config,
             )
@@ -595,7 +616,7 @@ def get_aiter_moe_config(
             return True, AiterMoeConfig(
                 quant_type=quant_type,
                 solution_type=solution_type,
-                need_shuffle=(((solution_type == MoeSolutionType.MOE_C) and (quant_type not in (MoeQuantType.W4A16, MoeQuantType.WFP4A16))) or (solution_type == MoeSolutionType.ASM and bool(use_shuffle))),
+                need_shuffle=(((solution_type == MoeSolutionType.MOE_C) and (quant_type not in (MoeQuantType.W4A16, MoeQuantType.WFP4A16))) or (solution_type == MoeSolutionType.ASM and bool(config.get("USE_SHUFFLE", use_shuffle)))),
                 need_shuffle_scale=((solution_type == MoeSolutionType.MOE_C) and (quant_type in (MoeQuantType.W4A16, MoeQuantType.WFP4A16))),
                 config=config,
             )
@@ -749,6 +770,10 @@ def aiter_moe(
         per_channel_quant = True if block_shape is None else False
         cfg = moe_config.config
         solution_id = f"{cfg['SOL_ID1']}+{cfg['SOL_ID2']}"
+        padded_k = cfg.get("PADDED_K") if cfg else None
+        if padded_k is not None:
+            padded_k = int(padded_k)
+            w2_scale = _pad_tensor_dim(w2_scale, 1, padded_k) if w2_scale is not None else None
         return fused_experts_asm_impl(
             hidden_states,
             w1,
@@ -775,7 +800,8 @@ def aiter_moe(
             solution_id=solution_id,
             routed_scaling_factor=routed_scaling_factor,
             gemm1_alpha=gemm1_alpha,
-            gemm1_limit=gemm1_limit
+            gemm1_limit=gemm1_limit,
+            padded_k=padded_k,
         )
 
     if moe_config.solution_type == MoeSolutionType.TRITON:
@@ -972,6 +998,13 @@ def aiter_moe_shfl_weight(
             )
 
     if sol_type == MoeSolutionType.ASM:
+        padded_k = (moe_config.config or {}).get("PADDED_K")
+        padded_k = int(padded_k) if padded_k is not None else None
+        if padded_k is not None:
+            return _apply_shfl(
+                lambda x: asm_shuffle_weight_b8(_pad_tensor_dim(x, 2, padded_k), stage=1),
+                lambda x: asm_shuffle_weight_b8(_pad_tensor_dim(x, 1, padded_k), stage=2),
+            )
         return _apply_shfl(
             lambda x: asm_shuffle_weight_b8(x, stage=1),
             lambda x: asm_shuffle_weight_b8(x, stage=2),

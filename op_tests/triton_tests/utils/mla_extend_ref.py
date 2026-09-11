@@ -1,4 +1,5 @@
-# SPDX-License-Identifier: MIT
+# Modified by Hygon Information Technology Co., Ltd.: file-header notices only.
+# SPDX-License-Identifier: Apache-2.0 AND MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
  
 # Copyright (C) 2023-2025 SGLang Team

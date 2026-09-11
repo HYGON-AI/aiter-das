@@ -1,4 +1,5 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Per-row TopK (k=2048) from topk_per_row.cu."""
 
 from typing import Optional

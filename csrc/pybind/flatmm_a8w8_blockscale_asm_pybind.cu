@@ -1,3 +1,4 @@
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: MIT
  
 #include "asm_flatmm_a8w8_blockscale.h"

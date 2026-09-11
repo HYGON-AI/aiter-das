@@ -1,3 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2023-2025 SGLang Team
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+#
+# Apache-2.0 applies to the incorporated upstream portions;
+# MIT applies to the AITER/Hygon contributions.
+# See LICENSE and LICENSE.Apache-2.0.
+#
+# Modified by Hygon in 2026: Hygon grouped-decode tuning and configuration enumeration.
+#
+# Upstream also references LightLLM decoding kernels at commit
+# 96353e868a840db4d103138caf15ed9dbea8c186.
+
 import os
 import json
 import torch

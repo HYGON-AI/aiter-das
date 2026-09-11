@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -19,7 +21,7 @@ import aiter.jit
 # Trigger normal Python loading/JIT compilation of module_cpp_api.so.
 dtype = torch.float16
 device = torch.device("cuda")
-A_log = torch.zeros((1,), dtype=dtype, device=device)
+A_log = torch.zeros((1,), dtype=torch.float32, device=device)
 a = torch.zeros((1, 1), dtype=dtype, device=device)
 b = torch.zeros((1, 1), dtype=dtype, device=device)
 dt_bias = torch.zeros((1,), dtype=dtype, device=device)

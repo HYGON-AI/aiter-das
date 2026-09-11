@@ -13,30 +13,35 @@ vLLM/SGLang frontends.
 - JIT module: `module_cpp_api` in `aiter/jit/optCompilerConfig.json`.
 - Supported shape specialization: `headDimK == 128`, `headDimV == 128`,
   `chunk_size == 64`, `transpose_state_layout=True`.
-- Active kernel paths: BV16, BV32, and a gfx938-only logical-BV64 path. All
-  use 4 wavefronts per block and fp32 state accumulation. BV64 uses the same
+- Active kernel paths: BV16, BV32, and gfx938 BV64/BV128 paths. All
+  use 4 wavefronts per block and fp32 state accumulation. BV64/BV128 use the same
   frontend ABI and compile-time flag axes as BV16/BV32: fp16/bf16 input,
   BF16/FP32 state, G-only, GK-only, G+GK, and no-gate calls; optional
   initial/final state and `v_new`; padded or varlen indexing; and
   Natural/Exp2/SafeNatural exponent modes. The vLLM wrapper continues to
   require FP32 persistent state, while the SGLang wrapper accepts BF16 or
   FP32 state and keeps its fixed in-place SafeNatural contract.
-- The launcher auto-selects BV16/BV32 based on grid-level parallelism: it
-  estimates the BV32 block count as `ceil(V/32) * N * H` and picks BV32 once that reaches the
-  `kBV32MinLaunchBlocks` cutoff (48 blocks, i.e. `N * H >= 12` when `V=128`),
-  otherwise falls back to BV16. `headDimK == 128`, `headDimV == 128`,
-  `chunk_size == 64`, and `transpose_state_layout=true` are required for both
-  paths.
-- Eligible BV64 calls use logical block count `ceil(V/64) * N * H` and require
-  at least 128 blocks on gfx938. `AITER_FLA_FORCE_BV=16|32|64` is available
-  for development A/B; forcing 64 rejects unsupported architecture, layout,
-  or head-dimension combinations. On other architectures, or below the
-  threshold, the established BV16/BV32 selector remains active.
+- On 72-CU gfx938, auto uses `P=N*H`, where N is the batch size for padded
+  inputs or the sequence count for varlen inputs. BV16/32/64/128 launch
+  `8P/4P/2P/P` CTAs. Selection depends only on P: P<=9: BV16, 10..18: BV32,
+  19..36: BV64, and P>=37: BV128. These empirical thresholds balance launch
+  parallelism and work per CTA for common workloads. Other devices keep the
+  established selection rules.
+- `AITER_FLA_FORCE_BV=auto|0|16|32|64|128` is available for A/B testing.
+  Forcing 64/128 requires gfx938, the supported head shape and transposed
+  state layout. Unset and `0` use auto. Captured graphs retain the BV chosen
+  during capture.
 - Optional inputs covered by dispatch: `g`, `gk`, `initial_state`,
   `initial_state_indices`, `cu_seqlens`, `chunk_indices`, `chunk_offsets`.
   Prefer the upper framework to prepare/cache `chunk_indices` and
   `chunk_offsets` for varlen.
 - Gate tensors `g` and `gk` must be fp32.
+- BV128 assigns 32 value channels to each wave and keeps recurrent FP32
+  state in registers. Its 32 KiB LDS is split between K (16 KiB) and shared
+  W/U/V storage (16 KiB), with a swizzled U/V layout for vector accesses.
+  A two-stage T32 pipeline overlaps data transfers with computation and
+  prefetches the next chunk's W/G. Shared-memory reuse is synchronized, and
+  invalid rows in the final chunk are masked.
 
 ## Files
 
@@ -81,11 +86,10 @@ GEMM0 uses a builtin-only, compiler-scheduled sequential W-read dataflow; W/K
 DS reads remain compiler intrinsics so LLVM owns waitcnt inference. A/B testing
 of the former D2/D3 lookahead paths and a four-read fill found no stable gain,
 so the production path keeps the shorter live range of the sequential form. G is
-carried across chunks behind
-W-next, allowing the next chunk to publish W at `vmcnt(5)` while G remains in
-flight. Each GEMM0 BK also reuses its live BF16 state operands for the h
-snapshot store, avoiding a second state-pack pass. The production resource/ISA
-gate for the current toolchain is 144 VGPR, 81
+carried across chunks behind W-next, allowing the next chunk to publish W at
+`vmcnt(4)` while G remains in flight. Each GEMM0 BK also reuses its live BF16
+state operands for the h snapshot store, avoiding a second state-pack pass. The
+production resource/ISA gate for the current toolchain is 144 VGPR, 81
 SGPR, zero private segment/spill, 32 KiB dynamic LDS, normal and alternate
   `ds_read_m32x16_b16`, q-even `ds_read_b128`, and LIT/LIT+LTS MMAC for the
   selected FP16/BF16 input type.
@@ -237,6 +241,13 @@ PYTHONPATH=. python op_tests/op_benchmarks/bench_chunk_gated_hip.py \
 ```
 
 Use `--frontend sglang` for the SGLang reference path.
+
+For fixed workloads, compare variants with `AITER_FLA_FORCE_BV=16|32|64|128`
+on a supported device. Sequence length, head layout, CTA scheduling tails,
+and uneven varlen sequence lengths can shift which BV performs best.
+After warming up, alternate variant order with the same inputs, tensor
+addresses, and graph replay counts; reset persistent state between timing
+groups. Recapture graphs after changing BV.
 
 For profiler-driven timing, wrap the same benchmark command with `hipprof`.
 The benchmark's printed timing is useful for smoke checks, but profiler output

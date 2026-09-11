@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 # Test for get_aiter_moe_config and aiter_moe with W16A16 (non-quantized)
 
 import torch

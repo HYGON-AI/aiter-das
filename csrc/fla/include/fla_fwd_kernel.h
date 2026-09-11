@@ -1841,6 +1841,524 @@ run_chunk_gated_delta_rule_fwd_kernel_body_bv64_lds32(
 }
 
 
+// -----------------------------------------------------------------------------------------------
+// gfx938 BV128: one contiguous V32 per wave, two adjacent V rows per lane.
+// state_[vp][bk][i] owns H[32*wave+2*p+vp, 32*bk+8*q+2*i+{0,1}].
+// GEMM0 LIT produces even/odd V4 projections whose union is contiguous V8;
+// GEMM1 reads BOTH V alt halves and closes this mapping with LIT+LTS.
+// W occupies LDS [0,16 KiB), then U/V reuse it through fla_uv_index_bv128.
+// Each W half is released after its GEMM0 BK range; K stays in [16,32 KiB).
+// -----------------------------------------------------------------------------------------------
+
+template <int BkBegin, int BkEnd, typename Kernel_traits, typename Params>
+__device__ __forceinline__ void fla_gemm0_bv128_lit_range(
+    typename Kernel_traits::Element *w_lds,
+    const fla_f32x4 (&state_even)[2][4],
+    const fla_f32x4 (&state_odd)[2][4],
+    fla_f32x4 (&projection)[2][4], const Params &params, const int chunk,
+    const int v_begin, typename Kernel_traits::Element *h_ptr)
+{
+    using Element = typename Kernel_traits::Element;
+    using ElementVec4 = typename fla_dtype_traits<Element>::vec4_t;
+    using index_t = typename Kernel_traits::index_t;
+    const int wave = threadIdx.x / 64;
+    const int p = threadIdx.x & 15;
+    const int q = (threadIdx.x & 63) >> 4;
+#pragma unroll
+    for (int bk = BkBegin; bk < BkEnd; ++bk) {
+        ElementVec4 lo[2], hi[2];
+#pragma unroll
+        for (int vp = 0; vp < 2; ++vp) {
+            lo[vp] = fla_make_gemm0_state_operand_bv64<0, Element>(
+                state_even[vp][bk], state_odd[vp][bk]);
+            hi[vp] = fla_make_gemm0_state_operand_bv64<1, Element>(
+                state_even[vp][bk], state_odd[vp][bk]);
+        }
+#pragma unroll
+        for (int ts = 0; ts < 4; ++ts) {
+            const fla_u32x4 w_raw =
+                fla_read_w_stage_bv64<Element, 64, 128, 4>(w_lds, ts, bk);
+            const ElementVec4 w_lo = fla_vec4_from_pack<Element>(w_raw, 0);
+            const ElementVec4 w_hi = fla_vec4_from_pack<Element>(w_raw, 4);
+#pragma unroll
+            for (int vp = 0; vp < 2; ++vp) {
+                projection[vp][ts] = fla_mmac_f32_16x16x16_lit<Element>(
+                    w_lo, lo[vp], projection[vp][ts]);
+                projection[vp][ts] = fla_mmac_f32_16x16x16_lit<Element>(
+                    w_hi, hi[vp], projection[vp][ts]);
+            }
+        }
+#pragma unroll
+        for (int vp = 0; vp < 2; ++vp) {
+            const int v = v_begin + 32 * wave + 2 * p + vp;
+            const fla_u32x2 a = ck_tile::bit_cast<fla_u32x2>(lo[vp]);
+            const fla_u32x2 b = ck_tile::bit_cast<fla_u32x2>(hi[vp]);
+            const int32_t offset = static_cast<int32_t>(
+                (index_t(chunk) * params.h_chunk_stride +
+                 index_t(v) * params.K + 32 * bk + 8 * q) * sizeof(Element));
+            fla_buffer_store_vgpr<4>(
+                h_ptr, offset, fla_u32x4{a[0], a[1], b[0], b[1]});
+        }
+        // Complete this BK contribution here. Otherwise LLVM can sink the
+        // later-consumed T32 projections and retain several W/state packs
+        // across the U/K publication points instead of reusing their VGPRs.
+        asm volatile(""
+            : "+v"(projection[0][0]), "+v"(projection[0][1]),
+              "+v"(projection[0][2]), "+v"(projection[0][3]),
+              "+v"(projection[1][0]), "+v"(projection[1][1]),
+              "+v"(projection[1][2]), "+v"(projection[1][3]));
+    }
+}
+
+__device__ __forceinline__ void fla_scale_state_gk_bv128(
+    const fla_f32x2 pair, const int bk,
+    fla_f32x4 (&state_even)[2][4], fla_f32x4 (&state_odd)[2][4])
+{
+    const int q = (threadIdx.x & 63) >> 4;
+    // Gather each K8 factor once; both adjacent V rows use these factors.
+    fla_f32x4 even, odd;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int source = (16 * bk + 4 * q + i) * sizeof(uint32_t);
+        even[i] = ck_tile::bit_cast<float>(fla_ds_bpermute_u32(
+            source, ck_tile::bit_cast<uint32_t>(pair[0])));
+        odd[i] = ck_tile::bit_cast<float>(fla_ds_bpermute_u32(
+            source, ck_tile::bit_cast<uint32_t>(pair[1])));
+    }
+#pragma unroll
+    for (int vp = 0; vp < 2; ++vp) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const fla_f32x2 e = fla_pk_mul_f32(
+                fla_f32x2{state_even[vp][bk][2*i], state_even[vp][bk][2*i+1]},
+                fla_f32x2{even[2*i], even[2*i+1]});
+            const fla_f32x2 o = fla_pk_mul_f32(
+                fla_f32x2{state_odd[vp][bk][2*i], state_odd[vp][bk][2*i+1]},
+                fla_f32x2{odd[2*i], odd[2*i+1]});
+            state_even[vp][bk][2*i] = e[0];
+            state_even[vp][bk][2*i+1] = e[1];
+            state_odd[vp][bk][2*i] = o[0];
+            state_odd[vp][bk][2*i+1] = o[1];
+        }
+    }
+}
+
+template <int TsBegin, int TsEnd, typename Kernel_traits, typename Params,
+          bool FullChunk>
+__device__ __forceinline__ void fla_residual_bv128_range(
+    const Params &params, const int chunk, const int valid_t, const int v_begin,
+    typename Kernel_traits::Element *v_new_ptr,
+    typename Kernel_traits::Element *uv_lds,
+    const fla_f32x4 (&projection)[2][4], const float (&row_scale)[4])
+{
+    using Element = typename Kernel_traits::Element;
+    using index_t = typename Kernel_traits::index_t;
+    const int p = threadIdx.x & 15;
+    const int q = (threadIdx.x & 63) >> 4;
+    const int wave = threadIdx.x / 64;
+#pragma unroll
+    for (int ts = TsBegin; ts < TsEnd; ++ts) {
+        const int t = 16 * ts + p;
+        const bool valid_row = FullChunk || t < valid_t;
+        const fla_u32x4 u_raw = fla_read_u_bv128(uv_lds, ts);
+        // Interleave V parity here; the persistent state uses K parity.
+        fla_f32x4 even, odd;
+        fla_unpack_state_bk8_bv64<Element>(u_raw, even, odd);
+        even -= projection[0][ts];
+        odd -= projection[1][ts];
+        if (!valid_row) {
+            even = fla_f32x4{0, 0, 0, 0};
+            odd = fla_f32x4{0, 0, 0, 0};
+        }
+        if constexpr (Kernel_traits::Save_new_value) {
+            const int v = v_begin + 32 * wave + 8 * q;
+            const int32_t offset = static_cast<int32_t>(
+                (index_t(64 * chunk + t) * params.v_new_row_stride + v) *
+                sizeof(Element));
+            // Save the residual before row gating.
+            fla_buffer_store_vgpr<4>(
+                v_new_ptr, valid_row ? offset : -1,
+                fla_pack_state_bk8_bv64<Element>(even, odd));
+        }
+        if constexpr (Kernel_traits::Use_G) {
+            if (valid_row) {
+                fla_scale_v4_pairs(even, row_scale[ts]);
+                fla_scale_v4_pairs(odd, row_scale[ts]);
+            }
+        }
+        // Each lane replaces only its own U8; tail lanes publish zero.
+        fla_store_v_bv128(uv_lds, ts,
+                          fla_pack_state_bk8_bv64<Element>(even, odd));
+    }
+}
+
+template <int TsBegin, typename Kernel_traits>
+__device__ __forceinline__ void fla_gemm1_bv128_t32(
+    typename Kernel_traits::Element *k_lds, const fla_u32x4 (&v_raw)[2],
+    const float state_scale, const fla_f32x2 gk_scale,
+    fla_f32x4 (&state_even)[2][4], fla_f32x4 (&state_odd)[2][4])
+{
+    using Element = typename Kernel_traits::Element;
+    using ElementVec4 = typename fla_dtype_traits<Element>::vec4_t;
+    static_assert(TsBegin == 0 || TsBegin == 2);
+#pragma unroll
+    for (int bk = 0; bk < 4; ++bk) {
+        // Scale once, before the first T32 contribution. Each accumulator
+        // retains the original ts=0,1,2,3 MMAC order across the two calls.
+        if constexpr (TsBegin == 0) {
+#pragma unroll
+            for (int vp = 0; vp < 2; ++vp) {
+                fla_scale_v4_pairs(state_even[vp][bk], state_scale);
+                fla_scale_v4_pairs(state_odd[vp][bk], state_scale);
+            }
+            if constexpr (Kernel_traits::Use_GK) {
+                fla_scale_state_gk_bv128(gk_scale, bk, state_even, state_odd);
+            }
+        }
+#pragma unroll
+        for (int ts = TsBegin; ts < TsBegin + 2; ++ts) {
+            const fla_u32x4 k_raw =
+                fla_read_k_stage_alt_bv64<Element, 64, 128, 4>(k_lds, bk, ts);
+            const ElementVec4 ke = fla_vec4_from_pack<Element>(k_raw, 0);
+            const ElementVec4 ko = fla_vec4_from_pack<Element>(k_raw, 4);
+#pragma unroll
+            for (int vp = 0; vp < 2; ++vp) {
+                const ElementVec4 v =
+                    fla_vec4_from_pack<Element>(v_raw[ts - TsBegin], 4 * vp);
+                state_even[vp][bk] = fla_mmac_f32_16x16x16_lit_lts<Element>(
+                    ke, v, state_even[vp][bk]);
+                state_odd[vp][bk] = fla_mmac_f32_16x16x16_lit_lts<Element>(
+                    ko, v, state_odd[vp][bk]);
+            }
+        }
+    }
+}
+
+template <typename Kernel_traits, typename Params, bool FullChunk,
+          bool PrefetchNextW>
+__device__ __forceinline__ void
+run_chunk_gated_delta_rule_fwd_chunk_bv128_lds32(
+    const Params &params, const int chunk, const int valid_t,
+    const int v_begin,
+    const typename Kernel_traits::Element *k_ptr,
+    const typename Kernel_traits::Element *w_ptr,
+    const typename Kernel_traits::Element *u_ptr,
+    typename Kernel_traits::Element *h_ptr,
+    typename Kernel_traits::Element *v_new_ptr,
+    const float *g_ptr, const float *gk_ptr,
+    uint32_t &g_last_bits, uint32_t (&g_cur_bits)[4],
+    fla_f32x4 (&state_even)[2][4], fla_f32x4 (&state_odd)[2][4],
+    typename Kernel_traits::Element *w_uv_lds,
+    typename Kernel_traits::Element *k_lds, const int next_valid_t = 64)
+{
+    using Element = typename Kernel_traits::Element;
+    using index_t = typename Kernel_traits::index_t;
+    constexpr bool Use_G = Kernel_traits::Use_G;
+    constexpr bool Use_GK = Kernel_traits::Use_GK;
+    constexpr bool Use_exp2 = Kernel_traits::Use_exp2;
+    constexpr bool Use_safe_exp = Kernel_traits::Use_safe_exp;
+    const int t_begin = 64 * chunk;
+    const int last_idx = t_begin + valid_t - 1;
+    static_assert(!PrefetchNextW || FullChunk);
+
+    // W is carried from the prologue or the preceding chunk. G is younger
+    // than both W halves and can remain in flight during GEMM0.
+    // Native DS accesses/barriers let LLVM place the required LDS waits.
+    // Inline-asm VMEM requests still need the explicit age counts below.
+    wait_vmcnt<Use_G ? 4 : 0>();
+    fla_lds_barrier();
+
+    fla_f32x4 projection[2][4] = {};
+    fla_gemm0_bv128_lit_range<0, 2, Kernel_traits>(
+        w_uv_lds, state_even, state_odd, projection,
+        params, chunk, v_begin, h_ptr);
+    // Every wave must release low W before any U producer overwrites it.
+    fla_lds_barrier();
+    const Element *u_chunk =
+        u_ptr + index_t(t_begin) * params.u_row_stride + v_begin;
+    const Element *k_chunk =
+        k_ptr + index_t(t_begin) * params.k_row_stride;
+    // Preserve the first-use order: U_low, GK, K_low, U_high, K_high.
+    // K halves are T32xK128; W halves are T64xK64.
+    compiler_sched_barrier();
+    fla_prefetch_u_bv128_to_lds<0, 2, Element, index_t, !FullChunk>(
+        w_uv_lds, u_chunk, params.u_row_stride, valid_t);
+    compiler_sched_barrier();
+    fla_u32x2 gk_raw = {0, 0};
+    if constexpr (Use_GK) {
+        gk_raw = fla_prefetch_gk_pair_bv64<index_t>(
+            gk_ptr, params.gk_row_stride, last_idx);
+    }
+    compiler_sched_barrier();
+    fla_prefetch_k_to_lds<Element, 64, 128, 4, !FullChunk, 0, 2>(
+        k_lds, k_chunk, params.k_row_stride, valid_t);
+    compiler_sched_barrier();
+
+    fla_gemm0_bv128_lit_range<2, 4, Kernel_traits>(
+        w_uv_lds, state_even, state_odd, projection,
+        params, chunk, v_begin, h_ptr);
+    fla_lds_barrier();
+    compiler_sched_barrier();
+    fla_prefetch_u_bv128_to_lds<2, 4, Element, index_t, !FullChunk>(
+        w_uv_lds, u_chunk, params.u_row_stride, valid_t);
+    compiler_sched_barrier();
+    fla_prefetch_k_to_lds<Element, 64, 128, 4, !FullChunk, 2, 4>(
+        k_lds, k_chunk, params.k_row_stride, valid_t);
+    compiler_sched_barrier();
+
+    constexpr int kHighHStores = 4;
+    constexpr int kHalfVStores = Kernel_traits::Save_new_value ? 2 : 0;
+    constexpr int kHalfWNext = PrefetchNextW ? 2 : 0;
+    // Younger than U_low: GK, K_low x2, h_high x4, U_high x2, K_high x2.
+    wait_vmcnt<(Use_GK ? 1 : 0) + 2 + kHighHStores + 4>();
+    fla_lds_barrier();
+
+    float state_scale = 1.0f;
+    float row_scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    if constexpr (Use_G) {
+        fla_broadcast_g_cur_bv64(g_cur_bits);
+        g_last_bits = fla_recover_g_last_bits_bv64<FullChunk>(valid_t, g_cur_bits);
+        const float g_last = ck_tile::bit_cast<float>(g_last_bits);
+        state_scale = fla_exp<false, Use_exp2>(g_last);
+#pragma unroll
+        for (int ts = 0; ts < 4; ++ts) {
+            row_scale[ts] = fla_exp<Use_safe_exp, Use_exp2>(
+                g_last - ck_tile::bit_cast<float>(g_cur_bits[ts]));
+        }
+    }
+
+    fla_residual_bv128_range<0, 2, Kernel_traits, Params, FullChunk>(
+        params, chunk, valid_t, v_begin, v_new_ptr, w_uv_lds,
+        projection, row_scale);
+    fla_lds_barrier();
+    fla_u32x4 v_low[2];
+#pragma unroll
+    for (int ts = 0; ts < 2; ++ts) {
+        v_low[ts] = fla_read_v_alt_bv128(w_uv_lds, ts);
+    }
+    // Publish K_low/GK and finish every low-V read before W_next overwrites
+    // the low 8 KiB. Younger: h_high, U_high, K_high, v_new_low.
+    wait_vmcnt<kHighHStores + 4 + kHalfVStores>();
+    fla_lds_barrier();
+    if constexpr (PrefetchNextW) {
+        fla_prefetch_w_to_lds<Element, 64, 128, 4, true, 0, 1>(
+            w_uv_lds, w_ptr + index_t(t_begin + 64) * params.w_row_stride,
+            params.w_row_stride, next_valid_t);
+        compiler_sched_barrier();
+    }
+
+    fla_f32x2 gk_scale = {1.0f, 1.0f};
+    if constexpr (Use_GK) {
+        const fla_f32x2 pair = ck_tile::bit_cast<fla_f32x2>(gk_raw);
+        gk_scale = fla_f32x2{fla_exp<false, Use_exp2>(pair[0]),
+                             fla_exp<false, Use_exp2>(pair[1])};
+    }
+    fla_gemm1_bv128_t32<0, Kernel_traits>(
+        k_lds, v_low, state_scale, gk_scale, state_even, state_odd);
+
+    // U_high is older than K_high, v_new_low, and W_next_low.
+    wait_vmcnt<2 + kHalfVStores + kHalfWNext>();
+    fla_lds_barrier();
+    fla_residual_bv128_range<2, 4, Kernel_traits, Params, FullChunk>(
+        params, chunk, valid_t, v_begin, v_new_ptr, w_uv_lds,
+        projection, row_scale);
+    fla_lds_barrier();
+    fla_u32x4 v_high[2];
+#pragma unroll
+    for (int ts = 0; ts < 2; ++ts) {
+        v_high[ts] = fla_read_v_alt_bv128(w_uv_lds, ts + 2);
+    }
+    // Publish K_high and finish high-V reads. The two v_new store groups
+    // and W_next_low are younger; the upper W/G prefetches follow this wait.
+    wait_vmcnt<2 * kHalfVStores + kHalfWNext>();
+    fla_lds_barrier();
+    if constexpr (PrefetchNextW) {
+        fla_prefetch_w_to_lds<Element, 64, 128, 4, true, 1, 2>(
+            w_uv_lds, w_ptr + index_t(t_begin + 64) * params.w_row_stride,
+            params.w_row_stride, next_valid_t);
+        compiler_sched_barrier();
+        if constexpr (Use_G) {
+            fla_prefetch_g_chunk_bv64<index_t>(
+                g_ptr, params.g_row_stride, t_begin + 64, next_valid_t,
+                g_last_bits, g_cur_bits);
+            compiler_sched_barrier();
+        }
+    }
+    fla_gemm1_bv128_t32<2, Kernel_traits>(
+        k_lds, v_high, state_scale, gk_scale, state_even, state_odd);
+    // K can be reused next chunk. W_next/G_next remain governed by the
+    // next entrance wait; terminal output stores are drained by the body.
+    fla_lds_barrier();
+}
+
+template <typename Kernel_traits, typename Params>
+__device__ void run_chunk_gated_delta_rule_fwd_kernel_body_bv128_lds32(
+    const Params &params, const int i_v, const int i_nh)
+{
+    using Element = typename Kernel_traits::Element;
+    using State = typename Kernel_traits::State;
+    using index_t = typename Kernel_traits::index_t;
+    static_assert(Kernel_traits::kBlockT == 64 &&
+                  Kernel_traits::kBlockK == 128 &&
+                  Kernel_traits::kBlockV == 128 &&
+                  Kernel_traits::kNWarps == 4 &&
+                  Kernel_traits::Transpose_state,
+                  "BV128 requires BT64/BK128/W4 and transposed state");
+    static_assert(Kernel_traits::w_smem_size == 16 * 1024 &&
+                  Kernel_traits::k_smem_size == 16 * 1024 &&
+                  Kernel_traits::smem_size == 32 * 1024,
+                  "BV128 requires W/U/V16K + K16K");
+    const int i_n = i_nh / params.H;
+    const int i_h = i_nh - i_n * params.H;
+    const int v_begin = i_v * 128;
+    BlockInfo<Kernel_traits::Is_varlen, typename Kernel_traits::VarlenIndexT>
+        binfo(params, i_n);
+    const int nt = binfo.n_chunks();
+    const int seqlen = binfo.actual_seqlen();
+    const int h_per_k = params.H / params.Hg;
+    const Element *k_ptr = reinterpret_cast<const Element *>(params.k_ptr) +
+        binfo.template k_offset<index_t>(
+            i_h, params.k_row_stride, params.k_head_stride, h_per_k);
+    const Element *w_ptr = reinterpret_cast<const Element *>(params.w_ptr) +
+        binfo.template w_offset<index_t>(
+            i_h, params.w_row_stride, params.w_head_stride);
+    const Element *u_ptr = reinterpret_cast<const Element *>(params.u_ptr) +
+        binfo.template v_offset<index_t>(
+            i_h, params.u_row_stride, params.u_head_stride);
+    Element *h_ptr = reinterpret_cast<Element *>(params.h_ptr) +
+        binfo.template h_offset<index_t>(
+            i_h, params.h_chunk_stride, params.h_head_stride);
+    Element *v_new_ptr = nullptr;
+    if constexpr (Kernel_traits::Save_new_value) {
+        v_new_ptr = reinterpret_cast<Element *>(params.v_new_ptr) +
+            binfo.template v_offset<index_t>(
+                i_h, params.v_new_row_stride, params.v_new_head_stride);
+    }
+    const float *g_ptr = nullptr, *gk_ptr = nullptr;
+    if constexpr (Kernel_traits::Use_G) {
+        g_ptr = reinterpret_cast<const float *>(params.g_ptr) +
+            binfo.template g_offset<index_t>(i_h, params.g_row_stride);
+    }
+    if constexpr (Kernel_traits::Use_GK) {
+        gk_ptr = reinterpret_cast<const float *>(params.gk_ptr) +
+            binfo.template gk_offset<index_t>(
+                i_h, params.gk_row_stride, params.gk_head_stride);
+    }
+    const State *h0_ptr = nullptr;
+    State *ht_ptr = nullptr;
+    if constexpr (Kernel_traits::Use_initial_state) {
+        if (binfo.has_state()) {
+            h0_ptr = reinterpret_cast<const State *>(params.h0_ptr) +
+                binfo.template state_offset<index_t>(
+                    i_h, params.h0_batch_stride, params.h0_head_stride);
+        }
+    }
+    if constexpr (Kernel_traits::Store_final_state) {
+        if (binfo.has_state()) {
+            ht_ptr = reinterpret_cast<State *>(params.ht_ptr) +
+                binfo.template state_offset<index_t>(
+                    i_h, params.ht_batch_stride, params.ht_head_stride);
+        }
+    }
+
+    extern __shared__ uint8_t lds_base[];
+    Element *w_uv_lds = reinterpret_cast<Element *>(lds_base);
+    Element *k_lds = reinterpret_cast<Element *>(lds_base + 16 * 1024);
+    const int wave = threadIdx.x / 64;
+    const int p = threadIdx.x & 15;
+    const int q = (threadIdx.x & 63) >> 4;
+    fla_f32x4 state_even[2][4] = {}, state_odd[2][4] = {};
+    if constexpr (Kernel_traits::Use_initial_state) {
+        if (binfo.has_state()) {
+#pragma unroll
+            for (int vp = 0; vp < 2; ++vp) {
+#pragma unroll
+                for (int bk = 0; bk < 4; ++bk) {
+                    const int v = v_begin + 32 * wave + 2 * p + vp;
+                    const index_t offset = index_t(v) * params.K + 32 * bk + 8 * q;
+                    if constexpr (std::is_same_v<State, float>) {
+                        const fla_u32x4 lo = fla_load_state_fp32x4_direct(h0_ptr + offset);
+                        const fla_u32x4 hi = fla_load_state_fp32x4_direct(h0_ptr + offset + 4);
+                        fla_unpack_state_bk8_bv64_fp32(
+                            lo, hi, state_even[vp][bk], state_odd[vp][bk]);
+                    } else {
+                        const fla_u32x4 raw = fla_buffer_load_vgpr<4>(
+                            h0_ptr, static_cast<int32_t>(offset * sizeof(State)));
+                        wait_vmcnt<0>();
+                        fla_unpack_state_bk8_bv64<State>(
+                            raw, state_even[vp][bk], state_odd[vp][bk]);
+                    }
+                }
+            }
+        }
+    }
+    uint32_t g_last_bits = 0, g_cur_bits[4] = {};
+    if (nt > 0) {
+        const int first_valid_t = seqlen < 64 ? seqlen : 64;
+        compiler_sched_barrier();
+        fla_prefetch_w_to_lds<Element, 64, 128, 4, true>(
+            w_uv_lds, w_ptr, params.w_row_stride, first_valid_t);
+        compiler_sched_barrier();
+        if constexpr (Kernel_traits::Use_G) {
+            fla_prefetch_g_chunk_bv64<index_t>(
+                g_ptr, params.g_row_stride, 0, first_valid_t,
+                g_last_bits, g_cur_bits);
+            compiler_sched_barrier();
+        }
+    }
+    // Keep the partial terminal path outside the recurrent full-chunk loop.
+    // Otherwise its lane addresses stay live across every full chunk.
+    for (int chunk = 0; chunk < nt - 1; ++chunk) {
+        const int remaining = seqlen - 64 * (chunk + 1);
+        const int next_valid_t = remaining < 64 ? remaining : 64;
+        run_chunk_gated_delta_rule_fwd_chunk_bv128_lds32<Kernel_traits, Params, true, true>(
+            params, chunk, 64, v_begin, k_ptr, w_ptr, u_ptr, h_ptr,
+            v_new_ptr, g_ptr, gk_ptr, g_last_bits, g_cur_bits,
+            state_even, state_odd, w_uv_lds, k_lds, next_valid_t);
+    }
+    if (nt > 0) {
+        const int chunk = nt - 1;
+        const int valid_t = seqlen - 64 * chunk;
+        if (valid_t == 64) {
+            run_chunk_gated_delta_rule_fwd_chunk_bv128_lds32<Kernel_traits, Params, true, false>(
+                params, chunk, 64, v_begin, k_ptr, w_ptr, u_ptr, h_ptr,
+                v_new_ptr, g_ptr, gk_ptr, g_last_bits, g_cur_bits,
+                state_even, state_odd, w_uv_lds, k_lds);
+        } else {
+            run_chunk_gated_delta_rule_fwd_chunk_bv128_lds32<Kernel_traits, Params, false, false>(
+                params, chunk, valid_t, v_begin, k_ptr, w_ptr, u_ptr, h_ptr,
+                v_new_ptr, g_ptr, gk_ptr, g_last_bits, g_cur_bits,
+                state_even, state_odd, w_uv_lds, k_lds);
+        }
+    }
+    if constexpr (Kernel_traits::Store_final_state) {
+        if (binfo.has_state()) {
+#pragma unroll
+            for (int vp = 0; vp < 2; ++vp) {
+#pragma unroll
+                for (int bk = 0; bk < 4; ++bk) {
+                    const int v = v_begin + 32 * wave + 2 * p + vp;
+                    const index_t offset = index_t(v) * params.K + 32 * bk + 8 * q;
+                    if constexpr (std::is_same_v<State, float>) {
+                        const fla_f32x4 e = state_even[vp][bk], o = state_odd[vp][bk];
+                        fla_store_state_fp32x4_direct(ht_ptr + offset,
+                            ck_tile::bit_cast<fla_u32x4>(fla_f32x4{e[0], o[0], e[1], o[1]}));
+                        fla_store_state_fp32x4_direct(ht_ptr + offset + 4,
+                            ck_tile::bit_cast<fla_u32x4>(fla_f32x4{e[2], o[2], e[3], o[3]}));
+                    } else {
+                        fla_buffer_store_vgpr<4>(
+                            ht_ptr, static_cast<int32_t>(offset * sizeof(State)),
+                            fla_pack_state_bk8_bv64<State>(
+                                state_even[vp][bk], state_odd[vp][bk]));
+                    }
+                }
+            }
+        }
+    }
+    wait_vmcnt<0>();
+    fla_lds_barrier();
+}
+
 template <typename Kernel_traits, typename Params>
 __device__ void
 run_chunk_gated_delta_rule_fwd_kernel_body_bv32(
@@ -2288,7 +2806,10 @@ __device__ void
 run_chunk_gated_delta_rule_fwd_kernel_body(const Params &params, const int i_v,
                                            const int i_nh)
 {
-    if constexpr (Kernel_traits::kBlockV == 64) {
+    if constexpr (Kernel_traits::kBlockV == 128) {
+        run_chunk_gated_delta_rule_fwd_kernel_body_bv128_lds32<
+            Kernel_traits, Params>(params, i_v, i_nh);
+    } else if constexpr (Kernel_traits::kBlockV == 64) {
         run_chunk_gated_delta_rule_fwd_kernel_body_bv64_lds32<
             Kernel_traits, Params>(params, i_v, i_nh);
     } else if constexpr (Kernel_traits::kBlockV == 32) {

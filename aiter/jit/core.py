@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-# Copyright (c) 2026 Hygon Info Technologies Ltd.
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
  
 import functools
 import importlib
@@ -670,12 +670,28 @@ def get_module(md_name):
 rebuilded_list = ["module_aiter_enum"]
 
 
+def _module_cache_path(root, md_name, suffix=""):
+    # Module names are Python extension identifiers, never paths or shell text.
+    if not isinstance(md_name, str) or not md_name.isidentifier():
+        raise ValueError(f"Invalid JIT module name: {md_name!r}")
+    root = os.path.realpath(root)
+    return os.path.join(root, md_name + suffix)
+
+
 def rm_module(md_name):
-    os.system(f"rm -rf {get_user_jit_dir()}/{md_name}.so")
+    path = _module_cache_path(get_user_jit_dir(), md_name, ".so")
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
 
 
 def clear_build(md_name):
-    os.system(f"rm -rf {bd_dir}/{md_name}")
+    path = _module_cache_path(bd_dir, md_name)
+    if os.path.islink(path):
+        os.unlink(path)
+    elif os.path.exists(path):
+        shutil.rmtree(path)
 
 
 def build_module(
@@ -850,7 +866,8 @@ def build_module(
                 os.makedirs(blob_dir, exist_ok=True)
                 if AITER_LOG_MORE:
                     logger.info(f"exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}")
-                os.system(f"{PY} {blob_gen_cmd.format(blob_dir)}")
+                command = [PY, *shlex.split(blob_gen_cmd.format(shlex.quote(blob_dir)))]
+                subprocess.run(command, check=True)
                 sources += rename_cpp_to_cu([blob_dir], src_dir, hipify, recursive=True)
             return sources
 
@@ -961,6 +978,8 @@ def get_args_of_build(
     }
 
     def convert(d_ops: dict, module_name: str):
+        # optCompilerConfig.json is executable build configuration shipped with
+        # this module, not a user/model input. Treat changes to it as code changes.
         converted_ops = {}
         for k, val in d_ops.items():
             if isinstance(val, list):
@@ -1173,6 +1192,8 @@ def compile_ops(
                     if _aiter_tensor_t is not None:
                         namespace["aiter_tensor_t"] = _aiter_tensor_t
 
+                    # The signature comes from the already-loaded native extension,
+                    # which has the same trust level as this Python module.
                     exec(
                         f"from aiter import*\ndef {doc_str}: pass",
                         namespace,

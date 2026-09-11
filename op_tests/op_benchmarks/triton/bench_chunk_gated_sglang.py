@@ -497,21 +497,6 @@ def main():
     print(
         f"e2e(cur two-kernel) : {ms_e2e_cur:.3f} ms ({tflops(h_flops + o_flops, ms_e2e_cur):.3f} TF)"
     )
-    return
-    
-    print(
-        f"h_only : cur {ms_h_cur:.3f} ms ({tflops(h_flops, ms_h_cur):.3f} TF, {gbps(h_bytes, ms_h_cur):.3f} GB/s) | "
-        f"ref {ms_h_ref:.3f} ms ({tflops(h_flops, ms_h_ref):.3f} TF) | speedup(cur/ref) {ms_h_ref / ms_h_cur:.3f}x"
-    )
-    print(
-        f"o_only : cur {ms_o_cur:.3f} ms ({tflops(o_flops, ms_o_cur):.3f} TF) | "
-        f"ref {ms_o_ref:.3f} ms ({tflops(o_flops, ms_o_ref):.3f} TF) | speedup(cur/ref) {ms_o_ref / ms_o_cur:.3f}x"
-    )
-    print(
-        f"e2e    : cur {ms_e2e_cur:.3f} ms ({tflops(h_flops + o_flops, ms_e2e_cur):.3f} TF) | "
-        f"ref {ms_e2e_ref:.3f} ms ({tflops(h_flops + o_flops, ms_e2e_ref):.3f} TF) | speedup(cur/ref) {ms_e2e_ref / ms_e2e_cur:.3f}x"
-    )
-    print("=" * 112)
 
 
 if __name__ == "__main__":

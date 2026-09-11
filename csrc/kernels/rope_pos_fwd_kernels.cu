@@ -1,3 +1,4 @@
+// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: MIT
  
 #include "rope_common.h"

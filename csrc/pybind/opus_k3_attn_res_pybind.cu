@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2026, Hygon Info Technologies Ltd. All rights reserved.
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 #ifndef __HIP_DEVICE_COMPILE__
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-# Copyright (c) 2026 Hygon Info Technologies Ltd.
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 import torch
 from aiter.test_common import checkAllclose, perftest
 from aiter.fused_moe import torch_moe, fused_topk

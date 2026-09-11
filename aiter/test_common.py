@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-# Copyright (c) 2026 Hygon Info Technologies Ltd.
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 import torch
+import ast
+import torch.distributed as dist
 import torch.profiler as tpf
 import os
 import copy
@@ -516,7 +518,28 @@ def tensor_dump(x: torch.tensor, name: str, dir="./"):
 
 
 def tensor_load(filename: str):
-    DWs = np.fromfile(filename, dtype=np.uint32)
     metafile = ".".join(filename.split(".")[:-1]) + ".meta"
-    shape, dtype = [eval(line.strip()) for line in open(metafile)]
-    return torch.tensor(DWs).view(dtype).view(shape)
+    with open(metafile, encoding="utf-8") as metadata:
+        lines = metadata.read().splitlines()
+    if len(lines) != 2:
+        raise ValueError("Tensor metadata must contain exactly a shape and a dtype")
+    shape_text, dtype_text = (line.strip() for line in lines)
+    if shape_text.startswith("torch.Size(") and shape_text.endswith(")"):
+        shape_text = shape_text[len("torch.Size("):-1]
+    shape = ast.literal_eval(shape_text)
+    if not isinstance(shape, (tuple, list)) or any(type(dim) is not int or dim < 0 for dim in shape):
+        raise ValueError("Tensor shape must be a tuple or list of nonnegative integers")
+    if not dtype_text.startswith("torch."):
+        raise ValueError("Tensor dtype must be a torch dtype name")
+    dtype = getattr(torch, dtype_text[len("torch."):], None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"Unsupported tensor dtype: {dtype_text!r}")
+    data = np.fromfile(filename, dtype=np.uint8)
+    elements = 1
+    for dim in shape:
+        elements *= dim
+    if data.nbytes != elements * torch.empty((), dtype=dtype).element_size():
+        raise ValueError("Tensor data size does not match its metadata")
+    if elements == 0:
+        return torch.empty(shape, dtype=dtype)
+    return torch.from_numpy(data).view(dtype).view(shape)

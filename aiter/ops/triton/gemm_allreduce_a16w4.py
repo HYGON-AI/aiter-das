@@ -1,3 +1,4 @@
+# Modified by Hygon Information Technology Co., Ltd.: quality and safety fixes.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
@@ -1181,10 +1182,7 @@ def awq_gemm_scatter_kernel(
                 SPLITK, NUM_GROUPS, USE_REDUCE_KERNEL)
         else:
             # TODO: to be supported
-            assert False
-            return awq_gemm_kernel_streamk(a_ptr, b_ptr, c_ptr, zeros_ptr, scales_ptr, M, N, N2, K, K2, GROUP_SIZE, NUM_CUS, BLOCK_SIZE_M,
-                                           BLOCK_SIZE_N, BLOCK_SIZE_K,
-                                           DP_TILES, DANGLING_TILES, NUM_GROUPS, USE_REDUCE_KERNEL)
+            raise NotImplementedError("This AWQ Stream-K configuration is not supported")
 
 
 # qweights - [N     , K // 2], int8

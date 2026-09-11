@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-// Copyright (c) 2026 Hygon Info Technologies Ltd.
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 // ---- aiter_tensor_t / stream pybind infrastructure (ported from aiter-github) ----
 #include "aiter_tensor.h"
@@ -116,7 +116,36 @@ namespace py = pybind11;
             py::arg("out"), py::arg("input"));                                                          \
       m.def("swiglu_variant", &aiter::swiglu_variant, "SwiGLU variant activation for MoE.",              \
             py::arg("out"), py::arg("input"), py::arg("alpha"), py::arg("limit"),                        \
-            py::arg("mode"), py::arg("rows_per_block") = 1, py::arg("vec_size") = 2);
+            py::arg("mode"), py::arg("rows_per_block") = 1, py::arg("vec_size") = 2);                    \
+      m.def("fuse_silu_mul_quant", &aiter::fuse_silu_mul_quant,                                          \
+            "Fused silu_and_mul + per-token int8 dynamic quant (lightop port).",                         \
+            py::arg("out"), py::arg("input"), py::arg("scales"),                                         \
+            py::arg("num_local_tokens_tensor") = std::nullopt,                                           \
+            py::arg("topk") = 1, py::arg("expect_m") = -1,                                               \
+            py::arg("expert_ids") = std::nullopt);                                                       \
+      m.def("fuse_silu_mul_fp8_quant", &aiter::fuse_silu_mul_fp8_quant,                                  \
+            "Fused silu_and_mul + per-token fp8 dynamic quant (lightop port).",                          \
+            py::arg("out"), py::arg("input"), py::arg("scales"), py::arg("fp8type") = 0,                 \
+            py::arg("num_local_tokens_tensor") = std::nullopt,                                           \
+            py::arg("topk") = 1, py::arg("expect_m") = -1,                                               \
+            py::arg("expert_ids") = std::nullopt);                                                       \
+      m.def("fuse_silu_mul_quant_ep", &aiter::fuse_silu_mul_quant_ep,                                    \
+            "Fused silu_and_mul + per-token int8 quant, EP layout (lightop port).",                      \
+            py::arg("out"), py::arg("input"), py::arg("scales"),                                         \
+            py::arg("tokens_per_expert") = std::nullopt,                                                 \
+            py::arg("num_local_tokens_tensor") = std::nullopt,                                           \
+            py::arg("topk") = 1, py::arg("expect_m") = -1);                                              \
+      m.def("fuse_silu_mul_fp8_quant_ep", &aiter::fuse_silu_mul_fp8_quant_ep,                            \
+            "Fused silu_and_mul + per-token fp8 quant, EP layout (lightop port).",                       \
+            py::arg("out"), py::arg("input"), py::arg("scales"), py::arg("fp8type") = 0,                 \
+            py::arg("tokens_per_expert") = std::nullopt,                                                 \
+            py::arg("num_local_tokens_tensor") = std::nullopt,                                           \
+            py::arg("topk") = 1, py::arg("expect_m") = -1);                                              \
+      m.def("fuse_silu_and_mul_ep", &aiter::fuse_silu_and_mul_ep,                                        \
+            "Masked silu_and_mul on EP layout (lightop port).",                                          \
+            py::arg("out"), py::arg("input"), py::arg("mask_m"), py::arg("expect_m") = -1);              \
+      m.def("relu2", &aiter::relu2, "out = relu(x)^2 (lightop port).",                                   \
+            py::arg("out"), py::arg("input"));
 
 #define MOE_C_ACTIVATION_PYBIND                                                        \
       m.def("moe_c_silu_and_mul",                                                      \

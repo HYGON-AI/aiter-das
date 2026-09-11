@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2026, Hygon Info Technologies Ltd. All rights reserved.
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 """gfx938/gfx946 FP8 E4M3 Opus GEMM 测试。
 

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
  
 import os
 import torch
@@ -29,49 +30,7 @@ def run_ref(
     w2_scale_ep,
     quant_type,
 ):
-    ref = torch.zeros(tokens.shape, dtype=tokens.dtype, device=tokens.device)
-    # out_list = []
-    for i in range(world_size):
-        mask = (topk_ids >= i * E // world_size) & (
-            topk_ids < (i + 1) * E // world_size
-        )
-        if not mask.any():
-            continue
-        topk_ids_ep = topk_ids[mask.any(1)]
-        topk_weights_ep = topk_weights[mask.any(1)]
-        tokens_ep = tokens[mask.any(1)]
-        expert_mask = torch.zeros((E,), dtype=dtypes.i32, device=w1_ep[i].device)
-        expert_mask[E // world_size * i : E // world_size * (i + 1)] = 1
-        num_local_tokens = torch.tensor(
-            [tokens_ep.shape[0]], dtype=dtypes.i32, device=tokens_ep.device
-        )
-        quant_func = get_hip_quant(
-            quant_type
-            if quant_type != aiter.QuantType.per_128x128
-            else aiter.QuantType.per_1x128
-        )
-        tokens_ep_qt, scale = quant_func(tokens_ep, quant_dtype=dtypes.fp8)
-        out, us = run_perftest(
-            fused_moe,
-            tokens_ep_qt,
-            w1_ep[i],
-            w2_ep[i],
-            topk_weights_ep,
-            topk_ids_ep,
-            expert_mask,
-            num_local_tokens=num_local_tokens,
-            w1_scale=w1_scale_ep[i],
-            w2_scale=w2_scale_ep[i],
-            quant_type=quant_type,
-            a1_scale=scale,
-            dtype=dtypes.bf16,
-        )
-        print(f"rank {i} us={us:.4f}")
-        # out_list.append(out)
-        # return out_list
-        ref[mask.any(1)] += out
-        # ref[mask.any(1)] += out.to(dtypes.fp32)
-    return ref.to(tokens)
+    raise NotImplementedError("The legacy run_ref API is unavailable; this test uses fused_experts_impl for its reference")
 
 
 def run_mori(
@@ -438,7 +397,7 @@ if __name__ == "__main__":
     if args.shape is not None:
         l_shape = [args.shape]
     if args.quant_type is not None:
-        quant_types = [eval(f"aiter.QuantType.{args.quant_type}")]
+        quant_types = [getattr(aiter.QuantType, args.quant_type)]
 
     # for quant_type in quant_types:
         # for dtype in l_dtype:

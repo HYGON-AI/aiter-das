@@ -486,12 +486,16 @@ def test_chunk_gated_delta_rule_fwd_boundary_cases_match_triton_vllm(
         ),
     ],
 )
+@pytest.mark.parametrize("heads", [4, 128])
 def test_chunk_gated_delta_rule_fwd_optional_arguments_match_triton_vllm(
-    case: ChunkGatedCase,
+    monkeypatch: pytest.MonkeyPatch, case: ChunkGatedCase, heads: int,
 ) -> None:
     if not torch.cuda.is_available():
         pytest.skip("ROCm/HIP CUDA-compatible device required")
 
+    # P=128 exercises optional state/outputs through auto BV128 on 72-CU gfx938.
+    monkeypatch.delenv("AITER_FLA_FORCE_BV", raising=False)
+    case = replace(case, heads=heads, grouped_heads=heads // 2)
     _assert_case_close(case, _build_case(case))
 
 
@@ -589,6 +593,7 @@ def test_chunk_gated_delta_rule_fwd_model_shape_matches_triton_vllm(
 @pytest.mark.parametrize("shape", SHORT_MEDIUM_SHAPES)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_chunk_gated_delta_rule_fwd_coverage_short_medium_vllm(
+    monkeypatch: pytest.MonkeyPatch,
     use_g: bool,
     use_gk: bool,
     shape: CoverageShape,
@@ -597,6 +602,7 @@ def test_chunk_gated_delta_rule_fwd_coverage_short_medium_vllm(
     if not torch.cuda.is_available():
         pytest.skip("ROCm/HIP CUDA-compatible device required")
 
+    monkeypatch.delenv("AITER_FLA_FORCE_BV", raising=False)
     case, tensors = _build_coverage_case(
         shape, dtype=dtype, use_g=use_g, use_gk=use_gk
     )

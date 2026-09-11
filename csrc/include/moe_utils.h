@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Modified by Hygon in 2026: extract MoE declarations and integrate AITER interfaces.
+
 #pragma once
 #include <torch/all.h>
 #include <torch/extension.h>

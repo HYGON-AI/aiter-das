@@ -1,4 +1,14 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+#
+# Includes flash-linear-attention code under MIT, distributed through
+# vLLM with Apache-2.0 notices; both sets of terms are retained.
+# See LICENSE and LICENSE.Apache-2.0.
+#
+# Modified by Hygon in 2026: AITER architecture configuration, tuning and kernel dispatch.
+
 
 from typing import Tuple
 

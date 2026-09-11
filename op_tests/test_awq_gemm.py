@@ -1,3 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+#
+# Apache-2.0 applies to the incorporated upstream portions;
+# MIT applies to the AITER/Hygon contributions.
+# See LICENSE and LICENSE.Apache-2.0.
+#
+# Modified by Hygon in 2026: Hygon GEMM and layout validation.
+
 """AWQ Triton Implementation.
 
 This module contains the AWQ (Activation-Weight Quantization) implementation using Triton.
@@ -5,7 +15,6 @@ Cloned from vllm main branch (commit:cb080f32) and modified to fit roc.
 Original file path: vllm/model_executor/layers/quantization/awq_triton.py
 """
 
-# SPDX-License-Identifier: Apache-2.0
 
 import torch
 import pytest

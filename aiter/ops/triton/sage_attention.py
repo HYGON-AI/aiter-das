@@ -4,6 +4,7 @@ from typing import Any, List, Literal, Optional, Tuple, Union
 
 from aiter.ops.triton.sage_attention_quant_per_block import per_block_int8 as per_block_int8_triton
 from aiter.ops.triton.sage_attention_qk_int8_per_block_causal import forward as attn_true
+from aiter.ops.triton.sage_attention_qk_int8_per_block_causal import _get_config as _get_attn_true_config
 from aiter.ops.triton.sage_attention_qk_int8_per_block import _get_config as _get_attn_false_config
 from aiter.ops.triton.sage_attention_qk_int8_per_block import forward as attn_false
 
@@ -147,12 +148,12 @@ def sageattn_qk_int8_pv_fp16(
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
 
     seq_dim = 1 if tensor_layout == "NHD" else 2
-    nh_dim = 2 if tensor_layout == 0 else 1
+    nh_dim = 2 if tensor_layout == "NHD" else 1
 
     if smooth_k:
         km = k.mean(dim=seq_dim, keepdim=True)
-        nqheads = q.size(2)
-        nkheads = k.size(2)
+        nqheads = q.size(nh_dim)
+        nkheads = k.size(nh_dim)
         q_per_kv_heads = nqheads // nkheads
         if q_per_kv_heads > 1:
             # nheads_k => nheads_q
@@ -175,7 +176,14 @@ def sageattn_qk_int8_pv_fp16(
 
     if is_causal:
         assert attn_mask is None, "Mask should be None for causal attention."
-        o, lse = attn_true(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse)
+        key = _get_attn_false_config_key(q, k, tensor_layout)
+        config = _get_attn_true_config(key, q.shape[-1])
+        q_int8, q_scale, k_int8, k_scale = do_quant_qk(
+            q, k, BLKQ=config["BLOCK_M"], BLKK=config["BLOCK_N"], km=km,
+            sm_scale=sm_scale, tensor_layout=tensor_layout,
+            quantization_backend=quantization_backend,
+        )
+        o, lse = attn_true(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse, config=config)
     else:
         if attn_mask is not None:
             if tensor_layout == "HND":

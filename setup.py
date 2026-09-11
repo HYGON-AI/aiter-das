@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-# Copyright (c) 2026 Hygon Info Technologies Ltd.
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 import os
 import shutil
@@ -242,8 +242,8 @@ class NinjaBuildExtension(BuildExtension):
 setup_requires = [
     "packaging",
     "psutil",
-    "ninja",
-    "setuptools_scm",
+    "ninja==1.11.1",
+    "setuptools_scm==10.2.1",
 ]
 if PREBUILD_KERNELS == 1:
     setup_requires.append("pandas")
@@ -254,7 +254,7 @@ class ForcePlatlibDistribution(Distribution):
         return True
 
 
-AITER_FIXED_VERSION = os.environ.get("AITER_FIXED_VERSION", "0.1.5")
+AITER_FIXED_VERSION = os.environ.get("AITER_FIXED_VERSION", "0.1.6")
 AITER_USE_SCM_VERSION = int(os.environ.get("AITER_USE_SCM_VERSION", 0))
 version_kwargs = {"use_scm_version": True} if AITER_USE_SCM_VERSION else {"version": AITER_FIXED_VERSION}
 
@@ -263,20 +263,21 @@ setup(
     **version_kwargs,
     packages=["aiter"] if IS_DEVELOP_MODE else ["aiter_meta", "aiter"],
     include_package_data=True,
+    license_files=["LICENSE", "THIRD_PARTY_NOTICES.md", "LICENSE.Apache-2.0"],
     package_data={
         "": ["*"],
     },
     classifiers=[
         "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: BSD License",
+        "License :: OSI Approved :: MIT License",
         "Operating System :: Unix",
     ],
     # ext_modules=ext_modules,
     cmdclass={"build_ext": NinjaBuildExtension},
-    python_requires=">=3.8",
+    python_requires=">=3.10",
     install_requires=[
         "pybind11>=3.0.1",
-        "ninja",
+        "ninja==1.11.1",
         "pandas",
         "einops",
         "psutil",

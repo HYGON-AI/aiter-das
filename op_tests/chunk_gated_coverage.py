@@ -70,6 +70,10 @@ SHORT_MEDIUM_SHAPES = [
     CoverageShape(seqlen=256, heads=8, grouped_heads=8, varlen=False),
     CoverageShape(seqlen=512, heads=16, grouped_heads=8, varlen=True),
     CoverageShape(seqlen=513, heads=8, grouped_heads=4, varlen=False),
+    # On 72-CU gfx938, auto selects BV128 for P=128 padded and P=384 varlen.
+    # Cover recurrent full chunks plus a tail, and three aligned sequences.
+    CoverageShape(seqlen=129, heads=128, grouped_heads=64, varlen=False),
+    CoverageShape(seqlen=384, heads=128, grouped_heads=64, varlen=True),
 ]
 
 # Long / stress shapes -- padded buffers (buf_seqlen > seqlen) with a single

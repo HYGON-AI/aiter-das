@@ -1,3 +1,12 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+#
+# Modified by Hygon in 2026: AITER attention tuning, configuration enumeration and timing.
+#
+# Upstream attributes its attention kernels to LightLLM:
+# https://github.com/ModelTC/lightllm/blob/main/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py
+
 import os
 
 import json
@@ -7,13 +16,14 @@ import random
 import itertools
 import argparse
 from typing import Optional
+from op_tests.triton_tests.test_pa_prefill import _get_alibi_slopes
 from aiter.ops.triton.pa_prefill import _fwd_kernel, _fwd_kernel_alibi
 from aiter.ops.triton.pa_prefill import context_attention_fwd as context_attention_fwd_ori
 
 _is_hip = True
 
 version = triton.__version__.split(".")
-major_version, minor_version = eval(version[0]), eval(version[1])
+major_version, minor_version = int(version[0]), int(version[1])
 os.environ["AMDGCN_USE_BUFFER_OPS"] = "1"
 
 def seed_everything(seed):

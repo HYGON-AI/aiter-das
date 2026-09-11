@@ -1,3 +1,4 @@
+# Modified by Hygon Information Technology Co., Ltd.: quality and safety fixes.
 # SPDX-License-Identifier: Apache-2.0
 """Fused MoE kernel."""
 import functools
@@ -17,7 +18,7 @@ import time
 from aiter.test_common import  perftest
 import aiter
 from aiter import dtypes
-from aiter import moe_c_silu_and_mul,moe_c_moe_sum_opt_v2, per_token_quant_hip,moe_c_situ_glu
+from aiter import moe_c_moe_sum, moe_c_silu_and_mul,moe_c_moe_sum_opt_v2, per_token_quant_hip,moe_c_situ_glu
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.fused_moe import triton_moe_sum
 from triton.language.extra import libdevice
@@ -1195,7 +1196,6 @@ def fused_moe_kernel(
 
             # We accumulate along the K dimension.
             if use_int8_w8a16:
-                accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
                 tl.static_assert(False, "Not implemented")
             elif use_fp8_w8a8 or use_int8_w8a8:
                 if group_k > 0 and group_n > 0:
@@ -1223,10 +1223,8 @@ def fused_moe_kernel(
                     accumulator += tl.dot(a1, b1) * a_scale_1[:,
                                                         None] * b_scale_1[None, :]
                 else:
-                    accumulator = tl.dot(a, b, acc=accumulator)
                     tl.static_assert(False, "Not implemented")
             else:
-                accumulator += tl.dot(a, b)
                 tl.static_assert(False, "Not implemented")
 
             # Advance the ptrs to the next K block.
@@ -3032,7 +3030,7 @@ def try_get_optimal_moe_config_marlin(
         if dtype in ("int8_w4a8", "fp4_w4a8"):
             logical_k = w2_shape[1]
         elif dtype == "fp8_w8a8" and block_shape is None:
-            logical_k = w2_shape[2] if is_bottom else w1_shape[2]
+            logical_k = w2_shape[1] if is_bottom else w1_shape[2]
 
         if dtype in ("int4_w4a16", "fp4_w4a16", "int8_w4a8", "fp4_w4a8"):
             N = N * 2

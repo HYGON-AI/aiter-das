@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 # Test for AITER moe_c WFP4A8 channelwise.
 
 import argparse

@@ -1,3 +1,9 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+#
+# Modified by Hygon in 2026: Hygon CK/ASM paths and quantization tests.
+
 from aiter.ops.shuffle import ck_shuffle_weight, ck_shuffle_weight_down
 from aiter.ops.shuffle import asm_shuffle_weight_b8
 import pytest
@@ -410,8 +416,6 @@ def test_fused_moe_w8a8(M: int,
                               dtype=torch.int32)
         e_map = torch.full((E, ), -1, device="cuda", dtype=torch.int32)
         e_map[e_ids] = torch.arange(local_e, device="cuda", dtype=torch.int32)
-        w1_ref = w1_ref[e_ids]
-        w2_ref = w2_ref[e_ids]
         w1_qweight = w1_qweight[e_ids]
         w2_qweight = w2_qweight[e_ids]
         w1_scales = w1_scales[e_ids]

@@ -1,3 +1,4 @@
+# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
  # generate kernel instances to speed up compilation
 

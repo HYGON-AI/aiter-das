@@ -1,11 +1,11 @@
 [build-system]
 requires = [
-    "setuptools>=45",
-    "setuptools_scm[toml]>=6.2",
+    "setuptools==79.0.1",
+    "setuptools_scm[toml]==10.2.1",
     "wheel",
     "packaging",
     "psutil",
-    "ninja",
+    "ninja==1.11.1",
     "pandas"
 ]
 [tool.setuptools_scm]

@@ -1,3 +1,5 @@
+// Modified by Hygon Information Technology Co., Ltd.
+// Changes: adapted FP8 type selection for Hygon GPUs.
 #pragma once
 /*
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.

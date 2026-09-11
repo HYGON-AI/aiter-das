@@ -1,4 +1,9 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+#
+# Modified by Hygon in 2026: input dump/replay and Hygon test configurations.
+
  
 import math
 import random

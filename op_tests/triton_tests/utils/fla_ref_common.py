@@ -1,4 +1,9 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+#
+# Modified by Hygon in 2026: reference helper extraction and local device/shared-memory checks.
+
 
 import torch
 import triton

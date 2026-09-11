@@ -2,6 +2,7 @@ import re
 from decimal import Decimal
 from textwrap import shorten
 import json
+import ast
 import sys
 import os
 import shutil
@@ -160,7 +161,7 @@ def save_results_to_json(results, k1_filename, k2_filename):
     json_data_k2 = {}
 
     for idx, (cfg_num, params, k1_id, k2_id, total, k1_params, k2_params) in enumerate(results, 1):
-        config_dict = eval(params)  # 注意：实际使用中建议用更安全的方式解析
+        config_dict = ast.literal_eval(params)
 
         # 解析两个kernel的参数
         k1_block_n, k1_block_k, k1_group_m, k1_combine_scale_load, k1_use_mls_load, k1_instruction_sched_variant, k1_sched_latency, k1_kpack, k1_warps, k1_stages = k1_params

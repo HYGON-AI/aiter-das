@@ -351,7 +351,7 @@ if __name__ == "__main__":
     if args.shape is not None:
         l_shape = [args.shape]
     if args.quant_type is not None:
-        quant_types = [eval(f"aiter.QuantType.{args.quant_type}")]
+        quant_types = [getattr(aiter.QuantType, args.quant_type)]
 
     for quant_type in quant_types:
         for dtype in l_dtype:

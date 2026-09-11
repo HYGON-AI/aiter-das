@@ -3,7 +3,6 @@ import argparse
 import math
 import random
 
-#import flashinfer
 import torch
 import triton
 import triton.language as tl
@@ -11,7 +10,6 @@ import triton.language as tl
 from aiter.ops.triton.triton_decode_attention import decode_attention_fwd
 
 # pip install flashinfer-python
-#from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
 
 def scaled_dot_product_attention(query, key, value, h_q, h_kv, is_causal=False):
@@ -63,6 +61,8 @@ def run_torch_mla(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q,
 
 @torch.inference_mode()
 def run_flash_mla(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype):
+    from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+
     for i in range(b):
         blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = float("nan")
     blocked_v = blocked_k[..., :dv]
@@ -83,6 +83,8 @@ def run_flash_mla(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q,
 @torch.inference_mode()
 def run_flash_infer(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype):
     
+    import flashinfer
+
     for i in range(b):
         blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = float("nan")
 
