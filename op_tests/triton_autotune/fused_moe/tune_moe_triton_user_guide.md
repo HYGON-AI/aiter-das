@@ -1,9 +1,5 @@
 # Triton Fused MoE Autotune 一线使用手册
 
-**来源**
-
-- `http://112.11.119.99:10068/dcutoolkit/deeplearing/aiter/-/blob/rel-6.3.3/op_tests/triton_autotune/fused_moe/tune_moe_triton_user_guide.md`
-
 **文档版本**
 
 - `v1.0`
@@ -190,9 +186,9 @@ tune-moe-cli nmz int8_channel \
 训练后生成的配置会拷贝到本机安装目录（如 `/usr/local/lib/python3.10/dist-packages/aiter/ops/triton/configs/moe`）。  
 建议再做一步判断：这些配置是否需要回传到 aiter 仓库长期保存。
 
-目标仓库路径：
+目标路径：
 
-- `http://112.11.119.99:10068/dcutoolkit/deeplearing/aiter/-/tree/rel-6.3.3/aiter/ops/triton/configs/moe`
+- `/aiter/ops/triton/configs/moe`
 
 建议提交的场景：
 
