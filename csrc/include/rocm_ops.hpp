@@ -459,6 +459,16 @@ namespace py = pybind11;
             "Tensor block_table, Tensor k_scale, Tensor v_scale, "                           \
             "str kv_cache_dtype) -> ()");
 
+#define KVCACHE_METADATA_PYBIND                                                             \
+      m.def("fused_metadata_kernel_general", &fused_metadata_kernel_general,                \
+            "fused_metadata_kernel_general",                                                \
+            py::arg("seq_lens"), py::arg("req_to_token"), py::arg("req_pool_indices"),      \
+            py::arg("cache_seqlens_int32"), py::arg("cu_seqlens_k"), py::arg("page_table"), \
+            py::arg("swa_page_table") = std::nullopt,                                       \
+            py::arg("full_to_swa_mapping") = std::nullopt,                                  \
+            py::arg("B") = 0, py::arg("max_seq_pages") = 0, py::arg("page_size") = 1,       \
+            py::arg("seq_len_delta") = 0, py::arg("use_swa") = false);
+
 #define CPP_API_PYBIND                                                                         \
     m.def("moe_sorting_fwd",                                                                    \
           &aiter::native::moe_sorting_fwd,                                                      \
