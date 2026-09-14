@@ -41,6 +41,20 @@ except Exception as e:
 
 
 _AR_TRANSPORT_IDS = {"ipc": 0, "fabric": 1}
+_DEFAULT_AR_MAX_SIZE_MB = 256
+_LEGACY_AR_MAX_SIZE = 64 * 1024 * 1024
+
+
+def _requested_ar_max_size() -> int:
+    """Ordinary AllReduce admission limit in bytes, independent of allocation."""
+    value = os.environ.get("AITER_AR_MAX_SIZE_MB", str(_DEFAULT_AR_MAX_SIZE_MB))
+    try:
+        size_mb = int(value)
+    except ValueError:
+        raise ValueError("AITER_AR_MAX_SIZE_MB must be a positive integer") from None
+    if size_mb <= 0:
+        raise ValueError("AITER_AR_MAX_SIZE_MB must be a positive integer")
+    return size_mb * 1024 * 1024
 
 
 def _requested_ar_transport() -> str:
@@ -380,7 +394,7 @@ class CustomAllreduce:
         self,
         group: ProcessGroup,
         device: Union[int, str, torch.device],
-        max_size=1024 * 1024 * 1024,  # 2GB bf16/half
+        max_size=1024 * 1024 * 1024,  # Input staging capacity in bytes (1 GiB).
         enable_register_for_capturing: bool = True,
     ) -> None:
         """
@@ -397,6 +411,7 @@ class CustomAllreduce:
         self.disabled = True
         self._ptr = 0
         self.requested_transport = _requested_ar_transport()
+        self._all_reduce_max_size = _requested_ar_max_size()
         self.transport = "ipc"
         self.transport_id = _AR_TRANSPORT_IDS["ipc"]
 
@@ -509,6 +524,8 @@ class CustomAllreduce:
                 "forcing AITER_AR_ENABLE_REG_CAPTURE=0 copy-in mode."
             )
             enable_register_for_capturing = False
+        # Every graph collective must use copy-in mode when registration is
+        # disabled; Fabric cannot register arbitrary graph allocations later.
         self.enable_register_for_capturing = enable_register_for_capturing
         debug_init = os.environ.get("AITER_AR_DEBUG_STAGES", "0") == "1"
 
@@ -682,6 +699,21 @@ class CustomAllreduce:
         self._pool.flush_graph_buffers(self._ptr)
 
     def should_custom_ar(self, inp: torch.Tensor, prefill_support: bool = False):
+        """Admit ordinary AR without requiring frameworks to identify prefill.
+
+        Both framework dispatch and custom_all_reduce use this same policy.
+        The configured limit does not resize the preallocated buffers. Keep
+        the existing half-capacity bound for two-stage temporary storage.
+        Explicit prefill callers retain their existing capacity-based limit.
+        """
+        if self.disabled:
+            return False
+        max_bytes = self.max_size // 2
+        if not prefill_support:
+            max_bytes = min(max_bytes, self._all_reduce_max_size)
+        return self._should_custom_ar(inp, max_bytes)
+
+    def _should_custom_ar(self, inp: torch.Tensor, max_bytes: int):
         if self.disabled:
             return False
         inp_size = inp.numel() * inp.element_size()
@@ -692,14 +724,8 @@ class CustomAllreduce:
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
-        # In allreduce 2stage writemode, use 2x tmp buffer
         if self.world_size == 2 or self.fully_connected:
-            # decode
-            if not prefill_support:
-                return inp_size <= 8192 * 8192
-            # prefill
-            else:
-                return inp_size <= (self.max_size / 2)
+            return inp_size <= max_bytes
         return False
 
     def should_custom_ag(self, inp: torch.Tensor):
@@ -799,11 +825,13 @@ class CustomAllreduce:
         self, input: torch.Tensor, output: torch.Tensor
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
-        if self.disabled or not self.should_custom_ar(input):
+        if self.disabled or not self._should_custom_ar(input, _LEGACY_AR_MAX_SIZE):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.reduce_scatter(input, output, registered=True)
+                return self.reduce_scatter(
+                    input, output, registered=self.enable_register_for_capturing
+                )
         else:
             return self.reduce_scatter(input, output, registered=False)
 
@@ -859,10 +887,15 @@ class CustomAllreduce:
     ) -> Optional[torch.Tensor]:
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_gather_reg(inp, dim=dim)
+                if self.enable_register_for_capturing:
+                    return self.all_gather_reg(inp, dim=dim)
+                return self.all_gather_unreg(inp, dim=dim)
             else:
-                print("allgather capture hipgraph error")
-                return torch.zeros_like(inp)
+                return torch.zeros(
+                    self._allgather_out_shape(inp, dim),
+                    dtype=inp.dtype,
+                    device=inp.device,
+                )
         else:
             return self.all_gather_unreg(inp, dim=dim)
 
@@ -933,7 +966,7 @@ class CustomAllreduce:
         use_1stage: bool = False,
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
-        if self.disabled or not self.should_custom_ar(input):
+        if self.disabled or not self._should_custom_ar(input, _LEGACY_AR_MAX_SIZE):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
@@ -942,7 +975,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                 )
             else:
@@ -966,7 +999,7 @@ class CustomAllreduce:
         use_1stage: bool = False,
     ):
         # when custom allreduce is disabled, this will be None
-        if self.disabled or not self.should_custom_ar(input):
+        if self.disabled or not self._should_custom_ar(input, _LEGACY_AR_MAX_SIZE):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
@@ -975,7 +1008,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     post_per_token_quant=True,
                 )
@@ -1105,7 +1138,7 @@ class CustomAllreduce:
                     q_w,
                     k_w,
                     eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                 )
             else:
                 return (
@@ -1132,7 +1165,7 @@ class CustomAllreduce:
         use_1stage: bool = False,
         emit_bf16: bool = False,
     ):
-        if self.disabled or not self.should_custom_ar(input):
+        if self.disabled or not self._should_custom_ar(input, _LEGACY_AR_MAX_SIZE):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
@@ -1142,7 +1175,7 @@ class CustomAllreduce:
                     w=weight,
                     eps=eps,
                     group_size=group_size,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
                 )
