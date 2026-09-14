@@ -368,6 +368,15 @@ def _try_get_asm_config(
                 return None
             return maybe_record_asm_padding(decode_sol_0(solution, config_use_shuffle))
 
+        if quant_type == MoeQuantType.W4A8 and block_size == 64:
+            from .fused_moe_asm_wna16 import decode_sol_0
+            solution = get_moe_asm_solution(
+                arch=arch, token=asm_token, inter_dim=n, model_dim=k,
+                expert=e, topk=top_k, quant_type=AsmMoeQuantType.INT4_W4A8,
+                use_shuffle=use_shuffle,
+            )
+            return None if solution == "default" else decode_sol_0(solution)
+
         if quant_type == MoeQuantType.W16A16:
             from .fused_moe_asm_wna16 import decode_sol_0
 
@@ -421,7 +430,7 @@ def _try_get_triton_config(
             E=e,
             N=n,
             dtype=dtype_name,
-            block_n=0,
+            block_n=block_size if block_size and quant_type in (MoeQuantType.W8A8, MoeQuantType.FP8_W8A8) else 0,
             block_k=block_size if block_size else 0,
             is_bottom=False,
         )
@@ -787,6 +796,7 @@ def aiter_moe(
             use_fp8_w8a8=use_fp8_w8a8,
             activation=activation,
             per_channel_quant = per_channel_quant,
+            use_int8_w4a8=use_int8_w4a8,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
             w1_scale=w1_scale,
@@ -807,8 +817,8 @@ def aiter_moe(
     if moe_config.solution_type == MoeSolutionType.TRITON:
         from boltops.fused_moe.triton.fused_moe import fused_experts_impl
 
-        # W8A8 / W8A16 channel-wise (block_shape=None) requires per_channel_quant=True
-        per_channel_quant = (use_int8_w8a8 or use_fp8_w8a8 or use_int8_w8a16) and block_shape is None
+        # W8A8 / W8A16 / W4A8 channel-wise requires per_channel_quant=True.
+        per_channel_quant = (use_int8_w8a8 or use_fp8_w8a8 or use_int8_w8a16 or use_int8_w4a8) and block_shape is None
 
         return fused_experts_impl(
             hidden_states,
@@ -818,11 +828,12 @@ def aiter_moe(
             topk_ids,
             output_dtype=output_dtype,
             inplace=inplace,
-            use_int4_w4a16=use_int4_w4a16,
-            use_int8_w8a8=use_int8_w8a8,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
             activation=activation,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            use_int4_w4a8=use_int8_w4a8,
             per_channel_quant=per_channel_quant,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
