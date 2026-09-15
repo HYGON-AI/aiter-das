@@ -27,6 +27,15 @@ vLLM/SGLang frontends.
   19..36: BV64, and P>=37: BV128. These empirical thresholds balance launch
   parallelism and work per CTA for common workloads. Other devices keep the
   established selection rules.
+- The BV16/BV32 selector uses `P=N*H`, where N is the padded batch size or
+  the number of sequences in `cu_seqlens`, and H is the value-head count.
+  gfx936 retains P<12: BV16, P>=12: BV32. On 120-CU gfx92a, the measured
+  boundary is P<16: BV16, P>=16: BV32. Other untuned CU configurations retain
+  the established fallback. With V=128, BV16/32 launch `8P/4P` CTAs.
+  Paired GPU-graph benchmarks on an idle 120-CU K200_AI, covering FP16/BF16,
+  padded/varlen inputs, and G-only vLLM/SGLang calls, favor the P=16 boundary.
+  This is a single-threshold heuristic: long sequences at large P can favor
+  BV16 again, so fixed workloads can still use the force override below.
 - `AITER_FLA_FORCE_BV=auto|0|16|32|64|128` is available for A/B testing.
   Forcing 64/128 requires gfx938, the supported head shape and transposed
   state layout. Unset and `0` use auto. Captured graphs retain the BV chosen
@@ -233,6 +242,10 @@ Notes:
   validate length==N or index OOB (caller-owned, same as SGLang).
 
 ## Benchmark
+
+Before every performance test, run `hy-smi` and set `HIP_VISIBLE_DEVICES`
+to an HCU reporting 0% utilization. Recheck utilization before each timed
+variant to avoid interference from other jobs.
 
 ```bash
 PYTHONPATH=. python op_tests/op_benchmarks/bench_chunk_gated_hip.py \

@@ -439,6 +439,10 @@ def test_chunk_gated_delta_rule_fwd_bv64_target_matches_triton_sglang(
     if not torch.cuda.is_available():
         pytest.skip("ROCm/HIP CUDA-compatible device required")
 
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if not getattr(props, "gcnArchName", "").startswith("gfx938"):
+        pytest.skip("BV64 requires gfx938")
+
     monkeypatch.setenv("AITER_FLA_FORCE_BV", "64")
     case = SglangChunkGatedCase(
         seqlen=seqlen,
@@ -622,25 +626,28 @@ def test_chunk_gated_delta_rule_fwd_sglang_requires_initial_state_and_indices() 
 
 
 @pytest.mark.parametrize(
-    ("input_dtype", "state_dtype", "varlen", "heads", "all_invalid"),
+    ("input_dtype", "state_dtype", "varlen", "heads", "all_invalid", "bv"),
     [
-        pytest.param(torch.float16, torch.float32, False, 2, False, id="fp16-fp32-bv16"),
-        pytest.param(torch.bfloat16, torch.bfloat16, False, 4, False, id="bf16-bf16-bv32"),
-        pytest.param(torch.bfloat16, torch.bfloat16, True, 4, False, id="bf16-bf16-varlen"),
-        pytest.param(torch.float16, torch.float32, False, 2, True, id="all-minus-one"),
+        pytest.param(torch.float16, torch.float32, False, 2, False, 16, id="fp16-fp32-bv16"),
+        pytest.param(torch.bfloat16, torch.bfloat16, False, 4, False, 32, id="bf16-bf16-bv32"),
+        pytest.param(torch.bfloat16, torch.bfloat16, True, 4, False, 32, id="bf16-bf16-varlen"),
+        pytest.param(torch.float16, torch.float32, False, 2, True, 16, id="all-minus-one"),
     ],
 )
 def test_chunk_gated_delta_rule_fwd_sglang_state_pool_view_and_minus_one(
+    monkeypatch: pytest.MonkeyPatch,
     input_dtype: torch.dtype,
     state_dtype: torch.dtype,
     varlen: bool,
     heads: int,
     all_invalid: bool,
+    bv: int,
 ) -> None:
     """Envelope slot stride and -1 semantics against a scratch-slot reference."""
     if not torch.cuda.is_available():
         pytest.skip("ROCm/HIP CUDA-compatible device required")
 
+    monkeypatch.setenv("AITER_FLA_FORCE_BV", str(bv))
     case = SglangChunkGatedCase(
         batch=1 if varlen else 3,
         seqlen=130 if varlen else 64,
