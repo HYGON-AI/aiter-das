@@ -1,8 +1,12 @@
 name: AITER CI
 
 on:
-  pull_request:
+  # This trusted-fork allowlist is required because the job uses a privileged
+  # self-hosted Runner and needs internal repository configuration variables.
+  # Never broaden it to arbitrary public forks.
+  pull_request_target:
     branches: [main]
+    types: [opened, reopened, synchronize]
   workflow_dispatch:
 
 permissions:
@@ -15,6 +19,12 @@ concurrency:
 
 jobs:
   build-and-test:
+    # A pull_request_target job can access repository configuration.  This job
+    # runs untrusted checkout code in a privileged container, so restrict it
+    # to the repository owner's explicitly trusted fork.
+    if: >-
+      github.event_name != 'pull_request_target' ||
+      github.event.pull_request.head.repo.full_name == 'lyt-ghub/aiter-das-fork'
     runs-on:
       group: ci-general
       labels: [self-hosted, ci]
@@ -45,6 +55,10 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
         with:
+          # pull_request_target checks out the base by default; test the
+          # immutable commit proposed by the trusted fork instead.
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: false
 
       - name: Prepare DTK and Python environment
