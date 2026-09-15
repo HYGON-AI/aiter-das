@@ -53,6 +53,32 @@ If you are in install mode:
 ```
 python -m op_tests.test_***   # note that there is no '.py' suffix
 ```
+
+## Continuous integration
+
+GitHub Actions workflow definitions are in `.github/workflows/`; CI test source
+files remain in `op_tests/ci_tests/`. The GPU build-and-test workflow runs only
+on self-hosted runners in the `ci-general` Runner Group with the `ci` label.
+The workflow runs inside the DTK/Python 3.10 container declared in
+`.github/workflows/ci.yml`; the Runner passes through the HCU device nodes and
+the read-only Hygon runtime mount. For the current SGLang CI image,
+`optest` is the only package that needs an organisation-managed source today:
+configure `OPTEST_PIP_INDEX_URL` (and, if needed, `OPTEST_PIP_TRUSTED_HOST`) as
+a GitHub Actions Variable. The image lacks `optest`, `auditwheel`, and
+`patchelf`; the latter two are explicitly fetched from `https://pypi.org/simple`.
+It already provides
+Torch 2.11, Triton, BoltOps, and the project runtime dependencies, which this
+workflow deliberately does not reinstall. Once `optest` is preinstalled in the
+SGLang image, its two Variables can be removed as well.
+`AICC_NIGHTLY_DIR` is optional and only installs a newer AICC package when
+configured. Set `DTK_PKG` only when running the environment script
+outside that image and a replacement DTK archive is required.
+
+For an interactive local reproduction on a BW1100 host, run
+`bash ci_script/run_sglang_ci_container.sh`. Override `AITER_CI_IMAGE` or
+`AITER_CI_CONTAINER_NAME` when necessary; attach with
+`docker exec -it <container-name> /bin/bash`.
+
 ## Aoubt the environment variable
 1. 'AITER_LOG_MORE': log more info about aiter internal process,params, etc.
 2. 'AITER_LOG_OP_PARAM': log the params for special interface, such as 'aiter_moe'.

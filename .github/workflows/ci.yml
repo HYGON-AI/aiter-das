@@ -1,0 +1,90 @@
+name: AITER CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Avoid wasting a GPU Runner on an obsolete commit for the same PR or branch.
+concurrency:
+  group: aiter-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on:
+      group: ci-general
+      labels: [self-hosted, ci]
+    container:
+      image: 10.16.1.152:5000/jenkins/model_test_env/sglang:0.5.18-latest
+      # The self-hosted BW1100 Runner provides these host devices and runtime
+      # libraries. All build and operator tests run inside this container.
+      options: >-
+        --shm-size 100g
+        --network host
+        --privileged
+        --device /dev/kfd
+        --device /dev/mkfd
+        --device /dev/dri
+        --group-add video
+        --cap-add SYS_PTRACE
+        --security-opt seccomp=unconfined
+        --volume /opt/hyhal:/opt/hyhal:ro
+    timeout-minutes: 180
+    env:
+      TORCH_VERSION: '2.11.0'
+      AICC_NIGHTLY_DIR: ${{ vars.AICC_NIGHTLY_DIR }}
+      # Temporary: optest is not included in the current SGLang image and is
+      # not published on public PyPI. Remove these once the image preinstalls it.
+      OPTEST_PIP_INDEX_URL: ${{ vars.OPTEST_PIP_INDEX_URL }}
+      OPTEST_PIP_TRUSTED_HOST: ${{ vars.OPTEST_PIP_TRUSTED_HOST }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Prepare DTK and Python environment
+        shell: bash
+        run: source ci_script/prepare_environment.sh
+
+      - name: Build manylinux wheel
+        shell: bash
+        run: bash ci_script/build_wheel_and_manylinux.sh
+
+      - name: Install built wheel
+        shell: bash
+        run: python -m pip install --force-reinstall --no-deps dist/*manylinux*.whl
+
+      # Continue long enough to turn optest output into JUnit and upload it.
+      # The final step below still makes an optest failure fail this workflow.
+      - name: Run operator tests
+        id: optest
+        continue-on-error: true
+        shell: bash
+        run: optest --op_name aiter --test_mode all --test_dir "$GITHUB_WORKSPACE"
+
+      - name: Generate JUnit report
+        if: always()
+        shell: bash
+        run: python ci_script/optest_to_junit.py "$GITHUB_WORKSPACE" ci
+
+      - name: Upload wheel and test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/*manylinux*.whl
+            op_tests/ci_tests/ci_aiter_performance_output.xml
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Mark operator-test failure
+        if: always() && steps.optest.outcome == 'failure'
+        shell: bash
+        run: exit 1
