@@ -1,8 +1,11 @@
 name: AITER CI
 
 on:
-  pull_request:
+  # The self-hosted Runner pool is network-isolated, so all fork pull requests
+  # can use the repository configuration required by the hardware CI.
+  pull_request_target:
     branches: [main]
+    types: [opened, reopened, synchronize]
   workflow_dispatch:
 
 permissions:
@@ -24,7 +27,6 @@ jobs:
       # libraries. All build and operator tests run inside this container.
       options: >-
         --shm-size 100g
-        --network host
         --privileged
         --device /dev/kfd
         --device /dev/mkfd
@@ -46,6 +48,10 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
         with:
+          # pull_request_target checks out the base by default; test the
+          # immutable commit proposed by the fork instead.
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: false
 
       - name: Prepare DTK and Python environment
