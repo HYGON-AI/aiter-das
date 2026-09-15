@@ -2,17 +2,34 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: MIT
 
-: "${DTK_PKG:?DTK_PKG must point to the DTK archive mounted on the Runner}"
 : "${TORCH_VERSION:?TORCH_VERSION must be set}"
 
-cp -f "${DTK_PKG}" /opt/
-cd /opt || exit 1
-tar -xzf "$(basename "${DTK_PKG}")"
-rm -rf dtk
-mv dtk-* dtk
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ -n "${DTK_PKG:-}" ]]; then
+  cp -f "${DTK_PKG}" /opt/
+  cd /opt || exit 1
+  tar -xzf "$(basename "${DTK_PKG}")"
+  rm -rf dtk
+  mv dtk-* dtk
+elif [[ ! -f /opt/dtk/env.sh ]]; then
+  echo "DTK_PKG is unset and no DTK installation exists at /opt/dtk." >&2
+  exit 1
+fi
 source /opt/dtk/env.sh
 
-cd "${CI_PROJECT_DIR:?CI_PROJECT_DIR must be set by GitLab}" || exit 1
+# GitHub Actions starts a fresh shell for each `run` step.  Preserve the DTK
+# environment for the build and test steps when this script is sourced there.
+if [[ -n "${GITHUB_ENV:-}" ]]; then
+  for env_name in PATH LD_LIBRARY_PATH LIBRARY_PATH CMAKE_PREFIX_PATH CPATH \
+                  PKG_CONFIG_PATH HIP_PATH ROCM_PATH CPLUS_INCLUDE_PATH; do
+    if [[ -v "${env_name}" ]]; then
+      printf '%s=%s\n' "${env_name}" "${!env_name}" >> "${GITHUB_ENV}"
+    fi
+  done
+fi
+
+cd "${repo_root}" || exit 1
 
 # Install the newest AICC package available on the Runner's shared storage.
 # Its absence is non-fatal because some Runners include AICC already.
@@ -20,15 +37,15 @@ cd "${CI_PROJECT_DIR:?CI_PROJECT_DIR must be set by GitLab}" || exit 1
 # AICC filename format:
 #   dtk_llvm_<commit>_<YYYYMMDD[HHMM]>.run
 #
-# Compare the timestamp extracted from the filename instead of sorting the full
-# path, because the parent directory "/ArchivedFile/ai_cc" contains an
-# underscore that would shift the sort field.
-aicc_dir="/ArchivedFile/ai_cc/nightly"
+# Set AICC_NIGHTLY_DIR in the self-hosted Runner configuration when a newer
+# AICC package should be installed.  Leaving it unset uses the AICC already
+# installed on the Runner.
+aicc_dir="${AICC_NIGHTLY_DIR:-}"
 latest_aicc_run=""
 latest_aicc_timestamp=""
 
 shopt -s nullglob
-for aicc_candidate in "${aicc_dir}"/dtk_llvm_*.run; do
+for aicc_candidate in ${aicc_dir:+"${aicc_dir}"/dtk_llvm_*.run}; do
   aicc_candidate_name="${aicc_candidate##*/}"
   aicc_timestamp="${aicc_candidate_name%.run}"
   aicc_timestamp="${aicc_timestamp##*_}"
@@ -74,48 +91,41 @@ else
   echo "No AICC installer found; continuing with the existing environment."
 fi
 
-cd "${CI_PROJECT_DIR:?CI_PROJECT_DIR must be set by GitLab}" || exit 1
+cd "${repo_root}" || exit 1
 
-python -m pip install packaging -i https://pypi.tuna.tsinghua.edu.cn/simple/
-python -m pip install zmq -i https://pypi.tuna.tsinghua.edu.cn/simple/
-python -m pip install tabulate -i https://pypi.tuna.tsinghua.edu.cn/simple/
-python -m pip install wheel -i https://pypi.tuna.tsinghua.edu.cn/simple/
-python -m pip install setuptools -i https://pypi.tuna.tsinghua.edu.cn/simple/
-python -m pip install pyyaml -i https://pypi.tuna.tsinghua.edu.cn/simple/
-python -m pip install -r requirements.txt --trusted-host 10.68.20.101
-python -m pip install  ciupload auditwheel patchelf
-python -m pip install torch=="${TORCH_VERSION}" triton 
-python -m pip install torch=="${TORCH_VERSION}" boltops
-PYTHON_VERSION="$(python --version 2>&1 | awk -F '[ .]' '{print $2 "." $3}')"
-export PYTHON_VERSION
-
-declare -A NUMPY_VERSIONS=(
-  ["3.8"]="1.21.6"
-  ["3.9"]="1.22.4"
-  ["3.10"]="1.24.3"
-  ["3.11"]="1.26.2"
-  ["3.12"]="1.26.2"
-  ["3.13"]="2.1.2"
-  ["3.14"]="2.3.4"
-)
-
-NUMPY_VERSION="${NUMPY_VERSIONS[$PYTHON_VERSION]}"
-if [[ -z "${NUMPY_VERSION}" ]]; then
-  echo "Warning: no numpy version configured for Python ${PYTHON_VERSION}; using numpy==1.24.3"
-  NUMPY_VERSION="1.24.3"
+actual_torch_version="$(python -c 'import torch; print(torch.__version__.split("+")[0])')"
+if [[ "${actual_torch_version}" != "${TORCH_VERSION}" ]]; then
+  echo "Expected torch==${TORCH_VERSION} in the CI image, found ${actual_torch_version}." >&2
+  exit 1
 fi
 
-echo "Installing numpy==${NUMPY_VERSION} ..."
-python -m pip uninstall -y numpy 2>/dev/null || true
-python -m pip install numpy=="${NUMPY_VERSION}" \
-  --force-reinstall \
-  --no-deps \
-  --no-cache-dir \
-  -i https://pypi.tuna.tsinghua.edu.cn/simple/
+# The SGLang CI image already contains Torch, Triton, BoltOps and every
+# requirements.txt dependency.  Do not replace its compatible runtime.
+python -c 'import boltops, einops, ninja, numpy, packaging, pandas, psutil, pybind11, pytest, tabulate, torch, triton, yaml, zmq'
 
-python -c "import numpy; print(f'numpy {numpy.__version__} installed successfully')"
+# These build tools are absent from the SGLang image but are published on
+# public PyPI. Do not reinstall them when a future CI image already provides
+# them.
+if ! command -v auditwheel >/dev/null || ! command -v patchelf >/dev/null; then
+  python -m pip install --index-url https://pypi.org/simple auditwheel patchelf
+fi
 
-python -m pip install optest -i http://10.16.1.201:9929/nightly/dtk2604/+simple/ --trusted-host 10.16.1.201 --force-reinstall
+optest_pip_args=()
+if [[ -n "${OPTEST_PIP_INDEX_URL:-}" ]]; then
+  optest_pip_args+=(--index-url "${OPTEST_PIP_INDEX_URL}")
+fi
+if [[ -n "${OPTEST_PIP_TRUSTED_HOST:-}" ]]; then
+  optest_pip_args+=(--trusted-host "${OPTEST_PIP_TRUSTED_HOST}")
+fi
+# optest is not currently published on public PyPI.  A future SGLang CI image
+# should preinstall it; until then, configure its organisation package source.
+if ! command -v optest >/dev/null; then
+  if [[ "${#optest_pip_args[@]}" -eq 0 ]]; then
+    echo "optest is absent from the CI image. Preinstall optest in the image or set OPTEST_PIP_INDEX_URL." >&2
+    exit 1
+  fi
+  python -m pip install "${optest_pip_args[@]}" optest
+fi
 
 hipcc --version
 python -c "import torch; print('torch:', torch.__version__); print('hip:', torch.version.hip)"

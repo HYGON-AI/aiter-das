@@ -34,6 +34,37 @@ def record_failure(
     )
 
 
+def check_topk_ids_with_ties(ref_ids, actual_ids, routing_scores, msg=""):
+    """Require the same selected score multiset, allowing only exact ties.
+
+    Top-K has no unique answer when several BF16/FP16 experts have exactly the
+    same routing score at the selection boundary.  Different IDs are valid
+    only when their selected raw-score multisets are byte-for-byte equal.  This
+    does not relax any numerical tolerance: a different non-tie score remains
+    a test failure.
+    """
+    ref_ids = ref_ids.to(torch.int64)
+    actual_ids = actual_ids.to(torch.int64)
+    sorted_ref_ids = ref_ids.sort(dim=-1).values
+    sorted_actual_ids = actual_ids.sort(dim=-1).values
+    if torch.equal(sorted_ref_ids, sorted_actual_ids):
+        aiter.logger.info(f"{msg}[exact IDs \033[32mpassed~\033[0m]")
+        return 0.0
+
+    ref_scores = routing_scores.gather(1, ref_ids).sort(dim=-1).values
+    actual_scores = routing_scores.gather(1, actual_ids).sort(dim=-1).values
+    non_tie_mismatch = ref_scores.ne(actual_scores)
+    error_ratio = (non_tie_mismatch.sum() / non_tie_mismatch.numel()).item()
+    if error_ratio == 0:
+        aiter.logger.info(f"{msg}[exact-score tie alternative \033[32mpassed~\033[0m]")
+    else:
+        aiter.logger.info(
+            f"{msg}[non-tie score mismatch \033[31mfailed!\033[0m] "
+            f"error_ratio={error_ratio}"
+        )
+    return error_ratio
+
+
 @perftest(num_iters=2, num_warmup=1)
 def test_nofuse(
     gating_output: torch.Tensor,
@@ -119,8 +150,6 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
     gating_output = torch.randn((token, E), dtype=dtype, device="cuda")
 
     (topk_weights_a, topk_ids_a), avg_a = test_nofuse(gating_output, topk, renormalize)
-    id_ref, _ref = torch.sort(topk_ids_a)
-    w_ref = topk_weights_a.gather(1, _ref)
 
     func_dict = {"hip": test_fuse}
     ret = {}
@@ -133,9 +162,16 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
             continue
         (topk_weights, topk_ids), us = func(gating_output, topk, renormalize)
         topk_ids = topk_ids.to(dtypes.i32)
-        id, _ref = torch.sort(topk_ids)
-        weight = topk_weights.gather(1, _ref)
-        weight_err = checkAllclose(w_ref, weight, msg=f"{tag} topk_weights")
+        expected_weights = torch.softmax(gating_output.float(), dim=-1).gather(
+            1, topk_ids.to(torch.int64)
+        )
+        if renormalize:
+            expected_weights = expected_weights / expected_weights.sum(
+                dim=-1, keepdim=True
+            )
+        weight_err = checkAllclose(
+            expected_weights, topk_weights, msg=f"{tag} topk_weights"
+        )
         record_failure(
             "test_topk_softmax",
             "topk_weights",
@@ -148,7 +184,9 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
             renormalize=renormalize,
             backend=tag,
         )
-        id_err = checkAllclose(id_ref, id, msg=f"{tag} topk_ids")
+        id_err = check_topk_ids_with_ties(
+            topk_ids_a, topk_ids, gating_output, msg=f"{tag} topk_ids"
+        )
         record_failure(
             "test_topk_softmax",
             "topk_ids",
@@ -745,11 +783,19 @@ def test_grouped_topk(
         is_softmax,
         scale_factor,
     )
-    id_ref, _ref = torch.sort(id_ref)
-    id_aiter, _aiter = torch.sort(id_aiter)
+    if scoring_func == "softmax":
+        routing_scores = torch.softmax(gating_output.float(), dim=-1)
+    else:
+        routing_scores = gating_output.float().sigmoid()
+    expected_weights = routing_scores.gather(1, id_aiter.to(torch.int64))
+    if need_renorm:
+        expected_weights = expected_weights / expected_weights.sum(
+            dim=-1, keepdim=True
+        )
+    expected_weights = expected_weights * scale_factor
     err = checkAllclose(
-        w_ref.gather(1, _ref),
-        w_aiter.gather(1, _aiter),
+        expected_weights,
+        w_aiter,
         msg="topk_weights [golden vs aiter]",
     )
     record_failure(
@@ -768,9 +814,10 @@ def test_grouped_topk(
         scoring_func=scoring_func,
         backend="aiter",
     )
-    id_err = checkAllclose(
+    id_err = check_topk_ids_with_ties(
         id_ref,
         id_aiter,
+        gating_output,
         msg=f"topk_ids     [golden vs aiter]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us......",
     )
     record_failure(

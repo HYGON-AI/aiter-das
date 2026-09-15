@@ -38,6 +38,7 @@ def run_torch(input, weight, bias, eps, residual=None, x_bias=None):
 def run_ck(input, weight, bias, eps, residual=None, x_bias=None):
     if residual is None:
         residual_out = None
+        output = aiter.layernorm2d_fwd(input, weight, bias, eps, x_bias)
     else:
         residual_out = torch.empty_like(input)
         output = torch.empty_like(input)
