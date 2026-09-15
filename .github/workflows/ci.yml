@@ -24,7 +24,6 @@ jobs:
       # libraries. All build and operator tests run inside this container.
       options: >-
         --shm-size 100g
-        --network host
         --privileged
         --device /dev/kfd
         --device /dev/mkfd
