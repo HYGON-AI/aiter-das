@@ -9,6 +9,7 @@ From repository root:
   python -B op_tests/test_paged_mqa_logits.py --bench --kernel-id 1 --json-out bench.json
   python -B op_tests/test_paged_mqa_logits.py --bench --shape-set models
   python -B -m pytest -q op_tests/test_paged_mqa_logits.py
+  python -B -m pytest -q op_tests/test_paged_mqa_logits.py -k TestPagedMQAHCU
   python -B op_tests/test_paged_mqa_logits.py --cpu-reference --kernel-id 4
 
 With no arguments, compare Opus and both Triton baselines against the reference.
@@ -16,9 +17,16 @@ JSON defaults to hygon_tmp/paged_mqa_logits/<mode>_<timestamp>.json in this repo
 With --bench, print a paired comparison table after all rounds; JSON retains raw samples.
 
 gfx938 IDs: 0/1 = initial full/wave reduction; 2 = DPP/K32; 3 = DPP/K64 prefetch.
-gfx938 Auto: ID2 for 128 < B*R*ceil(max_len/64) <= 1024, otherwise ID3.
+gfx936/gfx938 IDs: 6 = independent requests; 7 = verified two-query K sharing.
+Auto selects ID7 for H32/R1, B>=32, max_len>=4096 and cache_tokens<=2*max_len;
+otherwise ID6. IDs 0-3 remain explicit gfx938 comparisons.
 gfx946 IDs: 4 = aligned LDS/K32 (Auto); 5 = aligned LDS/K64 prefetch.
 Use --cpu-reference on gfx946; the Triton comparison mode requires gfx938.
+Add --cpu-graph only when the target runtime supports HIP Graph replay.
+Pytest runs all applicable cases from this file: gfx936/gfx938 use
+TestPagedMQAHCU for ID6/7, S1/S64, sharing fallback, FP8 limits, offset
+storage and graph replay. Public API checks also run on both architectures.
+gfx946 runs the CPU-reference matrix for Auto/ID4/ID5; HCU-only cases skip.
 All timing is a preallocated GPU Graph sequence including required cleanup.
 
 Triton compatibility is owned by utility/paged_mqa_logits/paged_mqa_logits_triton_baseline.py.
@@ -33,6 +41,7 @@ from pathlib import Path
 import statistics
 import sys
 
+import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -212,10 +221,16 @@ def run_correctness(backend, report_path, kernel_id=None):
 def run_api_contracts(report_path, kernel_id=None):
     from aiter import paged_mqa_logits
     impl = importlib.import_module("aiter.ops.opus.paged_mqa_logits")
-    assert impl._resolve_paged_mqa_kernel(None,rows=1,max_len=8192) == 3
-    assert impl._resolve_paged_mqa_kernel(None,rows=1,max_len=8193) == 2
-    assert impl._resolve_paged_mqa_kernel(None,rows=1,max_len=65536) == 2
-    assert impl._resolve_paged_mqa_kernel(None,rows=1,max_len=65537) == 3
+    assert impl._resolve_paged_mqa_kernel(None,rows=1,max_len=8192) == 6
+    for arch in ("gfx936","gfx938"):
+        options=dict(max_len=4096,cache_tokens=4096,arch=arch)
+        assert impl._resolve_paged_mqa_kernel(None,rows=31,**options) == 6
+        assert impl._resolve_paged_mqa_kernel(None,rows=32,**options) == 7
+        assert impl._resolve_paged_mqa_kernel(None,rows=32,heads=64,**options) == 6
+        assert impl._resolve_paged_mqa_kernel(None,rows=32,next_n=2,**options) == 6
+        assert impl._resolve_paged_mqa_kernel(None,rows=32,max_len=4095,cache_tokens=4095,arch=arch) == 6
+        assert impl._resolve_paged_mqa_kernel(None,rows=32,max_len=4096,cache_tokens=8193,arch=arch) == 6
+    assert impl._resolve_paged_mqa_kernel(None,rows=32,max_len=4096,arch="gfx946") == 4
     torch.backends.cuda.matmul.allow_tf32 = False
     records = []
     for label, shape, lengths in (
@@ -433,6 +448,134 @@ def run_benchmark(report_path, rounds=3, blocks=15, calls=20, kernel_id=None, sh
     print("BENCHMARK_COMPLETE",flush=True)
 
 
+def _skip_unless_hcu():
+    if not torch.cuda.is_available():
+        pytest.skip("requires gfx936/gfx938")
+    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    if arch not in ("gfx936", "gfx938"):
+        pytest.skip("ID6/7 and S64 regression requires gfx936/gfx938")
+
+
+def _make_hcu_paged_case(b,r,h,n,s,*,shared=False,offset=False):
+    capacity=(n+63)//64*64 if s==64 else n
+    args=list(make_case(b,r,h,capacity,seed=20260914+n, lengths=[n]*b if shared else None))
+    q,cache,w,ctx,tb,_=args
+    if not shared:
+        ctx=torch.tensor([max(r,n-i*7-3) for i in range(b)],device='cuda',dtype=torch.int32)
+    if s==64:
+        pages=capacity//64
+        packed=torch.empty((pages,64*132),device='cuda',dtype=torch.uint8)
+        old=cache.reshape(capacity,132)
+        packed[:,:8192]=old[:,:128].reshape(pages,8192)
+        packed[:,8192:]=old[:,128:].reshape(pages,256)
+        cache=packed.reshape(pages,64,1,132)
+        tb=torch.randint(pages,(b,(n+63)//64),device='cuda',dtype=torch.int32)
+    if shared:
+        tb=torch.arange((n+s-1)//s,device='cuda',dtype=torch.int32)[None].expand(b,-1).contiguous()
+    if offset:
+        qbase=torch.empty(q.numel()+4,device='cuda',dtype=torch.uint8)
+        qview=qbase[4:].view(torch.float8_e4m3fn).reshape_as(q);qview.copy_(q);q=qview
+        kbase=torch.empty(cache.numel()+4,device='cuda',dtype=torch.uint8)
+        kview=kbase[4:].reshape_as(cache);kview.copy_(cache);cache=kview
+        assert q.data_ptr()%16==4 and cache.data_ptr()%16==4
+    return q,cache,w,ctx,tb,n
+
+
+def _hcu_paged_reference(args):
+    q,cache,w,ctx,tb,n=args
+    s=cache.shape[1]
+    if s==1:return reference(args)
+    pages=cache.shape[0];raw=cache.reshape(pages,s*132)
+    canonical=torch.empty((pages*s,1,1,132),device='cuda',dtype=torch.uint8)
+    canonical.reshape(-1,132)[:,:128]=raw[:,:s*128].reshape(-1,128)
+    canonical.reshape(-1,132)[:,128:]=raw[:,s*128:].reshape(-1,4)
+    expanded=(tb[:,:,None]*s+torch.arange(s,device='cuda',dtype=torch.int32)).reshape(q.shape[0],-1)
+    return reference((q,canonical,w,ctx,expanded,n))
+
+
+def _validate_hcu_paged_case(args,kid=None,*,graph=False):
+    from aiter import paged_mqa_logits
+    ref,mask=_hcu_paged_reference(args)
+    guard=torch.full((ref.numel()+32,),654321.,device='cuda')
+    out=guard[16:-16].reshape_as(ref)
+    returned=paged_mqa_logits(*args,out=out,kernelId=kid)
+    assert returned.data_ptr()==out.data_ptr()
+    torch.cuda.synchronize();check_output(out,ref,mask)
+    if graph:
+        stream=torch.cuda.Stream();stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            g=torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):paged_mqa_logits(*args,out=out,kernelId=kid)
+        stream.synchronize();g.replay();torch.cuda.synchronize();check_output(out,ref,mask)
+    assert bool((guard[:16]==654321.).all()) and bool((guard[-16:]==654321.).all())
+    return out
+
+
+class TestPagedMQAHCU:
+    """ID6/7, S1/S64 and graph regressions on gfx936/gfx938 only."""
+
+    @pytest.fixture(autouse=True)
+    def require_hcu(self):
+        # Class scope keeps this guard from skipping gfx946 tests below.
+        _skip_unless_hcu()
+        torch.backends.cuda.matmul.allow_tf32 = False
+
+    @pytest.mark.parametrize('s',[1,64])
+    @pytest.mark.parametrize('r',[1,2,4])
+    @pytest.mark.parametrize('h',[32,64])
+    @pytest.mark.parametrize('n',[17,67,257])
+    def test_independent_pages(self, s,r,h,n):
+        _validate_hcu_paged_case(_make_hcu_paged_case(3,r,h,n,s),6)
+
+    @pytest.mark.parametrize('s',[1,64])
+    @pytest.mark.parametrize('n',[17,67,257,4097])
+    @pytest.mark.parametrize('shared',[True,False])
+    def test_grouped_and_fallback(self, s,n,shared):
+        _validate_hcu_paged_case(_make_hcu_paged_case(9,1,32,n,s,shared=shared),7)
+
+    @pytest.mark.parametrize('s',[1,64])
+    @pytest.mark.parametrize('kid',[6,7])
+    def test_offset_storage_and_graph(self, s,kid):
+        _validate_hcu_paged_case(_make_hcu_paged_case(8,1,32,257,s,shared=True,offset=True),kid,graph=True)
+
+    @pytest.mark.parametrize('s',[1,64])
+    def test_graph_rechecks_mutated_metadata(self, s):
+        from aiter import paged_mqa_logits
+        args=_make_hcu_paged_case(33,1,32,4097,s,shared=True)
+        out=_validate_hcu_paged_case(args)
+        g=torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):paged_mqa_logits(*args,out=out)
+        q,k,w,ctx,tb,n=args
+        # A middle page breaks sharing; a second pair has different lengths.
+        middle=tb.shape[1]//2;tb[1,middle]=(tb[1,middle]+1)%k.shape[0]
+        ctx[3]-=9;w.mul_(-0.5)
+        q.view(torch.uint8).bitwise_xor_(0x80)
+        k.view(-1)[0]=0x01  # New subnormal value must be read on replay.
+        g.replay();torch.cuda.synchronize()
+        ref,mask=_hcu_paged_reference(args);check_output(out,ref,mask)
+
+    @pytest.mark.parametrize('s',[1,64])
+    def test_fp8_subnormals_and_finite_extremes(self, s):
+        args=list(_make_hcu_paged_case(2,1,32,129,s,shared=True))
+        q,k,w,ctx,tb,n=args
+        pattern=torch.arange(256,device='cuda',dtype=torch.int32).to(torch.uint8)
+        pattern[0x7f]=0;pattern[0xff]=0x80
+        q.view(torch.uint8).reshape(-1).copy_(pattern.repeat((q.numel()+255)//256)[:q.numel()])
+        raw=k.reshape(k.shape[0],-1)
+        keys=pattern.repeat((k.shape[0]*s*128+255)//256)[:k.shape[0]*s*128].reshape(k.shape[0],s*128)
+        raw[:,:s*128]=keys
+        raw[:,s*128:]=torch.ones((k.shape[0],s),device='cuda').view(torch.uint8)
+        for kid in (6,7):_validate_hcu_paged_case(tuple(args),kid)
+
+    def test_hcu_selector_rejects_invalid_modes(self):
+        from aiter import paged_mqa_logits
+        for args in (_make_hcu_paged_case(2,2,32,67,1),_make_hcu_paged_case(2,1,64,67,64)):
+            with pytest.raises(ValueError,match='H=32.*R=1'):paged_mqa_logits(*args,kernelId=7)
+        impl=importlib.import_module('aiter.ops.opus.paged_mqa_logits')
+        with pytest.raises(ValueError):impl._resolve_paged_mqa_kernel(0,rows=1,max_len=64,arch='gfx936')
+        with pytest.raises(ValueError):impl._resolve_paged_mqa_kernel(7,rows=32,max_len=4096,arch='gfx946')
+
+
 def _skip_unless_gfx938():
     import pytest
     if not torch.cuda.is_available():
@@ -447,7 +590,7 @@ def test_paged_mqa_correctness(tmp_path):
 
 
 def test_paged_mqa_public_contract(tmp_path):
-    _skip_unless_gfx938()
+    _skip_unless_hcu()
     run_api_contracts(tmp_path/"api.json")
 
 
@@ -459,6 +602,23 @@ def test_paged_mqa_preserved_id0():
     check_output(paged_mqa_logits(*args,kernelId=0),ref,valid,structured=True)
 
 
+def test_paged_mqa_gfx946_cpu_reference(tmp_path):
+    """Current public API on gfx946, including automatic and both explicit IDs.
+
+    CPU references avoid depending on unrelated model-side Torch/Triton kernels.
+    ID6/7 and S64 regressions are grouped in TestPagedMQAHCU above.
+    """
+    import pytest
+    if not torch.cuda.is_available():
+        pytest.skip("requires gfx946 (Perf Model or hardware)")
+    if torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] != "gfx946":
+        pytest.skip("gfx946 public-API regression")
+    from op_tests.utility.paged_mqa_logits.cpu_reference import run_cpu_reference
+    for kernel_id in (None, 4, 5):
+        label = "auto" if kernel_id is None else f"id{kernel_id}"
+        run_cpu_reference(tmp_path/f"gfx946_{label}.json", kernel_id)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("baseline", "opus"), default="opus",
@@ -468,6 +628,8 @@ if __name__ == "__main__":
     parser.add_argument("--api-only", action="store_true")
     parser.add_argument("--cpu-reference", action="store_true",
                         help="CPU inputs/reference, Opus DUT only; suitable for gfx946 Perf Model")
+    parser.add_argument("--cpu-graph", action="store_true",
+                        help="also validate graph replay/metadata mutation with --cpu-reference; requires runtime graph support")
     parser.add_argument("--bench", action="store_true")
     parser.add_argument("--shape-set", choices=("smoke", "models"), default="smoke",
                         help="benchmark matrix: smoke (default) or model indexer shapes with independent per-request KV pages")
@@ -476,6 +638,8 @@ if __name__ == "__main__":
     parser.add_argument("--calls", type=int, default=20)
     parser.add_argument("--kernel-id", type=int, default=None)
     opts = parser.parse_args()
+    if opts.cpu_graph and not opts.cpu_reference:
+        parser.error("--cpu-graph requires --cpu-reference")
     if opts.json_out is None:
         mode = "benchmark" if opts.bench else "api" if opts.api_only else f"{opts.backend}_correctness"
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -485,7 +649,7 @@ if __name__ == "__main__":
         if opts.bench or opts.api_only or opts.backend != "opus":
             parser.error("--cpu-reference requires Opus correctness mode")
         from op_tests.utility.paged_mqa_logits.cpu_reference import run_cpu_reference
-        run_cpu_reference(opts.json_out, opts.kernel_id)
+        run_cpu_reference(opts.json_out, opts.kernel_id, test_graph=opts.cpu_graph)
     elif opts.bench:
         run_benchmark(opts.json_out,opts.rounds,opts.blocks,opts.calls,opts.kernel_id,opts.shape_set)
     elif opts.api_only:
