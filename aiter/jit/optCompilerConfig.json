@@ -659,6 +659,19 @@
         "hipify": "True",
         "blob_gen_cmd": "''"
     },
+    "module_sampling": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/sampling_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/sampling.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "hipify": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_prefer_hipcc": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/topk_per_row_pybind.cu'",

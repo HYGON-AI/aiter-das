@@ -1612,6 +1612,40 @@ namespace py = pybind11;
           py::arg("stride0"),                                                     \
           py::arg("stride1"));
 
+#define SAMPLING_PYBIND                                                        \
+    m.def("top_k_sampling_from_probs",                                         \
+          &aiter::sampling::c_top_k_sampling_from_probs,                       \
+          py::arg("probs"),                                                            \
+          py::arg("output"),                                                           \
+          py::arg("maybe_indices"),                                                    \
+          py::arg("maybe_top_k_arr"),                                                  \
+          py::arg("top_k_val"),                                                        \
+          py::arg("deterministic"),                                                    \
+          py::arg("philox_seed"),                                                      \
+          py::arg("philox_offset"));                                                   \
+    m.def("top_p_sampling_from_probs",                                         \
+          &aiter::sampling::c_top_p_sampling_from_probs,                       \
+          py::arg("probs"),                                                            \
+          py::arg("output"),                                                           \
+          py::arg("maybe_indices"),                                                    \
+          py::arg("maybe_top_p_arr"),                                                  \
+          py::arg("top_p_val"),                                                        \
+          py::arg("deterministic"),                                                    \
+          py::arg("philox_seed"),                                                      \
+          py::arg("philox_offset"));                                                   \
+    m.def("top_k_top_p_sampling_from_probs",                                   \
+          &aiter::sampling::c_top_k_top_p_sampling_from_probs,                 \
+          py::arg("probs"),                                                            \
+          py::arg("output"),                                                           \
+          py::arg("maybe_indices"),                                                    \
+          py::arg("maybe_top_k_arr"),                                                  \
+          py::arg("top_k_val"),                                                        \
+          py::arg("maybe_top_p_arr"),                                                  \
+          py::arg("top_p_val"),                                                        \
+          py::arg("deterministic"),                                                    \
+          py::arg("philox_seed"),                                                      \
+          py::arg("philox_offset"));
+
 #define TOPK_TRANSFORM_PYBIND                         \
     m.def("fast_topk_interface",                      \
           &fast_topk_interface,                       \
