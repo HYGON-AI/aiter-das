@@ -79,6 +79,10 @@ For an interactive local reproduction on a BW1100 host, run
 `AITER_CI_CONTAINER_NAME` when necessary; attach with
 `docker exec -it <container-name> /bin/bash`.
 
+Contributions from forks are verified through pull requests to `main`; only
+trusted fork pull requests should be approved to use the privileged
+self-hosted Runner.
+
 ## Aoubt the environment variable
 1. 'AITER_LOG_MORE': log more info about aiter internal process,params, etc.
 2. 'AITER_LOG_OP_PARAM': log the params for special interface, such as 'aiter_moe'.
