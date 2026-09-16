@@ -82,6 +82,7 @@ For an interactive local reproduction on a BW1100 host, run
 Contributions from forks are verified through pull requests to `main`. The
 self-hosted CI Runner pool is network-isolated for this purpose.
 The workflow checks out the immutable head commit of the pull request.
+Test reports are published as GitHub Actions artifacts for each CI run.
 
 ## Aoubt the environment variable
 1. 'AITER_LOG_MORE': log more info about aiter internal process,params, etc.
