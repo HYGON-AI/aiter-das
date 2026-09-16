@@ -636,6 +636,12 @@ namespace py = pybind11;
           py::arg("chunk_indices") = std::nullopt, py::arg("chunk_size") = 64,                \
           py::arg("use_exp2") = false, py::arg("transpose_state_layout") = true);             \
                                                                                                 \
+    m.def("chunk_gated_delta_rule_fwd_kkt_solve_hip",                                          \
+          &aiter::native::chunk_gated_delta_rule_fwd_kkt_solve_hip,                            \
+          py::arg("k"), py::arg("beta"), py::arg("g") = std::nullopt,                       \
+          py::arg("cu_seqlens") = std::nullopt, py::arg("chunk_indices") = std::nullopt,      \
+          py::arg("chunk_size") = 64);                                                        \
+                                                                                                \
 
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \
     AITER_TENSOR_PYBIND                                                                        \

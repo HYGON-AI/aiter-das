@@ -19,22 +19,10 @@ import aiter
 import aiter.jit
 
 # Trigger normal Python loading/JIT compilation of module_cpp_api.so.
-dtype = torch.float16
-device = torch.device("cuda")
-q = torch.zeros((1, 64, 1, 128), dtype=dtype, device=device)
-k = torch.zeros((1, 64, 1, 128), dtype=dtype, device=device)
-v = torch.zeros((1, 64, 1, 128), dtype=dtype, device=device)
-h = torch.zeros((1, 1, 1, 128, 128), dtype=dtype, device=device)
-g = torch.zeros((1, 64, 1), dtype=torch.float32, device=device)
-aiter.chunk_fwd_o_vllm_hip_blockdim64(
-    q,
-    k,
-    v,
-    h,
-    g=g,
-    chunk_size=64,
-    transpose_state_layout=True,
-)
+k = torch.zeros((1, 64, 1, 128), dtype=torch.float16, device="cuda")
+beta = torch.zeros((1, 64, 2), dtype=torch.float32, device="cuda")
+g = torch.zeros((1, 64, 2), dtype=torch.float32, device="cuda")
+aiter.chunk_gated_delta_rule_fwd_kkt_solve_hip(k=k, beta=beta, g=g, chunk_size=64)
 torch.cuda.synchronize()
 
 so_name = "module_cpp_api.so"
@@ -79,7 +67,6 @@ fi
 
 BUILD_DIR="${SCRIPT_DIR}/build"
 mkdir -p "${BUILD_DIR}"
-# Capture link failures; keep real -lamdhip64, sanitize user-facing stderr.
 # shellcheck source=../hcu_build_helpers.sh
 source "${SCRIPT_DIR}/../hcu_build_helpers.sh"
 PY_LDFLAGS="$(python3-config --ldflags --embed 2>/dev/null || python3-config --ldflags 2>/dev/null || true)"
@@ -87,15 +74,15 @@ PY_INCLUDES="$(python3-config --includes 2>/dev/null || true)"
 hcu_cxx_link "${BUILD_DIR}" "${CXX}" -std=c++20 -O2 \
     -D_GLIBCXX_USE_CXX11_ABI="${CXX11_ABI}" \
     -I"${AITER_CSRC}/include" ${PY_INCLUDES} ${TORCH_INCLUDES} \
-    "${SCRIPT_DIR}/test_chunk_fwd_o_torch_api.cpp" \
+    "${SCRIPT_DIR}/test_chunk_gated_delta_rule_fwd_kkt_solve_hip_torch_api.cpp" \
     -L"${SO_DIR}" ${TORCH_LIB_DIRS} \
     -Wl,-rpath,"${SO_DIR}" -Wl,-rpath,"${TORCH_LIB}" \
     -l:module_cpp_api.so -ltorch -ltorch_cpu -ltorch_hip -lc10 -lc10_hip -lamdhip64 \
-    ${PY_LDFLAGS} -o "${BUILD_DIR}/test_chunk_fwd_o_torch_api"
+    ${PY_LDFLAGS} -o "${BUILD_DIR}/test_chunk_gated_delta_rule_fwd_kkt_solve_hip_torch_api"
 
 for dtype in fp16 bf16; do
     fixture="${BUILD_DIR}/${dtype}"
     python3 "${SCRIPT_DIR}/generate_fixture.py" "${fixture}" --dtype "${dtype}"
     LD_LIBRARY_PATH="${SO_DIR}:${TORCH_LIB}:${LD_LIBRARY_PATH:-}" \
-        "${BUILD_DIR}/test_chunk_fwd_o_torch_api" "${fixture}"
+        "${BUILD_DIR}/test_chunk_gated_delta_rule_fwd_kkt_solve_hip_torch_api" "${fixture}"
 done
