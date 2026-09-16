@@ -57,6 +57,10 @@ jobs:
           allow-unsafe-pr-checkout: true
           submodules: false
 
+      - name: Mark checkout as a safe Git directory
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Prepare DTK and Python environment
         shell: bash
         run: source ci_script/prepare_environment.sh
