@@ -52,6 +52,9 @@ jobs:
           # Fetch the server-created PR merge ref instead, which contains the
           # proposed fork commit merged with main and is readable upstream.
           ref: ${{ github.event_name == 'pull_request_target' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.sha }}
+          # The isolated Runner pool is explicitly approved to execute fork
+          # pull-request code from this privileged pull_request_target job.
+          allow-unsafe-pr-checkout: true
           submodules: false
 
       - name: Prepare DTK and Python environment
