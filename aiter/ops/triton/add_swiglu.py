@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Hygon Info Technologies Ltd.
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Training Add + SwiGLU with explicit eager dtype rounding boundaries.
 
 Contract: silu((base + delta)[..., :D]) * (base + delta)[..., D:].
