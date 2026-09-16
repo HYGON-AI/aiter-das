@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Device-only correctness checks; run on the target HCU, not on a CPU host."""
 import pytest
 import torch
