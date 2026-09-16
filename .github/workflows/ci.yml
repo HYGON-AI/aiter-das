@@ -52,6 +52,9 @@ jobs:
           # immutable commit proposed by the fork instead.
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # The isolated Runner pool is explicitly approved to execute fork
+          # pull-request code from this privileged pull_request_target job.
+          allow-unsafe-pr-checkout: true
           submodules: false
 
       - name: Prepare DTK and Python environment
