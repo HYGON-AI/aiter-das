@@ -17,5 +17,9 @@ jobs:
   gate:
     name: Checks
     uses: HYGON-AI/quality-gate/.github/workflows/pr-quality-gate.yml@49ea72ee6967edb9f54013a15c4cc6e8d39da740
+    # Reuse the isolated CI Runner pool.  The reusable workflow accepts a JSON
+    # label array; Runner-group selection is managed by GitHub, not this input.
+    with:
+      runner_labels: '["self-hosted", "ci"]'
     permissions:
       contents: read

@@ -83,7 +83,13 @@ jobs:
         id: optest
         continue-on-error: true
         shell: bash
-        run: optest --op_name aiter --test_mode all --test_dir "$GITHUB_WORKSPACE"
+        # The server-generated pull-request merge ref is intentionally
+        # detached.  Give optest the PR head identity explicitly rather than
+        # asking it to infer a branch from that merge ref.
+        run: >-
+          optest --op_name aiter --test_mode all --test_dir "$GITHUB_WORKSPACE"
+          --branch "${{ github.event.pull_request.head.ref || github.ref_name }}"
+          --commit "${{ github.event.pull_request.head.sha || github.sha }}"
 
       - name: Generate JUnit report
         if: always()
