@@ -83,6 +83,7 @@ Contributions from forks are verified through pull requests to `main`. The
 self-hosted CI Runner pool is network-isolated for this purpose.
 The workflow checks out GitHub's immutable pull-request merge ref.
 Test reports are published as GitHub Actions artifacts for each CI run.
+CI therefore validates the result proposed for merge into `main`.
 
 ## Aoubt the environment variable
 1. 'AITER_LOG_MORE': log more info about aiter internal process,params, etc.
