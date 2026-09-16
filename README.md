@@ -73,6 +73,10 @@ SGLang image, its two Variables can be removed as well.
 `AICC_NIGHTLY_DIR` is optional and only installs a newer AICC package when
 configured. Set `DTK_PKG` only when running the environment script
 outside that image and a replacement DTK archive is required.
+While `Moe` and `composable_kernel-das` are private, configure the read-only
+`AITER_SUBMODULE_TOKEN` Repository secret so CI can fetch their submodules.
+After both repositories are public, delete that secret; the workflow falls
+back to `github.token` for public submodules.
 
 For an interactive local reproduction on a BW1100 host, run
 `bash ci_script/run_sglang_ci_container.sh`. Override `AITER_CI_IMAGE` or
