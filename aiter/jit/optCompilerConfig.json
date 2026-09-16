@@ -383,7 +383,8 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/quant_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/quant_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/per_token_group_quant_fp8_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/per_token_group_quant_fp8_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/per_token_quant_i8.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
