@@ -191,17 +191,53 @@ __device__ __forceinline__ unsigned short fp8_half(unsigned char b){
  __half x=__float2half(float(m)*(1.0f/512.0f));
  return sign|__builtin_bit_cast(unsigned short,x);
 }
+// Decode exactly, including E4M3FN subnormals, without global scratch.
+// Two independent 16-bit fields hold sign/magnitude. A packed FP16
+// subtraction normalizes the eight E4M3 subnormal magnitudes exactly:
+// (2^-6 + m*2^-9) - 2^-6. Every result is normal in FP16.
+// Masks select normal/subnormal/NaN fields without per-byte EXEC branches.
+__device__ __forceinline__ uint32_t decode_fp8_pair(uint32_t pair) {
+    const uint32_t mag=pair&0x007f007fu;
+    const uint32_t normal=(mag<<7)+0x20002000u;
+    const uint32_t sub_bits=(mag<<7)+0x24002400u;
+    const __half2 sub=__hsub2(__builtin_bit_cast(__half2,sub_bits),
+                             __builtin_bit_cast(__half2,uint32_t(0x24002400u)));
+    const uint32_t exp=mag&0x00780078u;
+    const uint32_t normal_mask=(((exp+0x00780078u)&0x00800080u)>>7)*0xffffu;
+    const uint32_t not_nan=mag^0x007f007fu;
+    const uint32_t finite_mask=(((not_nan+0x007f007fu)&0x00800080u)>>7)*0xffffu;
+    const uint32_t value=(normal&normal_mask)|(__builtin_bit_cast(uint32_t,sub)&~normal_mask);
+    return ((pair&0x00800080u)<<8)|(value&finite_mask)|(0x7fff7fffu&~finite_mask);
+}
+__device__ __forceinline__ f16x8_t decode_fp8x8_value(intx2 words) {
+    using u32x4=uint32_t __attribute__((ext_vector_type(4)));
+    u32x4 result;
+    #pragma unroll
+    for(int j=0;j<2;++j) {
+        const uint32_t bits=words[j];
+        result[j*2]=decode_fp8_pair((bits&0xffu)|((bits&0xff00u)<<8));
+        result[j*2+1]=decode_fp8_pair(((bits>>16)&0xffu)|((bits>>8)&0xff0000u));
+    }
+    return __builtin_bit_cast(f16x8_t,result);
+}
 __global__ void convert_q(const uint8_t* src,uint16_t* dst,int size){
     const int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i<size)dst[i]=fp8_half(src[i]);
 }
-__global__ void convert_cache(const uint8_t* src,uint8_t* dst,int tokens,int S){
-    const int i=blockIdx.x*blockDim.x+threadIdx.x;
-    if(i>=tokens*128)return;
-    const int token=i/128,d=i%128;
+// One lane converts one aligned logical 16-byte key fragment. The load helper
+// also supports storage views with only the public four-byte alignment.
+template<int S>
+__global__ void convert_cache_vector(const uint8_t* src,uint8_t* dst,int tokens){
+    const int fragment=blockIdx.x*blockDim.x+threadIdx.x;
+    if(fragment>=tokens*8)return;
+    const int token=fragment/8,d=(fragment%8)*16;
     const int srcpos=(token/S)*S*132+(token%S)*128+d;
-    const int64_t dstpos=int64_t(token)*256+d*2;
-    *reinterpret_cast<uint16_t*>(dst+dstpos)=fp8_half(src[srcpos]);
+    const auto bytes=load_q16(src+srcpos);
+    using u16x16=uint16_t __attribute__((ext_vector_type(16)));
+    u16x16 values;
+    #pragma unroll
+    for(int j=0;j<16;++j)values[j]=fp8_half(bytes.data[j]);
+    *reinterpret_cast<u16x16*>(dst+int64_t(token)*256+d*2)=values;
     if(d==0)*reinterpret_cast<float*>(dst+int64_t(tokens)*256+int64_t(token)*4)=
         *reinterpret_cast<const float*>(src+(token/S)*S*132+S*128+(token%S)*4);
 }
@@ -223,13 +259,13 @@ __global__ void check_groups(const int* context,const int* tables,int* flags,int
  for(int q=0;q<QT&&q0+q<B;++q){
   if(context[q0+q]!=len){if(tid==0)atomicExch(&bad,1);continue;}
   for(int i=chunk*1024+tid;i<ceil_div(len,S) && i<(chunk+1)*1024;i+=blockDim.x)
-   if(tables[int64_t(q0+q)*tw+i]!=int64_t(p0)+i)atomicExch(&bad,1);
+   if(tables[int64_t(q0+q)*tw+i]!=(S==64?tables[int64_t(q0)*tw+i]:int64_t(p0)+i))atomicExch(&bad,1);
  }
  __syncthreads();
  if(tid==0)flags[g*chunks+chunk]=bad?-1:p0*S;
  if(chunk==0){
   if(tid==0)compact_context[g]=len;
-  for(int i=tid;i<ctw;i+=blockDim.x)compact_tables[int64_t(g)*ctw+i]=p0*S/64+i;
+  for(int i=tid;i<ctw;i+=blockDim.x)compact_tables[int64_t(g)*ctw+i]=S==64?(i<ceil_div(len,S)?tables[int64_t(q0)*tw+i]:0):p0*S/64+i;
  }
 }
 

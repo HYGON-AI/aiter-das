@@ -84,11 +84,12 @@ NONE_WRAPPED_OP = [
     # "qr_get_handle",
 ]
 
-# These low-level entry points mutate preallocated outputs and launch one short
-# kernel. Keep their torch.library registration for torch.compile, but avoid
+# These low-level entry points launch short GPU workloads. Keep their torch.library registration for torch.compile, but avoid
 # that dispatcher hop in normal eager execution where it creates an observable
 # inter-launch gap for the one-row case.
 EAGER_DIRECT_OP = {
+    "_paged_mqa_logits_alloc",
+    "_paged_mqa_logits_opus",
     "top_k_per_row_prefill",
     "top_k_per_row_decode",
 }

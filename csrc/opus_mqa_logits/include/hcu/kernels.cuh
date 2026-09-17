@@ -4,6 +4,8 @@
 #pragma once
 #include "fp8.cuh"
 #include "fp16.cuh"
+#include "mls.cuh"
+#include "direct_half.cuh"
 namespace aiter_paged_mqa_hcu {
 
 // ID6: every request has its own page table. No sharing assumption is made.

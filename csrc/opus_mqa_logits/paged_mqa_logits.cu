@@ -11,6 +11,7 @@
 #include "hcu/kernels.cuh"
 #include <climits>
 #include <cstring>
+#include <optional>
 
 namespace {
 // All temporaries belong to the current PyTorch stream/capture pool. Preparation
@@ -27,14 +28,45 @@ void launch_hcu(const torch::Tensor& q, const torch::Tensor& cache,
     const bool grouped=kernel_id==7;
     const uint8_t* qp=static_cast<const uint8_t*>(q.data_ptr());
     const uint8_t* kp=cache.data_ptr<uint8_t>();
+    if(fp16_mmac && !grouped && page_size==64 && !(batch>=32 && int64_t(tokens)<=2LL*max_len) && !(batch==1 && max_len<=8192)) {
+        auto converted_q=torch::empty(q.sizes(),q.options().dtype(at::kHalf));
+        hipLaunchKernelGGL(convert_q,dim3((q.numel()+255)/256),dim3(256),0,stream,qp,reinterpret_cast<uint16_t*>(converted_q.data_ptr()),static_cast<int>(q.numel()));
+        const dim3 grid(((int64_t(max_len)+255)/256)*next,batch);
+#define FUSED(H,R) hipLaunchKernelGGL((paged_mqa_direct_half<H,R>),grid,dim3(256),0,stream,reinterpret_cast<const uint16_t*>(converted_q.data_ptr()),kp,weights.data_ptr<float>(),context.data_ptr<int>(),tables.data_ptr<int>(),output.data_ptr<float>(),max_len,table_width)
+#define FUSED_NEXT(H) if(next==1) { FUSED(H,1); } else if(next==2) { FUSED(H,2); } else { FUSED(H,4); }
+        if(heads==32) { FUSED_NEXT(32) } else { FUSED_NEXT(64) }
+#undef FUSED_NEXT
+#undef FUSED
+        return;
+    }
+    const bool mls_aligned=((reinterpret_cast<uintptr_t>(qp)|reinterpret_cast<uintptr_t>(kp))%16)==0;
+    if(!fp16_mmac && !grouped && page_size==64 && mls_aligned) {
+        // Small grids favor less serial KV work per wave; large grids reuse Q.
+        const int64_t elements=int64_t(batch)*next*max_len;
+        const int tile=elements<=16384 ? 64 : elements<=32768 ? 128 : 256;
+        const dim3 grid(((int64_t(max_len)+tile-1)/tile)*next,batch);
+#define MLS_TILE(H,R,I) hipLaunchKernelGGL((paged_mqa_mls_single<H,R,I>),grid,dim3(256),9216,stream,qp,kp,weights.data_ptr<float>(),context.data_ptr<int>(),tables.data_ptr<int>(),output.data_ptr<float>(),max_len,table_width)
+#define MLS(H,R) if(tile==64) { MLS_TILE(H,R,1); } else if(tile==128) { MLS_TILE(H,R,2); } else { MLS_TILE(H,R,4); }
+#define MLS_NEXT(H) if(next==1) { MLS(H,1); } else if(next==2) { MLS(H,2); } else { MLS(H,4); }
+        if(heads==32) { MLS_NEXT(32) } else { MLS_NEXT(64) }
+#undef MLS_NEXT
+#undef MLS
+#undef MLS_TILE
+        return;
+    }
     torch::Tensor qwork, kwork, flags, compact_context, compact_tables;
     if(fp16_mmac) {
         qwork=torch::empty(q.sizes(),q.options().dtype(at::kHalf));
         kwork=torch::empty({((int64_t(tokens)+63)/64)*64*260},cache.options());
         hipLaunchKernelGGL(convert_q,dim3((q.numel()+255)/256),dim3(256),0,stream,
             qp,reinterpret_cast<uint16_t*>(qwork.data_ptr()),static_cast<int>(q.numel()));
-        hipLaunchKernelGGL(convert_cache,dim3((int64_t(tokens)*128+255)/256),dim3(256),0,stream,
-            kp,kwork.data_ptr<uint8_t>(),tokens,page_size);
+        if(page_size==64) {
+            hipLaunchKernelGGL((convert_cache_vector<64>),dim3((int64_t(tokens)*8+255)/256),dim3(256),0,stream,
+                kp,kwork.data_ptr<uint8_t>(),tokens);
+        } else {
+            hipLaunchKernelGGL((convert_cache_vector<1>),dim3((int64_t(tokens)*8+255)/256),dim3(256),0,stream,
+                kp,kwork.data_ptr<uint8_t>(),tokens);
+        }
         qp=static_cast<const uint8_t*>(qwork.data_ptr());
         kp=kwork.data_ptr<uint8_t>();
     } else if(grouped && page_size==1) {
@@ -62,7 +94,11 @@ void launch_hcu(const torch::Tensor& q, const torch::Tensor& cache,
     context.data_ptr<int>(),tables.data_ptr<int>(),output.data_ptr<float>(),batch,max_len,table_width,tokens, \
     flags.data_ptr<int>(),compact_context.data_ptr<int>(),compact_tables.data_ptr<int>())
         if(fp16_mmac) { if(page_size==1) { GROUP_FP16(1); } else { GROUP_FP16(64); } }
-        else { if(page_size==1) { GROUP_FP8(1); } else { GROUP_FP8(64); } }
+        else if(page_size==64 && mls_aligned) {
+            hipLaunchKernelGGL(paged_mqa_mls_grouped,grid,dim3(256),10240,stream,qp,kp,weights.data_ptr<float>(),
+                context.data_ptr<int>(),tables.data_ptr<int>(),output.data_ptr<float>(),batch,max_len,table_width,
+                flags.data_ptr<int>(),compact_context.data_ptr<int>(),compact_tables.data_ptr<int>());
+        } else { if(page_size==1) { GROUP_FP8(1); } else { GROUP_FP8(64); } }
 #undef GROUP_FP8
 #undef GROUP_FP16
     } else {
@@ -84,15 +120,15 @@ void launch_hcu(const torch::Tensor& q, const torch::Tensor& cache,
 }
 } // namespace
 
-void paged_mqa_logits_opus(const torch::Tensor& q, const torch::Tensor& cache,
+static torch::Tensor paged_mqa_logits_impl(const torch::Tensor& q, const torch::Tensor& cache,
                           const torch::Tensor& weights, const torch::Tensor& context,
-                          const torch::Tensor& tables, torch::Tensor& output,
-                          int64_t max_len, int64_t kernel_id)
+                          const torch::Tensor& tables, std::optional<torch::Tensor> supplied_output,
+                          int64_t max_len, int64_t kernel_id, bool clean_logits)
 {
     TORCH_CHECK(q.is_cuda(), "paged_mqa_logits: q must be on GPU");
-    for(const auto& t : {q,cache,weights,context,tables,output}) {
-        TORCH_CHECK(t.is_cuda() && t.device()==q.device() && t.is_contiguous(),
-                    "paged_mqa_logits: tensors must be contiguous on the same GPU");
+    for(const auto& t : {q,cache,weights,context,tables}) {
+        TORCH_CHECK(t.is_cuda() && t.device()==q.device() && t.is_contiguous() && !t.requires_grad(),
+                    "paged_mqa_logits: tensors must be contiguous inference tensors on the same GPU");
     }
     TORCH_CHECK(q.dim()==4 && q.scalar_type()==at::ScalarType::Float8_e4m3fn,
                 "paged_mqa_logits: q must be E4M3FN [B,R,H,128]");
@@ -115,14 +151,7 @@ void paged_mqa_logits_opus(const torch::Tensor& q, const torch::Tensor& cache,
     TORCH_CHECK(tables.scalar_type()==at::kInt && tables.dim()==2 && tables.size(0)==batch &&
                 tables.size(1)>0 && tables.size(1)<=INT_MAX,
                 "paged_mqa_logits: tables must be int32 [B,T]");
-    TORCH_CHECK(max_len>0 && max_len<=INT_MAX && output.scalar_type()==at::kFloat &&
-                output.dim()==2 && output.size(0)==batch*next && output.size(1)==max_len,
-                "paged_mqa_logits: output must be FP32 [B*R,max_len], max_len>0");
-    for(const auto& t : {q,cache,weights,context,tables})
-        TORCH_CHECK(!output.is_alias_of(t), "paged_mqa_logits: output must not alias inputs");
-    TORCH_CHECK(kernel_id>=0 && kernel_id<=7, "paged_mqa_logits: kernelId must be in [0,7]");
-    TORCH_CHECK(kernel_id>=6 || cache.size(1)==1,"paged_mqa_logits: ID0-5 require S=1");
-    TORCH_CHECK(kernel_id!=7 || (heads==32 && next==1),"paged_mqa_logits: ID7 requires H=32,R=1");
+    TORCH_CHECK(max_len>0 && max_len<=INT_MAX,"paged_mqa_logits: max_len must be a positive int32 value");
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(q));
     // Cache per calling thread/device; never infer a tensor's architecture from
     // GPU_ARCHS or from a different current device.
@@ -140,9 +169,25 @@ void paged_mqa_logits_opus(const torch::Tensor& q, const torch::Tensor& cache,
         cached_device=device;
     }
     TORCH_CHECK(supported,"paged_mqa_logits: supported architectures are gfx936/gfx938/gfx946");
+    if(kernel_id==-1) {
+        kernel_id=is_gfx946 ? 4 :
+            ((heads==32 && next==1 && batch>=32 && max_len>=(is_gfx936?4096:16384) && cache.size(0)*cache.size(1)<=2*max_len) ? 7 : 6);
+    }
+    TORCH_CHECK(kernel_id>=0 && kernel_id<=7,"paged_mqa_logits: kernelId must be in [0,7]");
+    TORCH_CHECK(kernel_id>=6 || cache.size(1)==1,"paged_mqa_logits: ID0-5 require S=1");
+    TORCH_CHECK(kernel_id!=7 || (heads==32 && next==1),"paged_mqa_logits: ID7 requires H=32,R=1");
     TORCH_CHECK(is_gfx946 ? (kernel_id==4 || kernel_id==5) :
                 is_gfx936 ? kernel_id>=6 : (kernel_id<=3 || kernel_id>=6),
                 "paged_mqa_logits: gfx936 requires ID6-7; gfx938 ID0-3/6-7; gfx946 ID4-5");
+    // Eager allocation and metadata validation share this native entry. The
+    // supplied-output path retains storage-alias and inference-only checks.
+    torch::Tensor output=supplied_output ? *supplied_output : torch::empty({batch*next,max_len},q.options().dtype(at::kFloat));
+    TORCH_CHECK(output.is_cuda() && output.device()==q.device() && output.is_contiguous() && !output.requires_grad() &&
+                output.scalar_type()==at::kFloat && output.dim()==2 && output.size(0)==batch*next && output.size(1)==max_len,
+                "paged_mqa_logits: output must be contiguous FP32 [B*R,max_len] on input GPU");
+    if(supplied_output)for(const auto& t : {q,cache,weights,context,tables})
+        TORCH_CHECK(!output.is_alias_of(t),"paged_mqa_logits: output must not alias inputs");
+    if(clean_logits && kernel_id<2)output.fill_(-INFINITY);
     const dim3 grid(static_cast<unsigned>((max_len+63)/64),static_cast<unsigned>(batch*next));
     const auto stream=at::hip::getCurrentHIPStream();
     if(kernel_id>=6) {
@@ -195,4 +240,18 @@ void paged_mqa_logits_opus(const torch::Tensor& q, const torch::Tensor& cache,
             output.data_ptr<float>(),static_cast<int>(next),static_cast<int>(max_len),static_cast<int>(tables.size(1)));
     const auto err=hipGetLastError();
     TORCH_CHECK(err==hipSuccess,"paged_mqa_logits launch: ",hipGetErrorString(err));
+    return output;
+}
+
+void paged_mqa_logits_opus(const torch::Tensor& q,const torch::Tensor& cache,
+ const torch::Tensor& weights,const torch::Tensor& context,const torch::Tensor& tables,
+ torch::Tensor& output,int64_t max_len,int64_t kernel_id) {
+    TORCH_CHECK(kernel_id>=0,"paged_mqa_logits: explicit kernelId must be nonnegative");
+    (void)paged_mqa_logits_impl(q,cache,weights,context,tables,output,max_len,kernel_id,false);
+}
+
+torch::Tensor paged_mqa_logits_alloc(const torch::Tensor& q,const torch::Tensor& cache,
+ const torch::Tensor& weights,const torch::Tensor& context,const torch::Tensor& tables,
+ int64_t max_len,int64_t kernel_id,bool clean_logits) {
+    return paged_mqa_logits_impl(q,cache,weights,context,tables,std::nullopt,max_len,kernel_id,clean_logits);
 }

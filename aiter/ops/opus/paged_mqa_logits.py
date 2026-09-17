@@ -16,6 +16,13 @@ def _paged_mqa_logits_opus(q: torch.Tensor, cache: torch.Tensor,
                           max_len: int, kernel_id: int) -> None: ...
 
 
+@compile_ops("module_mqa_logits", fc_name="paged_mqa_logits_alloc")
+def _paged_mqa_logits_alloc(q: torch.Tensor, cache: torch.Tensor,
+                            weights: torch.Tensor, context: torch.Tensor,
+                            tables: torch.Tensor, max_len: int,
+                            kernel_id: int, clean_logits: bool) -> torch.Tensor: ...
+
+
 @lru_cache(maxsize=None)
 def _require_arch(device_index):
     arch = torch.cuda.get_device_properties(device_index).gcnArchName.split(":")[0]
@@ -38,7 +45,7 @@ def _resolve_paged_mqa_kernel(kernel_id, *, rows, max_len, arch="gfx938",
     if kernel_id is None:
         # Shape metadata limits preparation cost. The kernel still verifies
         # every used page ID and request length before sharing any K data.
-        return 7 if (heads == 32 and next_n == 1 and rows >= 32 and max_len >= 4096
+        return 7 if (heads == 32 and next_n == 1 and rows >= 32 and max_len >= (4096 if arch == "gfx936" else 16384)
                      and cache_tokens is not None and cache_tokens <= 2*max_len) else 6
     allowed = (6, 7) if arch == "gfx936" else (0, 1, 2, 3, 6, 7)
     if type(kernel_id) is not int or kernel_id not in allowed:
@@ -64,15 +71,21 @@ def paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables,
     are not read back to the host in the hot path. Query r sees candidates
     n<length[b]-R+r+1. Weights may be negative. Inputs are inference-only.
 
-    On gfx936/gfx938, ID6 is a four-wave, N256 paged pipeline. ID7 groups two
+    On gfx936/gfx938, ID6 is a four-wave paged pipeline. ID7 groups two
     queries when H=32,R=1. It verifies all used page IDs and lengths on GPU;
     nonmatching groups execute independently. Auto selects ID7 for B>=32,
-    max_model_len>=4096 and P*S<=2*max_model_len; otherwise it selects ID6.
+    P*S<=2*max_model_len and max_model_len>=4096 on gfx936 or >=16384 on gfx938;
+    otherwise it selects ID6.
     ID7 repacks S=1 cache into aligned physical blocks on every call. gfx936
-    converts Q/K exactly to FP16 (including FP8 subnormals) before FP16 MMAC;
-    gfx938 uses native FP8 MMAC. Temporary preparation is part of the call.
-    Approximate scratch: ID7 gfx938 S=1 uses 132*ceil(P/64)*64 bytes plus
-    metadata; gfx936 uses 2*Q.numel()+260*ceil(P*S/64)*64 bytes plus metadata.
+    converts Q exactly to FP16; its S64 independent path decodes KV in registers
+    without a full converted KV buffer, preserving FP8 subnormals and signed zero.
+    Reused/small caches and S1 retain vectorized global conversion. gfx938 uses
+    native FP8 MMAC with MLS on aligned S64: N64 for B*R*max_model_len<=16384,
+    N128 for <=32768, and N256 for larger grids.
+    S1 and 4-byte offset views retain the buffer-load path. Preparation is timed.
+    Approximate scratch: gfx936 direct S64 uses 2*Q.numel() bytes; conversion
+    paths additionally use 260*ceil(P*S/64)*64 bytes. ID7 gfx938 S1 uses
+    132*ceil(P/64)*64 bytes. Grouped paths also allocate checked page metadata.
     Explicit gfx938 IDs 0-3 retain the original S=1 Opus paths for comparison.
     On gfx946, None selects ID4 (K32); explicit ID5 uses K64 prefetch.
     IDs 4/5 use the N64 DPP pipeline with 8-byte aligned LDS row strides
@@ -86,6 +99,20 @@ def paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables,
     Allocation/fill occur on the current stream; no host synchronization is
     performed. Warm up the JIT before capturing the call in a GPU graph.
     """
+    # The eager allocating entry validates tensor metadata and allocates on the
+    # current stream in C++. Compiled and supplied-output calls retain the
+    # registered preallocated operator below.
+    if out is None and not torch.compiler.is_compiling():
+        if type(max_model_len) is not int or not 0 < max_model_len < 2**31:
+            raise ValueError("max_model_len must be a positive int32 value")
+        if type(clean_logits) is not bool:
+            raise ValueError("clean_logits must be bool")
+        if kernelId is not None and (type(kernelId) is not int or not 0 <= kernelId <= 7):
+            raise ValueError("kernelId must be None or an integer in [0,7]")
+        if kernelId == 7 and q.ndim == 4 and (q.shape[2] != 32 or q.shape[1] != 1):
+            raise ValueError("kernelId=7 requires H=32 and R=1")
+        return _paged_mqa_logits_alloc(q,kv_cache,weights,context_lens,block_tables,
+                                      max_model_len,-1 if kernelId is None else kernelId,clean_logits)
     inputs = (q, kv_cache, weights, context_lens, block_tables)
     if any(not t.is_cuda or t.device != q.device for t in inputs):
         raise ValueError("inputs must be on the same GPU")

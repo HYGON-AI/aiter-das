@@ -2,6 +2,12 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Paged MQA independent reference and reproducible comparison entry point.
 
+整体用法：在仓库根目录运行 pytest，验证当前架构所有适用路径；仅验证 HCU
+优化路径时加 -k TestPagedMQAHCU。该类同时检查默认分配和预分配 out、
+S1/S64 页、负权重、非正规数、非对齐视图、随机共享页和 Graph 回放更新。
+--cpu-reference 使用 CPU 构造输入和参考值，适合 gfx946 Perf Model；
+--bench 是已有的预分配 Graph 基准，功能正确性应先通过再测性能。
+
 From repository root:
   python -B op_tests/test_paged_mqa_logits.py
   python -B op_tests/test_paged_mqa_logits.py --backend baseline --json-out results.json
@@ -18,7 +24,8 @@ With --bench, print a paired comparison table after all rounds; JSON retains raw
 
 gfx938 IDs: 0/1 = initial full/wave reduction; 2 = DPP/K32; 3 = DPP/K64 prefetch.
 gfx936/gfx938 IDs: 6 = independent requests; 7 = verified two-query K sharing.
-Auto selects ID7 for H32/R1, B>=32, max_len>=4096 and cache_tokens<=2*max_len;
+Auto selects ID7 for H32/R1, B>=32, cache_tokens<=2*max_len, and
+max_len>=4096 on gfx936 or >=16384 on gfx938;
 otherwise ID6. IDs 0-3 remain explicit gfx938 comparisons.
 gfx946 IDs: 4 = aligned LDS/K32 (Auto); 5 = aligned LDS/K64 prefetch.
 Use --cpu-reference on gfx946; the Triton comparison mode requires gfx938.
@@ -223,7 +230,7 @@ def run_api_contracts(report_path, kernel_id=None):
     impl = importlib.import_module("aiter.ops.opus.paged_mqa_logits")
     assert impl._resolve_paged_mqa_kernel(None,rows=1,max_len=8192) == 6
     for arch in ("gfx936","gfx938"):
-        options=dict(max_len=4096,cache_tokens=4096,arch=arch)
+        options=dict(max_len=4096 if arch=="gfx936" else 16384,cache_tokens=4096,arch=arch)
         assert impl._resolve_paged_mqa_kernel(None,rows=31,**options) == 6
         assert impl._resolve_paged_mqa_kernel(None,rows=32,**options) == 7
         assert impl._resolve_paged_mqa_kernel(None,rows=32,heads=64,**options) == 6
@@ -496,6 +503,8 @@ def _hcu_paged_reference(args):
 def _validate_hcu_paged_case(args,kid=None,*,graph=False):
     from aiter import paged_mqa_logits
     ref,mask=_hcu_paged_reference(args)
+    allocated=paged_mqa_logits(*args,kernelId=kid)
+    check_output(allocated,ref,mask)
     guard=torch.full((ref.numel()+32,),654321.,device='cuda')
     out=guard[16:-16].reshape_as(ref)
     returned=paged_mqa_logits(*args,out=out,kernelId=kid)
@@ -539,20 +548,24 @@ class TestPagedMQAHCU:
         _validate_hcu_paged_case(_make_hcu_paged_case(8,1,32,257,s,shared=True,offset=True),kid,graph=True)
 
     @pytest.mark.parametrize('s',[1,64])
-    def test_graph_rechecks_mutated_metadata(self, s):
+    @pytest.mark.parametrize('b,n',[(2,257),(2,8193),(33,4097)])
+    def test_graph_rechecks_mutated_metadata(self, s,b,n):
         from aiter import paged_mqa_logits
-        args=_make_hcu_paged_case(33,1,32,4097,s,shared=True)
+        args=_make_hcu_paged_case(b,1,32,n,s,shared=True)
         out=_validate_hcu_paged_case(args)
         g=torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):paged_mqa_logits(*args,out=out)
+        with torch.cuda.graph(g):
+            paged_mqa_logits(*args,out=out)
+            allocated=paged_mqa_logits(*args)
         q,k,w,ctx,tb,n=args
         # A middle page breaks sharing; a second pair has different lengths.
         middle=tb.shape[1]//2;tb[1,middle]=(tb[1,middle]+1)%k.shape[0]
-        ctx[3]-=9;w.mul_(-0.5)
+        ctx[min(3,b-1)]-=9;w.mul_(-0.5)
         q.view(torch.uint8).bitwise_xor_(0x80)
         k.view(-1)[0]=0x01  # New subnormal value must be read on replay.
         g.replay();torch.cuda.synchronize()
         ref,mask=_hcu_paged_reference(args);check_output(out,ref,mask)
+        check_output(allocated,ref,mask)
 
     @pytest.mark.parametrize('s',[1,64])
     def test_fp8_subnormals_and_finite_extremes(self, s):
@@ -566,6 +579,38 @@ class TestPagedMQAHCU:
         raw[:,:s*128]=keys
         raw[:,s*128:]=torch.ones((k.shape[0],s),device='cuda').view(torch.uint8)
         for kid in (6,7):_validate_hcu_paged_case(tuple(args),kid)
+
+    @pytest.mark.parametrize('n',[4097,65537])
+    def test_shared_permuted_pages_and_replay(self,n):
+        """S64 任意同序页表允许共享；跨检查块及 Graph 中页表变化必须重新验证。"""
+        from aiter import paged_mqa_logits
+        args=_make_hcu_paged_case(5,1,32,n,64,shared=True)
+        q,k,w,ctx,tb,_=args
+        tb.copy_(torch.randperm(tb.shape[1],device='cuda',dtype=torch.int32)[None].expand_as(tb))
+        out=_validate_hcu_paged_case(args,7,graph=True)
+        graph=torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):paged_mqa_logits(*args,out=out,kernelId=7)
+        tb[1,-1]=(tb[1,-1]+1)%k.shape[0]
+        ctx[3]-=17
+        graph.replay();torch.cuda.synchronize()
+        ref,mask=_hcu_paged_reference(args);check_output(out,ref,mask)
+
+    @pytest.mark.parametrize('preallocated',[False,True])
+    def test_inference_metadata_checks(self,preallocated):
+        """原生分配入口与 out 入口均须拒绝梯度输入、非连续输入和错误类型。"""
+        from aiter import paged_mqa_logits
+        args=list(_make_hcu_paged_case(2,1,32,67,64))
+        out=torch.empty((2,67),device='cuda') if preallocated else None
+        for index,bad in (
+                (2,args[2].clone().requires_grad_()),
+                (2,args[2].t().contiguous().t()),
+                (3,args[3].long()),
+                (4,args[4].cpu())):
+            invalid=args.copy();invalid[index]=bad
+            with pytest.raises((ValueError,RuntimeError)):
+                paged_mqa_logits(*invalid,out=out)
+        with pytest.raises((ValueError,RuntimeError)):
+            paged_mqa_logits(*args,out=torch.empty((2,67),device='cuda',requires_grad=True))
 
     def test_hcu_selector_rejects_invalid_modes(self):
         from aiter import paged_mqa_logits
@@ -594,12 +639,14 @@ def test_paged_mqa_public_contract(tmp_path):
     run_api_contracts(tmp_path/"api.json")
 
 
-def test_paged_mqa_preserved_id0():
+@pytest.mark.parametrize('kid',[0,1,2,3])
+@pytest.mark.parametrize('h',[32,64])
+def test_paged_mqa_preserved_opus(kid,h):
     _skip_unless_gfx938()
     from aiter import paged_mqa_logits
-    args=make_case(2,2,64,513,structured=True)
+    args=make_case(2,2,h,513,structured=True)
     ref,valid=reference(args)
-    check_output(paged_mqa_logits(*args,kernelId=0),ref,valid,structured=True)
+    check_output(paged_mqa_logits(*args,kernelId=kid),ref,valid,structured=True)
 
 
 def test_paged_mqa_gfx946_cpu_reference(tmp_path):
