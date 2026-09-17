@@ -61,9 +61,17 @@ jobs:
           allow-unsafe-pr-checkout: true
           submodules: recursive
 
-      - name: Mark checkout as a safe Git directory
+      - name: Prepare local checkout for optest
         shell: bash
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # refs/pull/<number>/merge is deliberately checked out detached.
+          # optest local-source mode needs a branch name, so name this exact
+          # merge commit locally without changing the source under test.
+          if ! git symbolic-ref --quiet HEAD >/dev/null; then
+            git switch --create "ci-pr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          fi
+          git branch --show-current
 
       - name: Prepare DTK and Python environment
         shell: bash
@@ -83,13 +91,7 @@ jobs:
         id: optest
         continue-on-error: true
         shell: bash
-        # The server-generated pull-request merge ref is intentionally
-        # detached.  Give optest the PR head identity explicitly rather than
-        # asking it to infer a branch from that merge ref.
-        run: >-
-          optest --op_name aiter --test_mode all --test_dir "$GITHUB_WORKSPACE"
-          --branch "${{ github.event.pull_request.head.ref || github.ref_name }}"
-          --commit "${{ github.event.pull_request.head.sha || github.sha }}"
+        run: optest --op_name aiter --test_mode all --test_dir "$GITHUB_WORKSPACE"
 
       - name: Generate JUnit report
         if: always()
