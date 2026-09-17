@@ -146,6 +146,8 @@ The local `op_tests/triton_tests/utils/mla_extend_ref.py` retains the SGLang Apa
 - Copyright: SGLang Team (including the 2023-2025 notices retained locally); additional owners follow the source notices.
 - License: [Apache-2.0](https://github.com/sgl-project/sglang/blob/4cb53ecd0cffceb6dee5c011a58f65997a86f151/LICENSE) for SGLang portions.
 
+The TopK transform Python wrappers, original tests, and interface declarations derive from SGLang `sgl-kernel`; the baseline GPU kernel also derives from its TileLang-based implementation. The applicable SGLang terms are Apache-2.0, retained alongside MIT for the TileLang portions and Hygon implementation changes where present. File headers state the applicable combination and modification scope; the declaration-only header remains Apache-2.0. Fixed comparison copies are [`b8ddc296f448`](https://github.com/sgl-project/sglang/tree/b8ddc296f448307e17e6da15ebbe660f1f1ca4aa/sgl-kernel) and [`51e2eaa45801`](https://github.com/sgl-project/sglang/tree/51e2eaa45801fb7090ebef91ebd866043ec232b0/sgl-kernel); the exact upstream import revision remains unconfirmed. The component LICENSE supplies `Copyright 2023-2024 SGLang Team`; `sgl_kernel_ops.h` carries its own 2025 SGLang notice. See [Apache-2.0](LICENSE.Apache-2.0) and [MIT](LICENSE).
+
 PR numbers identify development references, not fixed import commits. `mla_decode_rope.py`, `prefill_attention.py`, and `utils/mla_decode_ref.py` retain SGLang Apache notices alongside MIT SPDX identifiers; the scope of the MIT contributions needs reconciliation. Other MIT-only local headers do not replace SGLang portion licensing.
 
 | Local path / incorporated portion | Source / fixed reference | Hygon changes |
@@ -248,7 +250,16 @@ The upstream license includes a note about additional collaboration terms from 2
 | Local path / incorporated portion | Source / fixed reference | Hygon changes |
 | --- | --- | --- |
 | `csrc/kernels/kpool_topk_fallback.cu` | [Source `main/examples/deepseek_v32/topk_selector.py`](https://github.com/tile-ai/tilelang/blob/main/examples/deepseek_v32/topk_selector.py)<br>Fixed import commit/version unconfirmed. | TileLang algorithm converted to a C++/GPU kernel, with memory-access fixes and performance changes documented in the local header; original import revision and author-by-author allocation unconfirmed. |
-| `csrc/kernels/topk_transform.cu`<br>Top-k kernel explicitly marked copied from a TileLang kernel; original source path and revision unconfirmed | Original-project file/revision unconfirmed; component identified by the local notice/comment. | Hygon modification scope unconfirmed; no same-path file in the two AMD comparison snapshots. |
+| `csrc/kernels/topk_transform.cu`<br>TileLang-derived selection, via SGLang | [TileLang example `6021ef32c803`](https://github.com/tile-ai/tilelang/blob/6021ef32c80387a589f4142360f562a612f3cab5/examples/deepseek_v32/topk_selector.py) and [LICENSE](https://github.com/tile-ai/tilelang/blob/6021ef32c80387a589f4142360f562a612f3cab5/LICENSE); [SGLang comparison `51e2eaa45801`](https://github.com/sgl-project/sglang/blob/51e2eaa45801fb7090ebef91ebd866043ec232b0/sgl-kernel/csrc/elementwise/topk.cu). Exact upstream import revisions unconfirmed. | HIP/AITER integration, bounded-LDS exact selection, gfx946 adaptation and gfx936/gfx938 dispatch. Retains Tile-AI MIT attribution and SGLang Apache-2.0 terms. |
+
+### RAPIDS RAFT
+
+The vectorized traversal in `csrc/include/topk_transform_hcu.cuh` derives from the RAFT traversal implementation also carried by historical AITER TopK sources. The historical AITER copy retains a comment naming the RAFT helper; the function structure and scalar/vector head-tail handling correspond to the upstream implementation. This is source incorporation, not a runtime dependency.
+
+- Project: [rapidsai/raft](https://github.com/rapidsai/raft).
+- Fixed comparison: [`v24.02.00/cpp/include/raft/matrix/detail/select_radix.cuh`](https://github.com/rapidsai/raft/blob/v24.02.00/cpp/include/raft/matrix/detail/select_radix.cuh), `vectorized_process`; the exact import revision remains unconfirmed.
+- Copyright: `Copyright (c) 2022-2024, NVIDIA CORPORATION.`
+- License: [Apache-2.0](LICENSE.Apache-2.0). The local helper retains these terms together with [MIT](LICENSE) for AMD histogram/rank selection and Hygon modifications, recorded as `Apache-2.0 AND MIT`.
 
 ### DeepGEMM
 
@@ -389,9 +400,9 @@ Their distributions include their own copyright and license notices.
 
 ## 待溯源
 
-本节共 **218 个文件**：**48 个**已定位对应来源，但来源文件没有版权声明，继续保留补证；**170 个**标记为“copyright 待定”。“copyright 待定”不表示文件为 Hygon 原创，也不表示互联网上不存在对应代码。
+本节共 **215 个文件**：**47 个**已定位对应来源，但来源文件没有版权声明，继续保留补证；**168 个**标记为“copyright 待定”。“copyright 待定”不表示文件为 Hygon 原创，也不表示互联网上不存在对应代码。
 
-### 已定位来源、源文件无版权声明（48 个）
+### 已定位来源、源文件无版权声明（47 个）
 
 下列固定 Commit 用于复核对应实现，不冒称实际引入版本。根目录许可及权利人不能自动替代单文件缺失的归属信息；不据此编造文件版权。
 
@@ -401,7 +412,6 @@ Their distributions include their own copyright and license notices.
 | `aiter/ops/tilelang/mhc/hc_split_sinkhorn_kernel.py` | 来源：[sgl-project/sglang](https://github.com/sgl-project/sglang)，[35870d55aca7 / python/sglang/srt/layers/mhc.py](https://github.com/sgl-project/sglang/blob/35870d55aca7c6912aa4c785f583da4acac04938/python/sglang/srt/layers/mhc.py)；对应部分：hc_split_sinkhorn_kernel 的混合权重及 Sinkhorn 循环。源文件未发现版权声明；仓库许可：[Apache-2.0](https://github.com/sgl-project/sglang/blob/35870d55aca7c6912aa4c785f583da4acac04938/LICENSE)。本地差异：TileLang 并行组织、存储和调用接口有变化。实际导入版本未确认。 本地已有 MIT 标记不能替代来源的 Apache-2.0 条款；引入许可及缺失声明仍待核对。 |
 | `aiter/ops/tilelang/mhc/pre_norm_fn_splitk_kernel.py` | 来源：[sgl-project/sglang](https://github.com/sgl-project/sglang)，[35870d55aca7 / python/sglang/srt/layers/mhc.py](https://github.com/sgl-project/sglang/blob/35870d55aca7c6912aa4c785f583da4acac04938/python/sglang/srt/layers/mhc.py)；对应部分：mhc_pre_gemm_sqrsum_splitk_stage_0 / stage_1。源文件未发现版权声明；仓库许可：[Apache-2.0](https://github.com/sgl-project/sglang/blob/35870d55aca7c6912aa4c785f583da4acac04938/LICENSE)。本地差异：stage_1 函数高度一致；stage_0 增加本地计算与存储适配。实际导入版本未确认。 本地已有 MIT 标记不能替代来源的 Apache-2.0 条款；引入许可及缺失声明仍待核对。 |
 | `aiter/ops/tilelang/sparse_mla_fwd.py` | 来源：[tile-ai/tilelang](https://github.com/tile-ai/tilelang)，[fc41463c413b / examples/deepseek_v32/sparse_mla_fwd.py](https://github.com/tile-ai/tilelang/blob/fc41463c413bedc777f6876931571f109dd5f945/examples/deepseek_v32/sparse_mla_fwd.py)；对应部分：sparse_mla_fwd 的参考实现及 TileLang 计算片段。源文件未发现版权声明；仓库许可：[MIT](https://github.com/tile-ai/tilelang/blob/fc41463c413bedc777f6876931571f109dd5f945/LICENSE)。本地差异：新增本地内核变体及调优配置；仅确认对应片段。实际导入版本未确认。 固定许可全文包含历史协作区间的补充说明，适用范围仍需结合引入时间核对。 |
-| `aiter/ops/topk_transform.py` | 来源：[sgl-project/sglang](https://github.com/sgl-project/sglang)，[b8ddc296f448 / sgl-kernel/python/sgl_kernel/top_k.py](https://github.com/sgl-project/sglang/blob/b8ddc296f448307e17e6da15ebbe660f1f1ca4aa/sgl-kernel/python/sgl_kernel/top_k.py)；对应部分：fast_topk_v2、fast_topk_transform_fused / ragged_fused。源文件未发现版权声明；仓库许可：[Apache-2.0](https://github.com/sgl-project/sglang/blob/b8ddc296f448307e17e6da15ebbe660f1f1ca4aa/LICENSE)。本地差异：保留包装函数和文档，改接 AITER 导出接口。实际导入版本未确认。 本地已有 MIT 标记不能替代来源的 Apache-2.0 条款；引入许可及缺失声明仍待核对。 |
 | `aiter/ops/triton/_triton_kernels/attention/fp8_mqa_logits.py` | 来源：[ROCm/aiter](https://github.com/ROCm/aiter)，[56f4d93364dc / aiter/ops/triton/_triton_kernels/attention/fp8_mqa_logits.py](https://github.com/ROCm/aiter/blob/56f4d93364dc06b9b0f2f2de2326b0660720a229/aiter/ops/triton/_triton_kernels/attention/fp8_mqa_logits.py)；对应部分：fp8_mqa_logits Triton 内核。源文件未发现版权声明；仓库许可：[MIT](https://github.com/ROCm/aiter/blob/56f4d93364dc06b9b0f2f2de2326b0660720a229/LICENSE)。本地差异：保留上游计算片段，新增／调整本地执行分支。实际导入版本未确认。 |
 | `aiter/ops/triton/activation.py` | 来源：[ROCm/aiter](https://github.com/ROCm/aiter)，[2ed9ad4d9b82 / aiter/ops/triton/activation.py](https://github.com/ROCm/aiter/blob/2ed9ad4d9b824f3a45ee5482a497a012b0873da3/aiter/ops/triton/activation.py)；对应部分：_gelu_tanh、_act_mul_and_dynamic_mxfp4_quant_kernel 等。源文件未发现版权声明；仓库许可：[MIT](https://github.com/ROCm/aiter/blob/2ed9ad4d9b824f3a45ee5482a497a012b0873da3/LICENSE)。本地差异：实现主体一致，局部语句有变化。实际导入版本未确认。 |
 | `aiter/ops/triton/attention/fp8_mqa_logits.py` | 来源：[ROCm/aiter](https://github.com/ROCm/aiter)，[7cfe51983cd9 / aiter/ops/triton/attention/fp8_mqa_logits.py](https://github.com/ROCm/aiter/blob/7cfe51983cd9dd55c0355e34fb614e7c0de44e6e/aiter/ops/triton/attention/fp8_mqa_logits.py)；对应部分：fp8_mqa_logits 包装函数。源文件未发现版权声明；仓库许可：[MIT](https://github.com/ROCm/aiter/blob/7cfe51983cd9dd55c0355e34fb614e7c0de44e6e/LICENSE)。本地差异：调度及参数处理有变化。实际导入版本未确认。 |
@@ -446,7 +456,7 @@ Their distributions include their own copyright and license notices.
 | `op_tests/triton_tests/test_topk.py` | 来源：[ROCm/aiter](https://github.com/ROCm/aiter)，[b057aff7acb4 / op_tests/triton_tests/test_topk.py](https://github.com/ROCm/aiter/blob/b057aff7acb4f6eb1b4032f76c911ecd6d76c24f/op_tests/triton_tests/test_topk.py)；对应部分：去除注释和换行后的完整实现 token 一致。源文件未发现版权声明；仓库许可：[MIT](https://github.com/ROCm/aiter/blob/b057aff7acb4f6eb1b4032f76c911ecd6d76c24f/LICENSE)。本地差异：未发现实现变化，仅文件声明／格式差异。实际导入版本未确认。 |
 | `op_tests/triton_tests/utils/hstu_attention_ref.py` | 来源：[ROCm/aiter](https://github.com/ROCm/aiter)，[93999c357645 / op_tests/triton_tests/utils/hstu_attention_ref.py](https://github.com/ROCm/aiter/blob/93999c35764565efed02c37744407d9407354201/op_tests/triton_tests/utils/hstu_attention_ref.py)；对应部分：去除注释和换行后的完整实现 token 一致。源文件未发现版权声明；仓库许可：[MIT](https://github.com/ROCm/aiter/blob/93999c35764565efed02c37744407d9407354201/LICENSE)。本地差异：未发现实现变化，仅文件声明／格式差异。实际导入版本未确认。 |
 
-### copyright 待定（170 个）
+### copyright 待定（168 个）
 
 | 文件路径 | 来源信息 |
 | --- | --- |
@@ -521,7 +531,6 @@ Their distributions include their own copyright and license notices.
 | `csrc/include/rmsnorm_autograd_kernels.h` | copyright 待定 |
 | `csrc/include/rmsnorm_autograd_reduce.h` | copyright 待定 |
 | `csrc/include/topk_gate.h` | copyright 待定 |
-| `csrc/include/topk_transform.h` | copyright 待定 |
 | `csrc/kernels/kpool_topk.cu` | copyright 待定 |
 | `csrc/kernels/per_token_group_quant_fp8_kernels.cu` | copyright 待定 |
 | `csrc/kernels/rmsnorm_autograd.cu` | copyright 待定 |
@@ -548,7 +557,6 @@ Their distributions include their own copyright and license notices.
 | `csrc/pybind/moe_c_wfp4a8_pybind.cu` | copyright 待定 |
 | `csrc/pybind/moe_sum_pybind.cu` | copyright 待定 |
 | `csrc/pybind/moe_utils_pybind.cu` | copyright 待定 |
-| `csrc/pybind/topk_transform_pybind.cu` | copyright 待定 |
 | `gen_co.sh` | copyright 待定 |
 | `op_tests/chunk_gated_coverage.py` | copyright 待定 |
 | `op_tests/op_benchmarks/bench_aiter_fused_recurrent_gated_delta_rule_packed_decode_hip_01.py` | copyright 待定 |

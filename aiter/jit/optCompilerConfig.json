@@ -699,7 +699,11 @@
             "f'{AITER_CSRC_DIR}/kernels/topk_transform.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "'-O1' if get_gfx() == 'gfx946' else None",
+            "'-mllvm -enable-post-misched=1' if get_gfx() in ('gfx936', 'gfx938') else None"
+        ],
+        "prefer_hipcc": "get_gfx() in ('gfx936', 'gfx938')",
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",

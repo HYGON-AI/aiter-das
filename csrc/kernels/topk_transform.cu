@@ -1,5 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0 AND MIT
+// Copyright 2023-2024 SGLang Team
+// Copyright (c) Tile-AI.
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+//
+// Derived from SGLang's sgl-kernel/csrc/elementwise/topk.cu (Apache-2.0),
+// which adapts the MIT-licensed TileLang example:
+// https://github.com/tile-ai/tilelang/blob/6021ef32c80387a589f4142360f562a612f3cab5/examples/deepseek_v32/topk_selector.py
+// Hygon modifications: HIP/AITER integration, bounded-LDS exact selection,
+// gfx946 support, and gfx936/gfx938 dispatch. Hygon modifications use MIT.
+// See LICENSE.Apache-2.0 and LICENSE for the applicable terms.
+
 #include <ATen/hip/HIPContext.h>
 #include <torch/all.h>
+#include <cstring>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 #include "dispatch_utils.h"
@@ -76,6 +89,60 @@ __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
 __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
   uint32_t bits = __float_as_uint(x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
+
+// Exact bounded-memory selection. Scan the full row at each radix byte so a
+// concentrated score distribution cannot overflow a shared candidate buffer.
+__device__ void exact_topk_rescan(const float* input, int* index, int row_start, int length) {
+  __shared__ int histogram[2][257];
+  __shared__ int threshold;
+  __shared__ int counter;
+  __shared__ int last_remaining;
+  const int tx = threadIdx.x;
+  uint32_t prefix = 0;
+  int remaining = TopK;
+  if (tx == 0) counter = 0;
+  __syncthreads();
+  for (int round = 0; round < 4; ++round) {
+    const int shift = 24 - round * 8;
+    const uint32_t mask = round == 0 ? 0u : (0xffffffffu << (32 - round * 8));
+    if (tx < 257) histogram[0][tx] = 0;
+    __syncthreads();
+    for (int idx = tx; idx < length; idx += kThreadsPerBlock) {
+      const auto key = convert_to_uint32(input[idx + row_start]);
+      if ((key & mask) == prefix) ::atomicAdd(&histogram[0][(key >> shift) & 255u], 1);
+    }
+    __syncthreads();
+    for (int pass = 0; pass < 8; ++pass) {
+      if (tx < 256) {
+        const int stride = 1 << pass;
+        int value = histogram[pass & 1][tx];
+        if (tx + stride < 256) value += histogram[pass & 1][tx + stride];
+        histogram[(pass & 1) ^ 1][tx] = value;
+      }
+      __syncthreads();
+    }
+    if (tx < 256 && histogram[0][tx] >= remaining && histogram[0][tx + 1] < remaining) {
+      threshold = tx;
+      last_remaining = remaining - histogram[0][tx + 1];
+    }
+    __syncthreads();
+    const int bin_threshold = threshold;
+    remaining -= histogram[0][bin_threshold + 1];
+    for (int idx = tx; idx < length; idx += kThreadsPerBlock) {
+      const auto key = convert_to_uint32(input[idx + row_start]);
+      if ((key & mask) != prefix) continue;
+      const int bin = (key >> shift) & 255u;
+      if (bin > bin_threshold) {
+        index[::atomicAdd(&counter, 1)] = idx;
+      } else if (round == 3 && bin == bin_threshold) {
+        const int pos = ::atomicAdd(&last_remaining, -1);
+        if (pos > 0) index[TopK - pos] = idx;
+      }
+    }
+    __syncthreads();
+    prefix |= static_cast<uint32_t>(bin_threshold) << shift;
+  }
 }
 
 __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
@@ -170,6 +237,15 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
       }
     }
     __syncthreads();
+  }
+
+  // A narrow score distribution can put more than SMEM_INPUT_SIZE entries in
+  // the coarse FP16 bucket. Clipping that bucket loses valid top-k candidates.
+  // In that uncommon case, rescan the row using exact FP32 radix prefixes.
+  // Keep the bounded-LDS fast path below for the usual score distribution.
+  if (s_num_input[0] > int(SMEM_INPUT_SIZE)) {
+    exact_topk_rescan(input, index, row_start, length);
+    return;
   }
 
   // stage 2: refine with 8bit radix passes
@@ -371,6 +447,8 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
   }
 }
 
+#include "topk_transform_hcu.cuh"
+
 auto get_params(
     const torch::Tensor& score,
     const torch::Tensor& lengths,
@@ -528,9 +606,26 @@ void fast_topk_transform_ragged_interface(
   const auto grid = dim3{static_cast<uint32_t>(B)};
   const auto block = dim3{kThreadsPerBlock};
 
-  setup_kernel_smem_once<topk_transform_prefill_ragged_kernel, kSmem>();
-  topk_transform_prefill_ragged_kernel<<<grid, block, kSmem, stream>>>(
-      params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
+  // Cache per host thread and recheck when the tensor's device changes. Avoid
+  // repeated property lookups for short eager calls while supporting mixed GPUs.
+  // gfx946 retains the validated bounded-LDS legacy kernel and -O1.
+  static thread_local int cached_device = -1;
+  static thread_local bool hcu_ragged_enabled = false;
+  const int device = score.get_device();
+  if (device != cached_device) {
+    const char* arch = at::cuda::getDeviceProperties(device)->gcnArchName;
+    hcu_ragged_enabled =
+        std::strncmp(arch, "gfx936", 6) == 0 || std::strncmp(arch, "gfx938", 6) == 0;
+    cached_device = device;
+  }
+  if (hcu_ragged_enabled) {
+    hcu_ragged::kernel<kThreadsPerBlock><<<grid, block, TopK * sizeof(int), stream>>>(
+        params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
+  } else {
+    setup_kernel_smem_once<topk_transform_prefill_ragged_kernel, kSmem>();
+    topk_transform_prefill_ragged_kernel<<<grid, block, kSmem, stream>>>(
+        params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
+  }
 
   const auto result = cudaGetLastError();
   TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
