@@ -481,6 +481,19 @@ auto get_params(
   };
 }
 
+// 按 host 线程及 tensor 设备缓存架构判断，避免短调用反复查询属性。
+bool use_hcu_topk(const torch::Tensor& score) {
+  static thread_local int cached_device = -1;
+  static thread_local bool enabled = false;
+  const int device = score.get_device();
+  if (device != cached_device) {
+    const char* arch = at::cuda::getDeviceProperties(device)->gcnArchName;
+    enabled = std::strncmp(arch, "gfx936", 6) == 0 || std::strncmp(arch, "gfx938", 6) == 0;
+    cached_device = device;
+  }
+  return enabled;
+}
+
 template <auto* f, size_t max_dynamic_smem>
 void setup_kernel_smem_once() {
   [[maybe_unused]]
@@ -516,8 +529,13 @@ void fast_topk_interface(
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
   const auto grid = dim3{static_cast<uint32_t>(B)};
   const auto block = dim3{kThreadsPerBlock};
-  setup_kernel_smem_once<topk_kernel, kSmem>();
-  topk_kernel<<<grid, block, kSmem, stream>>>(params);
+  // 小 batch 短行保留原路径，避免直方图准备成本超过收益。
+  if (use_hcu_topk(score) && !(B <= 32 && score.size(1) <= 8192)) {
+    hcu_ragged::plain_kernel<kThreadsPerBlock><<<grid, block, TopK * sizeof(int), stream>>>(params);
+  } else {
+    setup_kernel_smem_once<topk_kernel, kSmem>();
+    topk_kernel<<<grid, block, kSmem, stream>>>(params);
+  }
   const auto result = cudaGetLastError();
   TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
 }
@@ -559,7 +577,18 @@ void fast_topk_transform_interface(
   // decode: row_starts_opt is null, invokes the decode kernel
   // target verify: row_starts_opt is null, invokes the prefill kernel
   const auto is_decode = !row_starts_opt.has_value() && prefill_bs == B;
-  if (is_decode) {
+  // 小 batch 短行保留原路径，避免直方图准备成本超过收益。
+  if (use_hcu_topk(score) && !(B <= 32 && score.size(1) <= 8192)) {
+    if (is_decode) {
+      hcu_ragged::paged_kernel<kThreadsPerBlock, true><<<grid, block, TopK * sizeof(int), stream>>>(
+          params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride,
+          nullptr, 0);
+    } else {
+      hcu_ragged::paged_kernel<kThreadsPerBlock, false><<<grid, block, TopK * sizeof(int), stream>>>(
+          params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride,
+          cu_seqlens_q.data_ptr<int32_t>(), prefill_bs);
+    }
+  } else if (is_decode) {
     setup_kernel_smem_once<topk_transform_decode_kernel, kSmem>();
     topk_transform_decode_kernel<<<grid, block, kSmem, stream>>>(
         params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride);
@@ -606,21 +635,16 @@ void fast_topk_transform_ragged_interface(
   const auto grid = dim3{static_cast<uint32_t>(B)};
   const auto block = dim3{kThreadsPerBlock};
 
-  // Cache per host thread and recheck when the tensor's device changes. Avoid
-  // repeated property lookups for short eager calls while supporting mixed GPUs.
-  // gfx946 retains the validated bounded-LDS legacy kernel and -O1.
-  static thread_local int cached_device = -1;
-  static thread_local bool hcu_ragged_enabled = false;
-  const int device = score.get_device();
-  if (device != cached_device) {
-    const char* arch = at::cuda::getDeviceProperties(device)->gcnArchName;
-    hcu_ragged_enabled =
-        std::strncmp(arch, "gfx936", 6) == 0 || std::strncmp(arch, "gfx938", 6) == 0;
-    cached_device = device;
-  }
-  if (hcu_ragged_enabled) {
-    hcu_ragged::kernel<kThreadsPerBlock><<<grid, block, TopK * sizeof(int), stream>>>(
-        params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
+  // gfx946 等架构继续使用已验证的旧内核与 O1 配置。
+  if (use_hcu_topk(score)) {
+    // 小 batch 的中等候选桶使用 wave 协作；大 batch 保留广播读路径。
+    if (B <= 32) {
+      hcu_ragged::kernel<kThreadsPerBlock, true><<<grid, block, TopK * sizeof(int), stream>>>(
+          params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
+    } else {
+      hcu_ragged::kernel<kThreadsPerBlock><<<grid, block, TopK * sizeof(int), stream>>>(
+          params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
+    }
   } else {
     setup_kernel_smem_once<topk_transform_prefill_ragged_kernel, kSmem>();
     topk_transform_prefill_ragged_kernel<<<grid, block, kSmem, stream>>>(

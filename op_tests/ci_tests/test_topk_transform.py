@@ -18,7 +18,7 @@
       允许同分元素选取不同的合法索引，不要求 TopK 输出有序。
 
 整体用法（在已配置 GPU/PMD、PyTorch 和 AITER 的环境中，从 AITER 仓库根目录运行）：
-    # 全量正确性回归，共 141 项（含 torch.compile）；gfx936/gfx938 真机可使用此入口。
+    # 全量正确性回归，共 224 项（含四种模式 torch.compile、78 项长存储和 2 项非均匀 query 分组回归）；gfx936/gfx938 真机可使用此入口。
     python -m pytest -v op_tests/ci_tests/test_topk_transform.py
 
     # 仅运行 CPU-reference 严格子集，共 28 项；gfx946 PMD 建议使用此入口。
@@ -28,11 +28,20 @@
     python -m pytest -v "op_tests/ci_tests/test_topk_transform.py::test_topk_transform_strict[boundary-plain]"
 
     # 仅运行原有 112 项常规测试，或仅收集用例而不执行。
-    python -m pytest -v op_tests/ci_tests/test_topk_transform.py -k "not strict"
+    python -m pytest -v op_tests/ci_tests/test_topk_transform.py -k "not strict and not compile and not long_storage and not irregular_queries"
     python -m pytest --collect-only -q op_tests/ci_tests/test_topk_transform.py
 
 可增加 -s 查看运行输出，增加 --durations=0 查看每项测试耗时。测试耗时包含
 数据准备、参考计算和可能的 JIT 编译，不能用作算子性能数据。
+
+性能对比也使用本文件，不另设测试脚本：
+    python op_tests/ci_tests/test_topk_transform.py --benchmark \
+        --baseline-so /path/to/original/module_topk_transform.so \
+        --output /path/to/results.json --cases 1:16384:1,32:131072:1
+    --kinds 可选择 plain,paged_decode,paged_prefill,ragged；默认四种均测。
+    先在 CPU 校验两个实现的精确结果，再交替计时；graph 使用预分配输出，
+    eager 包含输出分配及 native 接口调用。它们不包含 JIT、参考计算或传输，
+    eager 不包含 Python 公开包装函数额外的注册分发开销。
 """
 
 from typing import Optional
@@ -374,10 +383,10 @@ def test_topk_transform_strict(kind, case):
     )
 
 
+@pytest.mark.parametrize("kind", ["plain", "paged_decode", "paged_prefill", "ragged"])
 @torch.inference_mode()
-def test_topk_transform_ragged_compile():
-    # eager 绕过 torch.library 的额外分发，但 torch.compile 仍须捕获已注册算子。
-    # 使用轻量 FX backend 校验完整图和实际输出，不依赖 Inductor 编译环境。
+def test_topk_transform_compile(kind):
+    # FX backend 验证四种调用模式保留已注册算子，且实际输出与 CPU 精确参考一致。
     graphs = []
 
     def capture(graph, example_inputs):
@@ -388,24 +397,261 @@ def test_topk_transform_ragged_compile():
     storage = torch.randn(4, 8220, generator=generator)
     score = storage[:, :8210]
     lengths = [0, 2048, 4096, 8192]
-    starts = [3, 5, 9, 13]
+    starts = [0] * 4 if kind == "paged_decode" else [3, 5, 9, 13]
     offsets = torch.arange(4, dtype=torch.int32) * 10000 + 37
-    compiled = torch.compile(
-        fast_topk_transform_ragged_fused, backend=capture, fullgraph=True
-    )
-    output = compiled(
-        storage.cuda()[:, :8210],
-        torch.tensor(lengths, dtype=torch.int32).cuda(),
-        offsets.cuda(),
-        K,
-        torch.tensor(starts, dtype=torch.int32).cuda(),
-    )
-    assert graphs and any(
-        "aiter.fast_topk_transform_ragged_interface" in str(node.target)
-        for graph in graphs for node in graph.graph.nodes
-    )
-    check_indices(score, output, lengths, starts, offsets)
+    owners = list(range(4)) if kind == "paged_decode" else [0, 0, 1, 1]
+    nseq = max(owners) + 1
+    pages = (torch.arange(8210, dtype=torch.int32)[None, :] * 7
+             + torch.arange(nseq, dtype=torch.int32)[:, None] * 100000 + 11)
+    cu = torch.tensor([0, 1, 2, 3, 4] if kind == "paged_decode" else [0, 2, 4], dtype=torch.int32)
+
+    def invoke(score, lens, aux, cu, starts):
+        if kind == "plain":
+            return fast_topk_v2(score, lens, K, starts)
+        if kind == "ragged":
+            return fast_topk_transform_ragged_fused(score, lens, aux, K, starts)
+        return fast_topk_transform_fused(score, lens, aux, cu, K, starts)
+
+    compiled = torch.compile(invoke, backend=capture, fullgraph=True)
+    output = compiled(storage.cuda()[:, :8210], torch.tensor(lengths, dtype=torch.int32).cuda(),
+                      (pages if kind.startswith("paged") else offsets).cuda(), cu.cuda(),
+                      None if kind == "paged_decode" else torch.tensor(starts, dtype=torch.int32).cuda())
+    target = {"plain": "aiter.fast_topk_interface", "ragged": "aiter.fast_topk_transform_ragged_interface"}.get(
+        kind, "aiter.fast_topk_transform_interface")
+    assert graphs and any(target in str(node.target) for graph in graphs for node in graph.graph.nodes)
+    check_indices(score, output, lengths, starts, offsets if kind == "ragged" else None,
+                  pages if kind.startswith("paged") else None, owners)
+
+
+@pytest.mark.parametrize("length", [0, 2048, 4095, 4096, 4097, 8191, 8192, 8193, 16383, 16384, 16385, 65536, 131072])
+@pytest.mark.parametrize("distribution", ["normal", "ties", "narrow", "mixed", "positive_inf", "negative_inf"])
+@torch.inference_mode()
+def test_topk_transform_ragged_long_storage(length, distribution):
+    # 存储宽度不能代表有效长度。覆盖分片下限的两侧、短行回退、非零起点、
+    # 极集中候选和跨分片同分；Graph 捕获/重放还验证临时 workspace 的生命周期。
+    start = 17
+    gen = torch.Generator().manual_seed(97)
+    storage = torch.randn(1, 131105, generator=gen)
+    if distribution == "ties":
+        storage.fill_(1)
+    elif distribution in ("positive_inf", "negative_inf"):
+        storage.fill_(float("inf") if distribution == "positive_inf" else float("-inf"))
+    elif distribution in ("narrow", "mixed"):
+        storage.mul_(1e-5).add_(1)
+        if distribution == "mixed":
+            storage[0, start:start + min(512, length)] = 2
+    score = storage[:, :131089]
+    gpu_storage = storage.cuda()
+    lens = torch.tensor([length], dtype=torch.int32, device="cuda")
+    rows = torch.tensor([start], dtype=torch.int32, device="cuda")
+    offsets = torch.tensor([37], dtype=torch.int32)
+    gpu_offsets = offsets.cuda()
+    eager = fast_topk_transform_ragged_fused(gpu_storage[:, :131089], lens, gpu_offsets, K, rows)
+    check_indices(score, eager, [length], [start], offsets)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = fast_topk_transform_ragged_fused(gpu_storage[:, :131089], lens, gpu_offsets, K, rows)
+    graph.replay()
+    check_indices(score, captured, [length], [start], offsets)
+
+
+@pytest.mark.parametrize("many_sequences", [False, True])
+@torch.inference_mode()
+def test_topk_transform_paged_irregular_queries(many_sequences):
+    # 覆盖空序列、不等长 query 分组及超过一个 block 线程数的序列数。
+    # Q>32 确保短行仍实际经过 HCU 页表归属查找路径。
+    if many_sequences:
+        q, nseq = 1030, 1025
+        cu = list(range(1025)) + [1030]
+        owners = list(range(1024)) + [1024] * 6
+    else:
+        q, nseq = 40, 4
+        cu = [0, 0, 1, 1, 40]
+        owners = [1] + [3] * 39
+    gen = torch.Generator().manual_seed(109)
+    storage = torch.randn(q, 45, generator=gen)
+    score = storage[:, :40]
+    lengths = [i % 33 for i in range(q)]
+    starts = [1 + i % 3 for i in range(q)]
+    pages = (torch.arange(40, dtype=torch.int32)[None, :] * 7
+             + torch.arange(nseq, dtype=torch.int32)[:, None] * 1000 + 11)
+    output = fast_topk_transform_fused(
+        storage.cuda()[:, :40], torch.tensor(lengths, dtype=torch.int32).cuda(),
+        pages.cuda(), torch.tensor(cu, dtype=torch.int32).cuda(), K,
+        torch.tensor(starts, dtype=torch.int32).cuda())
+    check_indices(score, output, lengths, starts, page_table=pages, owners=owners)
+
+
+@torch.inference_mode()
+def benchmark_topk_transform(args):
+    """同卡比较冻结 SO 与当前源码；原始样本、输入及二进制来源写入 JSON。"""
+    import hashlib
+    import importlib.util
+    import json
+    from pathlib import Path
+    import statistics
+
+    from aiter.jit.core import get_module
+
+    torch.set_num_threads(8)
+
+    # 通过正式入口完成当前源码的 JIT，再加载冻结二进制。两个模块分别持有
+    # native callable，不修改 sys.modules 或生产代码的 dispatch。
+    fast_topk_v2(torch.zeros((1, K), device="cuda"),
+                 torch.tensor([K], dtype=torch.int32, device="cuda"), K)
+    current = get_module("module_topk_transform")
+    spec = importlib.util.spec_from_file_location("_topk_original.module_topk_transform", args.baseline_so)
+    original = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(original)
+    assert original is not current, "original/current 必须是独立加载的模块"
+    assert Path(original.__file__).resolve() == Path(args.baseline_so).resolve()
+    modules = {"original": original, "current": current}
+    device = torch.cuda.get_device_properties(0)
+    result = {
+        "environment": {"device": str(device), "torch": torch.__version__, "hip": torch.version.hip},
+        "modules": {name: {"path": mod.__file__, "sha256": hashlib.sha256(Path(mod.__file__).read_bytes()).hexdigest()}
+                    for name, mod in modules.items()},
+        "policy": vars(args), "rows": [],
+    }
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def save():
+        output_path.write_text(json.dumps(result, indent=2) + "\n")
+
+    def event_us(fn, count):
+        begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        begin.record()
+        for _ in range(count):
+            fn()
+        end.record()
+        end.synchronize()
+        return begin.elapsed_time(end) * 1000 / count
+
+    for shape in args.cases.split(","):
+        q, n, sequences = map(int, shape.split(":"))
+        assert q >= sequences and q % sequences == 0
+        for kind in args.kinds.split(","):
+            assert kind in ("plain", "paged_decode", "paged_prefill", "ragged")
+            nseq = q if kind == "paged_decode" else sequences
+            per_sequence = q // nseq
+            owners = [i // per_sequence for i in range(q)]
+            lengths = [max(0, n - per_sequence + 1 + i % per_sequence) for i in range(q)]
+            if args.valid_length is not None:
+                assert args.valid_length >= 0
+                lengths = [min(length, args.valid_length) for length in lengths]
+            starts = [0 if kind == "paged_decode" else owner * n + 3 for owner in owners]
+            width = (n if kind == "paged_decode" else n * sequences + 3)
+            gen = torch.Generator().manual_seed(20260918)
+            storage = torch.randn(q, width + 13, generator=gen)
+            if args.distribution in ("narrow", "mixed"):
+                storage.mul_(1e-5).add_(1)
+                if args.distribution == "mixed":
+                    for row, start in enumerate(starts):
+                        storage[row, start:start + min(512, lengths[row])] = 2
+            elif args.distribution == "ties":
+                storage.fill_(1)
+            score = storage[:, :width]
+            gpu_storage = storage.cuda()
+            gpu_score = gpu_storage[:, :width]
+            gpu_lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+            gpu_starts = (None if kind == "paged_decode" else
+                          torch.tensor(starts, dtype=torch.int32, device="cuda"))
+            offsets = torch.arange(q, dtype=torch.int32) * (width + 100) + 37
+            gpu_offsets = offsets.cuda()
+            pages = (torch.arange(n, dtype=torch.int32)[None, :] * 7
+                     + (torch.arange(nseq, dtype=torch.int32) % 17)[:, None] * (n * 7 + 100) + 11)
+            gpu_pages = pages.cuda()
+            cu = torch.arange(0, q + 1, per_sequence, dtype=torch.int32, device="cuda")
+
+            def call(mod, dst):
+                if kind == "plain":
+                    mod.fast_topk_interface(gpu_score, dst, gpu_lengths, gpu_starts)
+                elif kind == "ragged":
+                    mod.fast_topk_transform_ragged_interface(gpu_score, gpu_lengths, dst, gpu_offsets, gpu_starts)
+                else:
+                    mod.fast_topk_transform_interface(gpu_score, gpu_lengths, dst, gpu_pages, cu, gpu_starts)
+
+            outputs = {name: torch.empty((q, K), dtype=torch.int32, device="cuda") for name in modules}
+            for name, mod in modules.items():
+                call(mod, outputs[name])
+                check_indices(score, outputs[name], lengths, starts,
+                              offsets if kind == "ragged" else None,
+                              pages if kind.startswith("paged") else None, owners)
+            torch.cuda.synchronize()
+            if args.profile_kind:
+                assert kind == args.profile_kind
+                for _ in range(3):
+                    call(modules[args.profile_implementation], outputs[args.profile_implementation])
+                torch.cuda.synchronize()
+                continue
+
+            eager, graphs = {}, {}
+            for name, mod in modules.items():
+                def eager_call(mod=mod):
+                    dst = torch.empty((q, K), dtype=torch.int32, device="cuda")
+                    call(mod, dst)
+                    return dst
+                eager[name] = eager_call
+                for _ in range(args.warmup):
+                    eager_call()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    for _ in range(args.graph_unroll):
+                        call(mod, outputs[name])
+                graphs[name] = graph
+            samples = {mode: {name: [] for name in modules} for mode in ("eager_us", "graph_us")}
+            # 大 shape 按每轮时间预算减少重复次数；两实现使用相同次数，
+            # 避免固定 50×20 重放令毫秒级 kernel 的单 case 耗时数分钟。
+            probe_us = max(event_us(graph.replay, 2) for graph in graphs.values())
+            graph_iters = max(2, min(args.iters, int(args.round_budget_ms * 1000 / probe_us)))
+            eager_iters = max(5, min(args.iters, graph_iters * args.graph_unroll))
+            for round_index in range(args.rounds):
+                order = list(modules) if round_index % 2 == 0 else list(reversed(modules))
+                for name in order:
+                    samples["eager_us"][name].append(event_us(eager[name], eager_iters))
+                    samples["graph_us"][name].append(event_us(graphs[name].replay, graph_iters) / args.graph_unroll)
+            # 重放后再次校验，避免只验证预热路径而遗漏 Graph 行为。
+            for name in modules:
+                check_indices(score, outputs[name], lengths, starts,
+                              offsets if kind == "ragged" else None,
+                              pages if kind.startswith("paged") else None, owners)
+            row = {"kind": kind, "q": q, "kv": n, "sequences": sequences,
+                   "length_min": min(lengths), "length_max": max(lengths),
+                   "distribution": args.distribution, "correctness": "exact all rows and graph replay",
+                   "samples": samples, "graph_iters": graph_iters, "eager_iters": eager_iters}
+            for mode, values in samples.items():
+                row[mode] = {name: statistics.median(v) for name, v in values.items()}
+                row[mode + "_speedup"] = row[mode]["original"] / row[mode]["current"]
+                row[mode + "_cv"] = {name: statistics.pstdev(v) / statistics.mean(v) for name, v in values.items()}
+            result["rows"].append(row)
+            save()
+            print(kind, shape, "graph", row["graph_us"], "speedup", row["graph_us_speedup"], flush=True)
+            del graphs, eager, outputs, gpu_storage, gpu_score, gpu_pages
+    save()
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
+    import sys
+
+    if "--benchmark" in sys.argv:
+        import argparse
+
+        parser = argparse.ArgumentParser(description="三个 TopK 接口的同设备 original/current 性能比较")
+        parser.add_argument("--benchmark", action="store_true")
+        parser.add_argument("--baseline-so", required=True)
+        parser.add_argument("--output", required=True)
+        parser.add_argument("--cases", default="1:4096:1,1:16384:1,1:65536:1,1:131072:1,32:131072:1,512:16384:1,4096:65536:1")
+        parser.add_argument("--kinds", default="plain,paged_decode,paged_prefill,ragged")
+        parser.add_argument("--distribution", choices=["normal", "narrow", "mixed", "ties"], default="normal")
+        parser.add_argument("--rounds", type=int, default=7)
+        parser.add_argument("--iters", type=int, default=50)
+        parser.add_argument("--warmup", type=int, default=20)
+        parser.add_argument("--graph-unroll", type=int, default=20)
+        parser.add_argument("--round-budget-ms", type=float, default=30)
+        parser.add_argument("--profile-kind", default=None)
+        parser.add_argument("--profile-implementation", choices=["original", "current"], default="current")
+        parser.add_argument("--valid-length", type=int, default=None, help="限制有效长度，检查宽存储短行的性能")
+        benchmark_topk_transform(parser.parse_args())
+    else:
+        raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

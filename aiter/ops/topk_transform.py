@@ -77,7 +77,7 @@ def fast_topk_v2(
         lengths: The lengths tensor of shape (B)
         topk: The number of topk indices to get
         row_starts: The start index of each row in the score tensor of shape (B).
-            For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i]]
+            For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i])
             of the score tensor.
     Returns:
         The topk indices tensor of shape (B, topk)
@@ -107,11 +107,12 @@ def fast_topk_transform_fused(
             between the query and the key whose layout is either ragged or paged.
             row_starts is only required when the key is ragged.
         lengths: The lengths tensor of shape (B)
-        page_table_size_1: The page table tensor of shape (Batch, topk)
+        page_table_size_1: The page table tensor of shape (Batch, capacity), where
+            capacity covers every valid local KV position (not just topk)
         cu_seqlens_q: The cumulative sequence lengths tensor of shape (Batch + 1)
         topk: The number of topk indices to get
         row_starts: The start index of each row in the score tensor of shape (B).
-            For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i]]
+            For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i])
             of the score tensor. It's only used for cases where the key is
             ragged, i.e. during extend and draft extend.
     Returns:
@@ -148,10 +149,9 @@ def fast_topk_transform_ragged_fused(
         topk_indices_offset: The offset of topk indices in ragged kv of shape (B)
         topk: The number of topk indices to get
         row_starts: The start index of each row in the score tensor of shape (B).
-            For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i]]
-            of the score tensor. It can be None if only the fast path is triggered,
-            in the case of all values in lengths <= topk (not checked in the kernel,
-            guaranteed by the caller).
+            For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i])
+            of the score tensor. None means every row starts at column zero,
+            including rows whose lengths exceed topk.
     Returns:
         The topk indices tensor of shape (B, topk)
     """

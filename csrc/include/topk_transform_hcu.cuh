@@ -6,7 +6,7 @@
 // Histogram/rank selection derives from AITER topk_per_row_kernels.cu.
 // Vectorized traversal derives from RAPIDS RAFT select_radix.cuh (Apache-2.0).
 // Hygon modifications: FP16 coarse filtering, vectorized ragged output,
-// HCU integration, and overflow-count reset. AMD/Hygon contributions use MIT;
+// HCU integration, overflow-count reset, and wave-cooperative candidate ranking. AMD/Hygon contributions use MIT;
 // see LICENSE.Apache-2.0 and LICENSE for the applicable terms.
 #pragma once
 
@@ -14,7 +14,8 @@
 // Histogram selection uses aligned vectorized traversal to reduce memory traffic.
 // Keep the shared counters and helper boundaries: an otherwise
 // equivalent simplification raised SGPR usage from 80 to 112 and regressed HCU
-// multi-row throughput. Only the single-block, non-radix-sort path is instantiated.
+// multi-row throughput. The helper contains only the single-block rank path;
+// score columns are contiguous, while input_stride still supports strided rows.
 // FP16 overflow is restarted with a clean selected count before FP32 refinement.
 
 namespace hcu_ragged {
@@ -58,85 +59,77 @@ template <typename T, typename idxT, typename Func>
 __device__ void vectorized_process(size_t thread_rank, size_t num_threads,
                                    const T* in, idxT len, Func f) {
   using WideT = float4;
-  if constexpr (sizeof(T) >= sizeof(WideT)) {
-    for (idxT i = thread_rank; i < len; i += num_threads) {
-      f(in[i], i);
-    }
-  } else {
-    constexpr int items_per_scalar = sizeof(WideT) / sizeof(T);
-    union {
-      WideT scalar;
-      T array[items_per_scalar];
-    } wide;
+  static_assert(sizeof(T) < sizeof(WideT), "TopK traversal uses scalar elements");
+  constexpr int items_per_scalar = sizeof(WideT) / sizeof(T);
+  union {
+    WideT scalar;
+    T array[items_per_scalar];
+  } wide;
 
-    int skip_cnt =
-        (reinterpret_cast<size_t>(in) % sizeof(WideT))
-            ? ((sizeof(WideT) - reinterpret_cast<size_t>(in) % sizeof(WideT)) / sizeof(T))
-            : 0;
-    if (skip_cnt > len) skip_cnt = len;
+  int skip_cnt =
+      (reinterpret_cast<size_t>(in) % sizeof(WideT))
+          ? ((sizeof(WideT) - reinterpret_cast<size_t>(in) % sizeof(WideT)) / sizeof(T))
+          : 0;
+  if (skip_cnt > len) skip_cnt = len;
 
-    const WideT* in_cast = reinterpret_cast<decltype(in_cast)>(in + skip_cnt);
-    const idxT len_cast = (len - skip_cnt) / items_per_scalar;
+  const WideT* in_cast = reinterpret_cast<decltype(in_cast)>(in + skip_cnt);
+  const idxT len_cast = (len - skip_cnt) / items_per_scalar;
 
-    for (idxT i = thread_rank; i < len_cast; i += num_threads) {
-      wide.scalar = in_cast[i];
-      const idxT real_i = skip_cnt + i * items_per_scalar;
+  for (idxT i = thread_rank; i < len_cast; i += num_threads) {
+    wide.scalar = in_cast[i];
+    const idxT real_i = skip_cnt + i * items_per_scalar;
 #pragma unroll
-      for (int j = 0; j < items_per_scalar; ++j) {
-        f(wide.array[j], real_i + j);
-      }
+    for (int j = 0; j < items_per_scalar; ++j) {
+      f(wide.array[j], real_i + j);
     }
-
-    if (thread_rank < skip_cnt) f(in[thread_rank], thread_rank);
-    const idxT remain_i = skip_cnt + len_cast * items_per_scalar + thread_rank;
-    if (remain_i < len) f(in[remain_i], remain_i);
   }
+
+  if (thread_rank < skip_cnt) f(in[thread_rank], thread_rank);
+  const idxT remain_i = skip_cnt + len_cast * items_per_scalar + thread_rank;
+  if (remain_i < len) f(in[remain_i], remain_i);
 }
 
 template <typename T, typename IdxT, typename Func>
 __device__ __forceinline__ void vectorized_write(size_t thread_rank, size_t num_threads,
                                                  T* out, IdxT len, Func f) {
   using WideT = float4;
-  if constexpr (sizeof(T) >= sizeof(WideT)) {
-    for (IdxT i = thread_rank; i < len; i += num_threads) out[i] = f(i);
-  } else {
-    constexpr int items_per_scalar = sizeof(WideT) / sizeof(T);
-    union {
-      WideT scalar;
-      T array[items_per_scalar];
-    } wide;
+  static_assert(sizeof(T) < sizeof(WideT), "TopK traversal uses scalar elements");
+  constexpr int items_per_scalar = sizeof(WideT) / sizeof(T);
+  union {
+    WideT scalar;
+    T array[items_per_scalar];
+  } wide;
 
-    int skip_cnt =
-        (reinterpret_cast<size_t>(out) % sizeof(WideT))
-            ? ((sizeof(WideT) - reinterpret_cast<size_t>(out) % sizeof(WideT)) / sizeof(T))
-            : 0;
-    if (skip_cnt > len) skip_cnt = len;
+  int skip_cnt =
+      (reinterpret_cast<size_t>(out) % sizeof(WideT))
+          ? ((sizeof(WideT) - reinterpret_cast<size_t>(out) % sizeof(WideT)) / sizeof(T))
+          : 0;
+  if (skip_cnt > len) skip_cnt = len;
 
-    if (thread_rank < skip_cnt) out[thread_rank] = f(thread_rank);
+  if (thread_rank < skip_cnt) out[thread_rank] = f(thread_rank);
 
-    WideT* out_cast = reinterpret_cast<decltype(out_cast)>(out + skip_cnt);
-    const IdxT len_cast = (len - skip_cnt) / items_per_scalar;
+  WideT* out_cast = reinterpret_cast<decltype(out_cast)>(out + skip_cnt);
+  const IdxT len_cast = (len - skip_cnt) / items_per_scalar;
 
-    for (IdxT i = thread_rank; i < len_cast; i += num_threads) {
-      const IdxT real_i = skip_cnt + i * items_per_scalar;
+  for (IdxT i = thread_rank; i < len_cast; i += num_threads) {
+    const IdxT real_i = skip_cnt + i * items_per_scalar;
 #pragma unroll
-      for (int j = 0; j < items_per_scalar; ++j) wide.array[j] = f(real_i + j);
-      out_cast[i] = wide.scalar;
-    }
-
-    const IdxT remain_i = skip_cnt + len_cast * items_per_scalar + thread_rank;
-    if (remain_i < len) out[remain_i] = f(remain_i);
+    for (int j = 0; j < items_per_scalar; ++j) wide.array[j] = f(real_i + j);
+    out_cast[i] = wide.scalar;
   }
+
+  const IdxT remain_i = skip_cnt + len_cast * items_per_scalar + thread_rank;
+  if (remain_i < len) out[remain_i] = f(remain_i);
 }
 
 template <int step, int kNumThreadsPerBlock, int kNumBins, int kNumFinalItems,
-          bool multipleBlocksPerRow, bool mergeBlocks, typename SmemFinalType,
+          typename SmemFinalType,
           typename SmemOutputType>
 __device__ bool processHistogramStep(
-    const int* indices, const float* logits, int rowEnd, uint32_t& logitPattern,
+    const float* logits, int rowEnd, uint32_t& logitPattern,
     int& thresholdBinIdx, SmemOutputType& smemOutput, int* smemThresholdBinIdx,
     int* smemFinalDstIdx, int* smemFinalBinSize, int* smemFoundTopKValues,
-    SmemFinalType& smemFinal, int stride1, int rowStart, int topK) {
+    SmemFinalType& smemFinal, int rowStart, int topK) {
 
 #pragma unroll
   for (int idx = threadIdx.x; idx < kNumBins; idx += kNumThreadsPerBlock) {
@@ -158,13 +151,7 @@ __device__ bool processHistogramStep(
     }
   };
 
-  if (stride1 == 1) {
-    vectorized_process(threadIdx.x, kNumThreadsPerBlock, logits + rowStart, rowEnd - rowStart, distributeToBins);
-  } else {
-    for (int idx = rowStart + threadIdx.x; idx < rowEnd; idx += kNumThreadsPerBlock) {
-      distributeToBins(logits[idx * stride1], idx);
-    }
-  }
+  vectorized_process(threadIdx.x, kNumThreadsPerBlock, logits + rowStart, rowEnd - rowStart, distributeToBins);
   __syncthreads();
 
   int lastValue = smemFoundTopKValues[0];
@@ -213,78 +200,43 @@ __device__ bool processHistogramStep(
       uint32_t binIdx = extractBinIdx<step>(logit);
       if (binIdx < thresholdBinIdx) {
         int dstIdx = atomicAdd(&smemFoundTopKValues[0], 1);
-        if constexpr (mergeBlocks) {
-          smemOutput[dstIdx] = indices[idx];
-        } else if constexpr (multipleBlocksPerRow) {
-          smemOutput[dstIdx] = idx + rowStart;
-          reinterpret_cast<float*>(smemOutput + topK)[dstIdx] = logit;
-        } else {
-          smemOutput[dstIdx] = idx;
-        }
+        smemOutput[dstIdx] = idx;
       }
       if constexpr (step < 3) {
         if (binIdx == thresholdBinIdx && smemFinalBinSize[0] <= kNumFinalItems) {
           int dstIdx = atomicAdd(&smemFinalDstIdx[0], 1);
           smemFinal.items.logits[dstIdx] = logit;
-          if constexpr (mergeBlocks) {
-            smemFinal.items.indices[dstIdx] = indices[idx];
-          } else if constexpr (multipleBlocksPerRow) {
-            smemFinal.items.indices[dstIdx] = idx + rowStart;
-          } else {
-            smemFinal.items.indices[dstIdx] = idx;
-          }
+          smemFinal.items.indices[dstIdx] = idx;
         }
       } else {
         if (binIdx == thresholdBinIdx) {
           int dstIdx = atomicAdd(&smemFinal.histo.data[binIdx], 1);
           if (dstIdx < topK) {
-            if constexpr (mergeBlocks) {
-              smemOutput[dstIdx] = indices[idx];
-            } else if constexpr (multipleBlocksPerRow) {
-              smemOutput[dstIdx] = idx + rowStart;
-              reinterpret_cast<float*>(smemOutput + topK)[dstIdx] = logit;
-            } else {
-              smemOutput[dstIdx] = idx;
-            }
+            smemOutput[dstIdx] = idx;
           }
         }
       }
     }
   };
 
-  if (stride1 == 1) {
-    vectorized_process(threadIdx.x, kNumThreadsPerBlock, logits + rowStart, rowEnd - rowStart, processBins);
-  } else {
-    for (int idx = rowStart + threadIdx.x; idx < rowEnd; idx += kNumThreadsPerBlock) {
-      processBins(logits[idx * stride1], idx);
-    }
-  }
+  vectorized_process(threadIdx.x, kNumThreadsPerBlock, logits + rowStart, rowEnd - rowStart, processBins);
   __syncthreads();
 
   return smemFinalBinSize[0] > kNumFinalItems;
 }
 
-template <int kNumThreadsPerBlock, int kNumBins, bool useRadixSort,
-          bool multipleBlocksPerRow = false, bool mergeBlocks = false,
-          int kMaxTopK = 2048,
+template <int kNumThreadsPerBlock, int kNumBins, bool useWaveRank = false,
           typename TransformFunc>
-static __device__ void topKPerRowJob(const int* indices, const float* logits,
+static __device__ void topKPerRowJob(const float* logits,
                                      int rowStart, int rowEnd, int* outIndices,
-                                     float* outLogits, int stride1, int topK,
-                                     TransformFunc transform_func,
-                                     int* outRawIndices = nullptr) {
-  static constexpr int kNumFinalItems = kMaxTopK + 512;
-  static constexpr int kNumFinalItemsPerThread = kNumFinalItems / kNumThreadsPerBlock;
+                                     int topK, TransformFunc transform_func) {
+  static constexpr int kNumFinalItems = TopK + 512;
 
 #ifndef USE_ROCM
-  using FinalSort = cub::BlockRadixSort<float, kNumThreadsPerBlock, kNumFinalItemsPerThread, int>;
   using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
 #else
-  using FinalSort = hipcub::BlockRadixSort<float, kNumThreadsPerBlock, kNumFinalItemsPerThread, int>;
   using Scan = hipcub::BlockScan<int, kNumThreadsPerBlock>;
 #endif
-
-  using FinalSortTempStorage = std::conditional_t<useRadixSort, typename FinalSort::TempStorage, int>;
 
   struct FinalItems {
     int indices[kNumFinalItems];
@@ -298,7 +250,6 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
 
   __shared__ union {
     FinalItems items;
-    FinalSortTempStorage finalSort;
     Histogram histo;
   } smemFinal;
 
@@ -314,34 +265,15 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
   // Shortcut if length <= TopK
   if (rowLen <= topK) {
     vectorized_write<int, int>(threadIdx.x, kNumThreadsPerBlock, outIndices, rowLen, [&](int rowIt) {
-      int raw_idx = multipleBlocksPerRow ? rowIt + rowStart : rowIt;
-      if (outRawIndices != nullptr) {
-        outRawIndices[rowIt] = raw_idx;
-      }
+      int raw_idx = rowIt;
       return transform_func(raw_idx);
     });
-
-    if constexpr (multipleBlocksPerRow) {
-      vectorized_write<float, int>(threadIdx.x, kNumThreadsPerBlock, outLogits, rowLen, [&](int rowIt) {
-        return logits[rowIt + rowStart];
-      });
-    }
 
     int fillLen = topK - rowLen;
     if (fillLen > 0) {
       vectorized_write<int, int>(threadIdx.x, kNumThreadsPerBlock, outIndices + rowLen, fillLen, [&](int /*i*/) {
         return -1;
       });
-      if (outRawIndices != nullptr) {
-        vectorized_write<int, int>(threadIdx.x, kNumThreadsPerBlock, outRawIndices + rowLen, fillLen, [&](int /*i*/) {
-          return -1;
-        });
-      }
-      if constexpr (multipleBlocksPerRow) {
-        vectorized_write<float, int>(threadIdx.x, kNumThreadsPerBlock, outLogits + rowLen, fillLen, [&](int /*i*/) {
-          return -FLT_MAX;
-        });
-      }
     }
     return;
   }
@@ -363,62 +295,55 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
   int thresholdBinIdx = -1;
   uint32_t logitPattern = 0;
 
-  bool continueToNextStep = processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
-      indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
+  bool continueToNextStep = processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
+      logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK);
 
   if (continueToNextStep) {
     // FP16 coarse selection is superseded by a full-row FP32 rescan. Reset
     // its selected count so previously selected coarse bins are not duplicated.
     if (threadIdx.x == 0) smemFoundTopKValues[0] = 0;
     __syncthreads();
-    continueToNextStep = processHistogramStep<1, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
-        indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
+    continueToNextStep = processHistogramStep<1, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
+        logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK);
   }
 
   if (continueToNextStep) {
-    continueToNextStep = processHistogramStep<2, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
-        indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
+    continueToNextStep = processHistogramStep<2, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
+        logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK);
   }
 
   if (continueToNextStep) {
-    processHistogramStep<3, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
-        indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
+    processHistogramStep<3, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
+        logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK);
   }
 
   if (!continueToNextStep) {
-    if constexpr (useRadixSort) {
-      float finalLogits[kNumFinalItemsPerThread];
-      int finalIndices[kNumFinalItemsPerThread];
-
-#pragma unroll
-      for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) finalLogits[ii] = -FLT_MAX;
-
-#pragma unroll
-      for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
-        int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
-        if (srcIdx < smemFinalDstIdx[0]) {
-          finalLogits[ii] = smemFinal.items.logits[srcIdx];
-          finalIndices[ii] = smemFinal.items.indices[srcIdx];
-        }
-      }
-      __syncthreads();
-
-      FinalSort(smemFinal.finalSort).SortDescendingBlockedToStriped(finalLogits, finalIndices);
-
-      int baseIdx = smemFoundTopKValues[0];
-#pragma unroll
-      for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
-        int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
-        int dstIdx = baseIdx + srcIdx;
-        if (dstIdx < topK) {
-          smemOutput[dstIdx] = finalIndices[ii];
-          if constexpr (multipleBlocksPerRow) {
-            reinterpret_cast<float*>(smemOutput + topK)[dstIdx] = finalLogits[ii];
+    auto baseIdx = smemFoundTopKValues[0];
+    const int count = smemFinalDstIdx[0];
+    if (useWaveRank && count > 64 && count <= 128) {
+      // 中等候选桶由每个 wave 协作计算一个 rank，缩短串行比较链。
+      // 大候选桶保留广播读路径，避免更分散的 LDS 访问导致退化。
+      // ballot 后所有 lane 得到相同的计数，仅 lane0 写入；同分沿用候选序号。
+      const int lane = threadIdx.x % warpSize;
+      const int wave = threadIdx.x / warpSize;
+      for (int i = wave; i < count; i += kNumThreadsPerBlock / warpSize) {
+        const auto logit = smemFinal.items.logits[i];
+        const auto key = convert_to_uint32(logit);
+        int rank = 0;
+        for (int base = 0; base < count; base += warpSize) {
+          const int j = base + lane;
+          bool before = false;
+          if (j < count) {
+            const auto other = convert_to_uint32(smemFinal.items.logits[j]);
+            before = key > other || (key == other && i > j);
           }
+          rank += __popcll(__ballot(before));
+        }
+        if (lane == 0 && rank + baseIdx < topK) {
+          smemOutput[rank + baseIdx] = smemFinal.items.indices[i];
         }
       }
     } else {
-      auto baseIdx = smemFoundTopKValues[0];
       for (int i = threadIdx.x; i < smemFinalDstIdx[0]; i += kNumThreadsPerBlock) {
         int outIndex = 0;
         auto logit = smemFinal.items.logits[i];
@@ -433,9 +358,6 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
         }
         if (outIndex + baseIdx < topK) {
           smemOutput[outIndex + baseIdx] = smemFinal.items.indices[i];
-          if constexpr (multipleBlocksPerRow) {
-            reinterpret_cast<float*>(smemOutput + topK)[outIndex + baseIdx] = smemFinal.items.logits[i];
-          }
         }
       }
     }
@@ -443,32 +365,17 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
   }
 
   vectorized_write<int, int>(threadIdx.x, kNumThreadsPerBlock, outIndices, topK, [&](int i) {
-    if constexpr (multipleBlocksPerRow) {
-      return smemOutput[i];
-    } else {
-      int raw_idx = (stride1 == 1) ? smemOutput[i] : smemOutput[i] - rowStart;
-      if (raw_idx < 0 || raw_idx >= rowLen) {
-        if (outRawIndices != nullptr) {
-          outRawIndices[i] = -1;
-        }
-        return -1;
-      }
-      if (outRawIndices != nullptr) {
-        outRawIndices[i] = raw_idx;
-      }
-      return transform_func(raw_idx);
-    }
-  });
+    int raw_idx = smemOutput[i];
+    if (raw_idx < 0 || raw_idx >= rowLen) {
 
-  if constexpr (multipleBlocksPerRow) {
-    vectorized_write<float, int>(threadIdx.x, kNumThreadsPerBlock, outLogits, topK, [&](int i) {
-      return reinterpret_cast<float*>(smemOutput + topK)[i];
-    });
-  }
+      return -1;
+    }
+
+    return transform_func(raw_idx);
+  });
 }
 
-
-template<int Threads>
+template<int Threads, bool UseWaveRank = false>
 __global__ __launch_bounds__(Threads) void kernel(FastTopKParams params, int* output, const int* offsets) {
   const int row=blockIdx.x;
   const int start=params.row_starts ? params.row_starts[row] : 0;
@@ -476,7 +383,55 @@ __global__ __launch_bounds__(Threads) void kernel(FastTopKParams params, int* ou
   const int offset=offsets[row];
   const float* scores=params.input + row * params.input_stride;
   auto transform = [&](int idx) { return idx + offset; };
-  topKPerRowJob<Threads, 2048, false>(nullptr, scores, start, start+length,
-      output + int64_t(row)*TopK, nullptr, 1, TopK, transform);
+  topKPerRowJob<Threads, 2048, UseWaveRank>(
+      scores, start, start+length, output + int64_t(row)*TopK, TopK, transform);
+}
+
+// 三个公开接口共用选择逻辑，只在最后一步进行各自的索引映射。
+template<int Threads>
+__global__ __launch_bounds__(Threads) void plain_kernel(FastTopKParams params) {
+  const int row = blockIdx.x;
+  const int length = params.lengths[row];
+  if (length <= TopK) {
+    // 短行无需选择；一次写出相对索引和填充，避免两段写出增加开销。
+    for (int i = threadIdx.x; i < TopK; i += Threads) {
+      params.indices[int64_t(row) * TopK + i] = i < length ? i : -1;
+    }
+    return;
+  }
+  const int start = params.row_starts ? params.row_starts[row] : 0;
+  auto transform = [](int idx) { return idx; };
+  topKPerRowJob<Threads, 2048>(params.input + row * params.input_stride,
+      start, start + length, params.indices + int64_t(row) * TopK,
+      TopK, transform);
+}
+
+template<int Threads, bool Decode>
+__global__ __launch_bounds__(Threads) void paged_kernel(
+    FastTopKParams params, int* output, const int* pages, int64_t page_stride,
+    const int* cu_seqlens, int nseq) {
+  const int row = blockIdx.x;
+  const int start = params.row_starts ? params.row_starts[row] : 0;
+  const int length = params.lengths[row];
+  int owner = row;
+  if constexpr (!Decode) {
+    __shared__ int shared_owner;
+    if (threadIdx.x == 0) {
+      int low = 0, high = nseq;
+      while (low + 1 < high) {
+        int mid = (low + high) / 2;
+        if (cu_seqlens[mid] <= row) low = mid;
+        else high = mid;
+      }
+      shared_owner = low;
+    }
+    __syncthreads();
+    owner = shared_owner;
+  }
+  const int* page = pages + int64_t(owner) * page_stride;
+  auto transform = [=](int idx) { return page[idx]; };
+  topKPerRowJob<Threads, 2048>(params.input + row * params.input_stride,
+      start, start + length, output + int64_t(row) * TopK,
+      TopK, transform);
 }
 } // namespace hcu_ragged
