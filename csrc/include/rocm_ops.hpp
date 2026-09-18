@@ -1219,8 +1219,47 @@ namespace py = pybind11;
             "                         int block_size, Tensor! sorted_token_ids," \
             "                         Tensor! experts_ids,"                      \
             "                         Tensor! num_tokens_post_pad) -> ()");      \
-
-
+      m.def("ep_scatter", &aiter::ep_scatter,                                    \
+            "ep_scatter(Tensor aq, Tensor aq_scale, Tensor topk_ids,"            \
+            "           Optional[Tensor] expert_map, Tensor! expert_num_tokens," \
+            "           Tensor! aq_out, Tensor! aq_scale_out, Tensor! m_indices," \
+            "           Tensor! inv_perm, int local_num_experts,"                \
+            "           int alignment) -> ()");                                  \
+      m.def("ep_gather", &aiter::ep_gather,                                      \
+            "ep_gather(Tensor a, Tensor topk_ids, Tensor topk_weights,"          \
+            "          Tensor inv_perm, Optional[Tensor] expert_map,"            \
+            "          Tensor! output) -> ()");                                  \
+      m.def("ep_build_m_indices", &aiter::ep_build_m_indices,                    \
+            "ep_build_m_indices(Tensor topk_ids, Tensor! m_indices,"             \
+            "                   int local_num_experts, int alignment) -> ()");   \
+      m.def("ep_fused_quant_scatter", &aiter::ep_fused_quant_scatter,            \
+            "ep_fused_quant_scatter(Tensor input, Tensor topk_ids,"              \
+            "                       Optional[Tensor] expert_map,"                \
+            "                       Tensor! expert_num_tokens, Tensor! aq_out,"  \
+            "                       Tensor! aq_scale_out, Tensor! m_indices,"    \
+            "                       Tensor! inv_perm, int local_num_experts,"    \
+            "                       int alignment) -> ()");                      \
+      m.def("ep_fused_fp8_quant_scatter", &aiter::ep_fused_fp8_quant_scatter,    \
+            "ep_fused_fp8_quant_scatter(Tensor input, Tensor topk_ids,"          \
+            "                           Optional[Tensor] expert_map,"            \
+            "                           Tensor! expert_num_tokens,"              \
+            "                           Tensor! aq_out, Tensor! aq_scale_out,"   \
+            "                           Tensor! m_indices, Tensor! inv_perm,"    \
+            "                           int local_num_experts, int alignment,"   \
+            "                           int fp8type,"                            \
+            "                           bool fill_padded_m_indices) -> ()");     \
+      m.def("ep_fused_smooth_quant_scatter",                                     \
+            &aiter::ep_fused_smooth_quant_scatter,                               \
+            "ep_fused_smooth_quant_scatter(Tensor input, Tensor topk_ids,"       \
+            "                               Optional[Tensor] expert_map,"        \
+            "                               Tensor! expert_offsets,"             \
+            "                               Tensor smooth_scale, Tensor! aq_out,"\
+            "                               Tensor! aq_scale_out,"               \
+            "                               Tensor! m_indices,"                  \
+            "                               Tensor! inv_perm,"                   \
+            "                               int local_num_experts,"              \
+            "                               int alignment) -> ()");              \
+            
 #define MOE_OP_PYBIND                                                            \
       m.def("fmoe", &fmoe);                                                      \
       m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0,                                   \
