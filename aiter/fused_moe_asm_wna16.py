@@ -343,12 +343,16 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
             persist_cu = 0
         # INT4 w4a16
         if use_int4_w4a16:
-            if solution_id is None:
-                solution_id = get_moe_asm_solution(arch, tokens_in_chunk, N/2, w1.size(2)*2, E, top_k_num, MoeQuantType.INT4_W4A16)
             if block_shape is not None and block_shape[1] == 32:
+                if top_k_num > 8 or int(N / 2) != 256 or w1.size(2) * 2 != 7168:
+                    raise ValueError("no valid config for w4a16(moe)")
+
                 config = decode_sol_w4a16_gw32()
             else:
+                if solution_id is None:
+                    solution_id = get_moe_asm_solution(arch, tokens_in_chunk, N/2, w1.size(2)*2, E, top_k_num, MoeQuantType.INT4_W4A16)
                 config = decode_sol_w4a16(solution_id)
+                
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert, moe_buf = (
                 moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
             )
