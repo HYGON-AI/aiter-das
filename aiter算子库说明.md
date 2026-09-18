@@ -1018,7 +1018,7 @@ return out_q, out_s
 
 # 5\. MQA
 
-### 5\.1\.1 mqa_logits
+## 5\.1 mqa_logits
 
 ### 功能描述
 
@@ -1053,6 +1053,87 @@ logits = mqa_logits(
     q_seq_len, kv_seq_len, num_heads, head_dim,
 )
 ```
+
+## 5\.2 paged_mqa_logits
+
+### 功能描述
+
+`aiter.paged_mqa_logits` 用于分页 KV cache 的 MQA 索引分数计算，所有 head 共享同一份 Key，适用于稀疏注意力的候选 token 评分阶段：
+
+1. 根据 `block_tables` 将逻辑候选位置映射到物理页，读取 FP8 Key 及对应的 FP32 反量化 scale。
+2. 对每个 Query、每个 head 计算 Q 与反量化 Key 的点积，并应用 ReLU。
+3. 使用 `weights` 对各 head 的结果加权求和，输出 FP32 分数矩阵 `[B*R, N]`；权重允许为负数，因此输出也可能为负数。
+4. 根据 `context_lens` 和 Query 位置执行因果屏蔽。请求 `b` 的第 `r` 个 Query 对应输出第 `b*R+r` 行，有效候选范围为 `0 <= n < context_lens[b]-R+r+1`；默认将其余位置填为 `-inf`。
+
+接口不执行 softmax、Value 聚合或 TopK 选择，也不隐式乘以 `1/sqrt(D)`。当前支持 gfx936/gfx938 的 `S=1/64` 页，以及 gfx946 的 `S=1` 页；gfx946 已完成 Perf Model 功能验证，尚无实卡性能结论。
+
+### 参数说明
+
+记 `B` 为请求数，`R` 为每个请求的 Query 数，`H` 为当前 rank 的索引 head 数，`D=128` 为 head 维度，`N=max_model_len` 为输出候选列数，`P` 为物理页数，`S` 为每页 Key 数，`T` 为每个请求的页表容量。
+
+| 参数 | 类型/默认值 | 说明 |
+| --- | --- | --- |
+| `q` | `torch.Tensor` | 连续的 `torch.float8_e4m3fn [B,R,H,128]` Query；要求 `B>0`、`B*R<=65535`、`R∈{1,2,4}`、`H∈{32,64}`。 |
+| `kv_cache` | `torch.Tensor` | 连续的 `torch.uint8 [P,S,1,132]`，存放 FP8 Key 和 FP32 scale；要求 `P>0`、`P*S*132<=2**31-1`。每页的实际打包布局见下文。 |
+| `weights` | `torch.Tensor` | 连续的 `torch.float32 [B*R,H]`，每个 Query 对各 head 的权重，允许正数、负数和零。 |
+| `context_lens` | `torch.Tensor` | 连续的 `torch.int32 [B]`，每个请求的有效长度；调用方保证 `R<=context_lens[b]<=min(N,T*S)`。 |
+| `block_tables` | `torch.Tensor` | 连续的 `torch.int32 [B,T]`，逻辑页到物理页的映射；`0<T<2**31`，所有被使用的物理页编号必须位于 `[0,P)`。 |
+| `max_model_len` | Python `int` | 输出宽度 `N`；要求 `0<N<2**31`，不接受 `bool`。 |
+| `out` | `torch.Tensor 或 None`，默认 `None` | 可选的连续 FP32 输出缓冲区 `[B*R,N]`；为 `None` 时内部分配，传入时复用并返回该张量，不得与任一输入共享底层 storage。 |
+| `clean_logits` | `bool`，默认 `True` | 默认保证全部无效位置为 `-inf`，包括远端尾部；设为 `False` 时由调用方负责尾部初始化或屏蔽。 |
+| `kernelId` | `int 或 None`，默认 `None` | 默认自动选择。gfx936 支持 ID6/7；gfx938 支持 ID0–3、6/7，其中 ID0–3 仅支持 `S=1`；ID7 仅用于 `H=32、R=1`。gfx946 支持 ID4/5，默认 ID4，且仅支持 `S=1`。 |
+| 返回值 | `torch.Tensor` | FP32 分数矩阵 `[B*R,N]`，与输入位于同一 GPU。 |
+
+`out`、`clean_logits`、`kernelId` 为仅限关键字参数。所有输入及 `out` 必须位于同一 GPU、连续存储且不需要梯度；Q 和 KV cache 的起始地址至少 4 字节对齐。接口用于推理，不提供 autograd。
+
+KV cache 按整页打包：先存放 `S*128` 个 FP8 Key 字节，再存放 `S*4` 个 FP32 scale 字节，每个 Key 对应一个正的有限 scale。例如 `S=64` 时，每页前 8192 字节是 Key，后 256 字节是 scale，不能按每个 token 的 128+4 字节交错排列。接口不会在热路径把设备上的长度、页表和 scale 内容拷回 CPU 检查，调用方须保证这些数值有效。
+
+### 调用示例
+
+以下示例在 gfx936/gfx938 上构造 `S=64` 的独立物理页并调用公开接口；如在 gfx946 Perf Model 上验证，将 `S` 改为 1 后重新构造输入即可。
+
+```Python
+import torch
+import aiter
+
+device = "cuda:0"  # ROCm/HCU 环境同样使用 PyTorch 的 cuda 命名
+B, R, H, D = 2, 1, 32, 128
+S, N = 64, 256
+T = (N + S - 1) // S
+P = B * T  # 每个请求使用互不重叠的物理页
+
+q = (torch.randn(B, R, H, D, device=device) * 0.25).to(
+    torch.float8_e4m3fn
+)
+keys = (torch.randn(P, S, D, device=device) * 0.25).to(
+    torch.float8_e4m3fn
+)
+scales = torch.ones(P, S, device=device, dtype=torch.float32)
+
+# 每页先放全部 Key 字节，再放全部 scale 字节。
+raw = torch.empty(P, S * (D + 4), device=device, dtype=torch.uint8)
+raw[:, :S * D].copy_(keys.view(torch.uint8).reshape(P, S * D))
+raw[:, S * D:].copy_(scales.view(torch.uint8).reshape(P, S * 4))
+kv_cache = raw.view(P, S, 1, D + 4)
+
+weights = torch.randn(B * R, H, device=device, dtype=torch.float32)
+context_lens = torch.tensor([N, N - 13], device=device, dtype=torch.int32)
+block_tables = torch.arange(P, device=device, dtype=torch.int32).reshape(B, T)
+
+logits = aiter.paged_mqa_logits(
+    q, kv_cache, weights, context_lens, block_tables, N,
+    clean_logits=True, kernelId=None,
+)
+# logits 为 FP32 [2, 256]；第二个请求的最后 13 列为 -inf。
+
+# 可选：复用输出缓冲区。
+out = torch.empty(B * R, N, device=device, dtype=torch.float32)
+aiter.paged_mqa_logits(
+    q, kv_cache, weights, context_lens, block_tables, N, out=out,
+)
+```
+
+首次调用可能触发 JIT 编译，进行 Graph 捕获或性能计时前应先预热。完整接口说明、Graph 示例及 gfx936/gfx938 典型 shape 性能数据见 [paged_mqa_logits 算子说明与性能报告](docs/paged_mqa_logits.md)。
 
 # 6. FLA
 
