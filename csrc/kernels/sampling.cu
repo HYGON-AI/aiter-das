@@ -347,6 +347,9 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
     if constexpr (DETERMINISTIC) {
       DeterministicInclusiveSum<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>(
           prob_greater_than_threshold, inclusive_cdf, temp_storage);
+      // All waves must finish reading deterministic_scan before the union
+      // storage is reused by BlockAdjacentDifference below.
+      __syncthreads();
     } else {
       BlockScan<float, BLOCK_THREADS, SCAN_ALGORITHM>(temp_storage->block_prim.scan)
           .template InclusiveSum<VEC_SIZE>(prob_greater_than_threshold, inclusive_cdf);
@@ -360,8 +363,10 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
     }
 
     bool greater_than_u_diff[VEC_SIZE];
+    // FlagHeads was removed from BlockAdjacentDifference in newer hipCUB.
+    // Boolean inequality with a false predecessor preserves the head flags.
     BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
-        .template FlagHeads<VEC_SIZE>(greater_than_u_diff, greater_than_u, BoolDiffOp(), 0);
+        .template SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u_diff, BoolDiffOp(), false);
     __syncthreads();
 
 #pragma unroll

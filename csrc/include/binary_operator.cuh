@@ -1484,7 +1484,7 @@ struct BinaryOperationPattern<3, Operation, _T0, _T1>
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             output.scalar_type(), "operator_bcastM1K_unroll_kernel", [&]
-            { aiter::operator_bcastM1K_unroll_kernel<scalar_t, rows, Operation, false, _T0, _T1>
+            { aiter::operator_bcastM1K_unroll_kernel<scalar_t, rows, Operation, false, _T1, _T0>
                   <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, M, N, K, types_match); });
       }
     }
@@ -1492,17 +1492,18 @@ struct BinaryOperationPattern<3, Operation, _T0, _T1>
     {
       if (order_flag)
       {
+        // This kernel takes the broadcast tensor first, unlike the unrolled kernel.
         VLLM_DISPATCH_FLOATING_TYPES(
             output.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
-            { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true, _T0, _T1>
-                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N, types_match); });
+            { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false, _T1, _T0>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N, types_match); });
       }
       else
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             output.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
-            { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false, _T1, _T0>
-                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N, types_match); });
+            { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true, _T0, _T1>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N, types_match); });
       }
     }
   }
@@ -1558,7 +1559,7 @@ struct BinaryOperationPattern<5, Operation, _T0, _T1>
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             output.scalar_type(), "operator_bcastMN1_unroll_vec_naive", [&]
-            { aiter::operator_bcastMN1_unroll_vec_naive<scalar_t, row, Operation, false, _T0, _T1>
+            { aiter::operator_bcastMN1_unroll_vec_naive<scalar_t, row, Operation, false, _T1, _T0>
                   <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, forward_dim, bcast_dim, types_match); });
       }
     }
@@ -1578,7 +1579,7 @@ struct BinaryOperationPattern<5, Operation, _T0, _T1>
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             output.scalar_type(), "operator_bcastMN1_naive", [&]
-            { aiter::operator_bcastMN1_naive<scalar_t, row, Operation, false, _T0, _T1>
+            { aiter::operator_bcastMN1_naive<scalar_t, row, Operation, false, _T1, _T0>
                   <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, forward_dim, bcast_dim, types_match); });
       }
     }
@@ -1636,7 +1637,7 @@ struct BinaryOperationPattern<6, Operation, _T0, _T1>
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             output.scalar_type(), "operator_bcast1N1_unroll_vec_naive", [&]
-            { aiter::operator_bcast1N1_unroll_vec_naive<scalar_t, row, Operation, false, _T0, _T1>
+            { aiter::operator_bcast1N1_unroll_vec_naive<scalar_t, row, Operation, false, _T1, _T0>
                   <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, m, n, k, types_match); });
       }
     }
@@ -1656,7 +1657,7 @@ struct BinaryOperationPattern<6, Operation, _T0, _T1>
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             output.scalar_type(), "operator_bcast1N1_naive", [&]
-            { aiter::operator_bcast1N1_naive<scalar_t, row, Operation, false, _T0, _T1>
+            { aiter::operator_bcast1N1_naive<scalar_t, row, Operation, false, _T1, _T0>
                   <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, m, n, k, types_match); });
       }
     }
@@ -1751,18 +1752,21 @@ struct BinaryOperationPattern<7, Operation, _T0, _T1>
   {                                                                                                                                \
     case case_row:                                                                                                                 \
     {                                                                                                                              \
+      /* Keep the input types aligned with the possibly swapped tensor pointers. */                                                \
+      using normal_type = std::conditional_t<order_flag, _T0, _T1>;                                                                 \
+      using bcast_type = std::conditional_t<order_flag, _T1, _T0>;                                                                  \
       if (!need_pad)                                                                                                               \
       {                                                                                                                            \
         VLLM_DISPATCH_FLOATING_TYPES(                                                                                              \
             output.scalar_type(), "operator_bcastN11_unroll_vec_naive", [&]                                                        \
-            { aiter::operator_bcastN11_unroll_vec_naive<scalar_t, case_row, Operation, order_flag, _T0, _T1>                       \
+            { aiter::operator_bcastN11_unroll_vec_naive<scalar_t, case_row, Operation, order_flag, normal_type, bcast_type>        \
                   <<<grid_dim, block_dim, 0, stream>>>(normal_tensor, bcast_tensor, buf_c, m, n, k, types_match); });              \
       }                                                                                                                            \
       else                                                                                                                         \
       {                                                                                                                            \
         VLLM_DISPATCH_FLOATING_TYPES(                                                                                              \
             output.scalar_type(), "operator_bcastN11_unroll_vec_pad", [&]                                                          \
-            { aiter::operator_bcastN11_unroll_vec_pad<scalar_t, case_row, Operation, order_flag, _T0, _T1>                         \
+            { aiter::operator_bcastN11_unroll_vec_pad<scalar_t, case_row, Operation, order_flag, normal_type, bcast_type>          \
                   <<<grid_dim, block_dim, 0, stream>>>(normal_tensor, bcast_tensor, buf_c, m, n, k, padded_size, types_match); }); \
       }                                                                                                                            \
       return;                                                                                                                      \
@@ -1808,7 +1812,7 @@ struct BinaryOperationPattern<7, Operation, _T0, _T1>
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             output.scalar_type(), "operator_bcastN11_naive", [&]
-            { aiter::operator_bcastN11_naive<scalar_t, row, Operation, false, _T0, _T1>
+            { aiter::operator_bcastN11_naive<scalar_t, row, Operation, false, _T1, _T0>
                   <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, m, n, k, types_match); });
       }
     }
