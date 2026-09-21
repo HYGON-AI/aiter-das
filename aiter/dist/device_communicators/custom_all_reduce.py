@@ -28,6 +28,7 @@ from torch.distributed import ProcessGroup
 # from vllm import _custom_ops as ops
 import aiter as ops
 from aiter.dist.parallel_state import in_the_same_node_as
+from aiter.dist.device_communicators.topology import is_fully_connected
 from aiter import logger
 from aiter.utility.dtypes import fp8
 
@@ -483,27 +484,17 @@ class CustomAllreduce:
         assert isinstance(device, torch.device)
         self.device = device
 
-        # device_ids = get_cuda_visible_devices()
-
-        # physical_device_id = device_ids[device.index]
-        # tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
-        # gather_list = [
-        #     torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
-        # ]
-        # dist.all_gather(gather_list, tensor, group=self.group)
-        # physical_device_ids = [t.item() for t in gather_list]
-
-        # test nvlink first, this will filter out most of the cases
-        # where custom allreduce is not supported
-        # this checks hardware and driver support for NVLink
-        # assert current_platform.is_cuda() or current_platform.is_rocm()
-        # fully_connected = current_platform.is_full_nvlink(physical_device_ids)
+        # Preserve the two-rank path and Fabric's separate transport contract.
+        # HIP IPC with more than two ranks requires the vLLM ROCm link predicate.
         fully_connected = True
+        if self.transport == "ipc" and world_size > 2 and torch.version.hip:
+            fully_connected = is_fully_connected(self.group, self.device)
+        self.fully_connected = fully_connected
         if world_size > 2 and not fully_connected:
             logger.warning(
-                "Custom allreduce is disabled because it's not supported on"
-                " more than two PCIe-only GPUs. To silence this warning, "
-                "specify disable_custom_all_reduce=True explicitly."
+                "Custom allreduce IPC is disabled: the selected GPU group "
+                "does not have confirmed type=2, hops=1 connectivity for every "
+                "pair. Falling back to the next communicator."
             )
             return
         # test P2P capability, this checks software/cudaruntime support
