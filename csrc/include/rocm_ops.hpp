@@ -1403,13 +1403,6 @@ namespace py = pybind11;
           py::arg("use_ue8m0") = false,                                  \
           "Per-token-group FP8 dynamic quantization.");
 
-#define PTQ_I8_PYBIND                                                     \
-    m.def("per_token_quant_i8",                                           \
-          &aiter::ptq_i8::per_token_quant_i8,                             \
-          py::arg("out"),                                                 \
-          py::arg("input"),                                               \
-          py::arg("scale"));
-
 #define RMSNORM_PYBIND                                                                             \
     m.def("rms_norm_cu",                                                                           \
           &rms_norm,                                                                               \

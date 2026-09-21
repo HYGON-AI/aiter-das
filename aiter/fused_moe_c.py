@@ -19,7 +19,7 @@ from aiter.test_common import  perftest
 import aiter
 from aiter import dtypes
 from aiter import moe_c_moe_sum, moe_c_silu_and_mul,moe_c_moe_sum_opt_v2, per_token_quant_hip,moe_c_situ_glu
-from aiter.ops.per_token_quant_i8 import per_token_quant_i8
+from aiter.ops.quant import dynamic_per_token_scaled_quant
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.fused_moe import triton_moe_sum
 from triton.language.extra import libdevice
@@ -164,7 +164,11 @@ def per_token_quant_int8(x):
         backend == "auto"
         and x.numel() < int(os.getenv("AITER_PTQ_I8_HIP_MAX_ELEMS", "25000000"))
     ):
-        return per_token_quant_i8(x)
+        x_q = torch.empty_like(x, device=x.device, dtype=torch.int8)
+        scales = torch.empty(x.shape[:-1] + (1,),
+                             device=x.device, dtype=torch.float32)
+        dynamic_per_token_scaled_quant(x_q, x, scales)
+        return x_q, scales
 
     x_q = torch.empty_like(x, device=x.device, dtype=torch.int8)
     scales = torch.empty(x.shape[:-1] + (1,),

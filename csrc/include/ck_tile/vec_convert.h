@@ -168,8 +168,8 @@ CK_TILE_HOST_DEVICE constexpr int8x2_v fp32x2_t_to_int8x2_t(fp32x2_v x, fp32_t i
     fp32x2_v tmp = amd_assembly_pk_mul_f32(x, fp32x2_t{inverted_scale, inverted_scale});
 
     int8x2_v out;
-    out[0] = static_cast<int8_t>(tmp[0]);
-    out[1] = static_cast<int8_t>(tmp[1]);
+    out[0] = static_cast<int8_t>(rintf(tmp[0]));
+    out[1] = static_cast<int8_t>(rintf(tmp[1]));
     return out;
 }
 #if defined(__gfx946__) || defined(__Float4_e2m1fn_x2)
