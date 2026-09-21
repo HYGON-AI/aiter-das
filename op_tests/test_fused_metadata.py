@@ -20,8 +20,14 @@ CLI 测试组（--case，按测试方向分组，定义见文件头部）：
   * v6       内核结构边界：最小 launch / 扫描 lane / 组扫描 / XL 串行回退
 
 数值组（default / v1-v4 / v6）每例做 -1 哨兵三方对拍 + event 计时；v5 为
-异常组，仅断言 RuntimeError。pytest 侧经 @pytest.mark.parametrize 共享同一
-份 case 定义，另有 base matrix / SWA / dtype 组合三组独立参数化测试。
+异常组，仅断言 RuntimeError。
+
+单配置选择：--case 支持 ``组名:序号`` 语法（序号 1-based，按组内 case 顺序，
+如 ``--case v2:3`` 只运行 v2 组第 3 个配置）；``--list-cases`` 打印全部组内
+case 的序号与参数后退出。pytest 侧经 @pytest.mark.parametrize 共享同一
+份 case 定义（单 case 亦可用 node id 选择，如
+``::test_suite_v2_shift0[ps=1 tail=2]``），另有 base matrix / SWA / dtype
+组合三组独立参数化测试。
 
 所有测试需要 CUDA 设备（Triton + AITER JIT）。
 """
@@ -717,6 +723,11 @@ _NUMERIC_CASES = {
     'v6':      (V6_SUITE, _build_plain_kw),
 }
 
+# v5 异常组有序条目（--list-cases 与 --case v5:N 共用同一编号）：先 page_size
+# 后输出契约。
+V5_ENTRIES = ([('page_size', ps) for ps in V5_INVALID_PAGE_SIZES]
+              + [('contract', cid) for cid in V5_CONTRACT_CASES])
+
 
 def _run_numeric_case(kw, case, bench_only, warmup=20, iters=200):
     """单个数值 case：-1 哨兵三方对拍 + event 计时，返回 (ok, triton_ms, aiter_ms)。"""
@@ -743,8 +754,17 @@ def _write_traffic_note(kw):
     return f" writes_min={writes // 1024}KB"
 
 
-def run_case(case_id, bench_only=False, warmup=20, iters=200):
-    """运行一个测试 case 组，返回 (passed, failed, avg_speedup)。
+def _check_case_index(case_id, index, count):
+    """校验 --case 组名:N 的 1-based 序号，越界时报错并退出。"""
+    if not 1 <= index <= count:
+        raise SystemExit(
+            f"error: --case {case_id}:{index} out of range (1..{count}); "
+            f"use --list-cases to enumerate cases")
+
+
+def run_case(case_id, bench_only=False, warmup=20, iters=200, case_index=None):
+    """运行一个测试 case 组（case_index 非空时只跑组内第 case_index 个），
+    返回 (passed, failed, avg_speedup)。
 
     数值组每例打印明细行并记录 speedup；v5 异常组不计性能（avg 返回 None）。
     """
@@ -752,19 +772,27 @@ def run_case(case_id, bench_only=False, warmup=20, iters=200):
     speedups = []
 
     if case_id == 'v5':
-        for ps in V5_INVALID_PAGE_SIZES:
-            ok = _expects_runtime_error(_build_invalid_ps_kw(ps))
-            passed, failed = passed + ok, failed + (not ok)
-            print(f"  [page_size={ps}] "
-                  f"{'PASS: raised RuntimeError' if ok else 'FAIL: no RuntimeError'}")
-        for cid in V5_CONTRACT_CASES:
-            ok = _expects_runtime_error(_build_contract_kw(cid))
-            passed, failed = passed + ok, failed + (not ok)
-            print(f"  [{cid}] "
-                  f"{'PASS: raised RuntimeError' if ok else 'FAIL: no RuntimeError'}")
+        entries = V5_ENTRIES
+        if case_index is not None:
+            _check_case_index(case_id, case_index, len(entries))
+            entries = [entries[case_index - 1]]
+        for kind, val in entries:
+            if kind == 'page_size':
+                ok = _expects_runtime_error(_build_invalid_ps_kw(val))
+                passed, failed = passed + ok, failed + (not ok)
+                print(f"  [page_size={val}] "
+                      f"{'PASS: raised RuntimeError' if ok else 'FAIL: no RuntimeError'}")
+            else:
+                ok = _expects_runtime_error(_build_contract_kw(val))
+                passed, failed = passed + ok, failed + (not ok)
+                print(f"  [{val}] "
+                      f"{'PASS: raised RuntimeError' if ok else 'FAIL: no RuntimeError'}")
         return passed, failed, None
 
     cases, build = _NUMERIC_CASES[case_id]
+    if case_index is not None:
+        _check_case_index(case_id, case_index, len(cases))
+        cases = [cases[case_index - 1]]
     for case in cases:
         try:
             kw = build(case)
@@ -808,10 +836,42 @@ def test_benchmark_source_equivalent():
 
 
 # ---------------------------------------------------------------------------
-# CLI 入口：python test_fused_metadata.py [--bench-only] [--case v1 v2 ...]
+# CLI 入口：python test_fused_metadata.py [--bench-only] [--case v1 v2:3 ...]
+#           [--list-cases]
 # 每个 case 组输出独立的 [CASE vx] 汇总表；缺省只运行 default 基线组；
-# all = default + v1..v6；任一失败时退出码为 1。
+# all = default + v1..v6；--case 支持 组名:序号 语法只运行组内单个配置
+# （1-based，见 --list-cases）；任一失败时退出码为 1。
 # ---------------------------------------------------------------------------
+def _parse_case_token(token):
+    """'v2' -> ('v2', None)；'v2:3' -> ('v2', 3)。"""
+    group, sep, idx_str = token.partition(':')
+    if not sep:
+        return group, None
+    try:
+        index = int(idx_str)
+    except ValueError:
+        raise SystemExit(f"error: invalid case index in --case {token!r}")
+    if index <= 0:
+        raise SystemExit(f"error: case index must be 1-based in --case {token!r}")
+    return group, index
+
+
+def _list_cases():
+    """打印全部 case 组及其 1-based case 序号（供 --case 组名:N 引用）。"""
+    for case_id, desc in _CASE_DESCRIPTIONS.items():
+        print(f"[{case_id}] {desc}")
+        if case_id == 'v5':
+            for i, ps in enumerate(V5_INVALID_PAGE_SIZES, 1):
+                print(f"  {i:3d}. page_size={ps}")
+            for i, cid in enumerate(V5_CONTRACT_CASES,
+                                    len(V5_INVALID_PAGE_SIZES) + 1):
+                print(f"  {i:3d}. {cid}")
+        else:
+            cases, _ = _NUMERIC_CASES[case_id]
+            for i, case in enumerate(cases, 1):
+                print(f"  {i:3d}. {case['note']}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Correctness & benchmark tests for aiter.fused_metadata_kernel_general')
@@ -821,31 +881,56 @@ def main():
                         help='un-timed warmup calls per benchmark (default: 20)')
     parser.add_argument('--iters', type=int, default=200,
                         help='total timed iterations per benchmark (default: 200)')
+    parser.add_argument('--list-cases', action='store_true',
+                        help='print all case groups with 1-based case indices, then exit')
     parser.add_argument(
-        '--case', nargs='+',
-        choices=['default', 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'all'],
-        default=['default'],
+        '--case', nargs='+', default=['default'], metavar='GROUP[:N]',
         help='default: 基线配置集（LightOp 源测试逐参数移植）；'
              'v1-v6: 按测试方向分组的测试集（见 _CASE_DESCRIPTIONS）；'
-             'all = default + v1..v6')
+             'all = default + v1..v6；'
+             'GROUP:N 只运行该组第 N 个 case（1-based，见 --list-cases）')
     args = parser.parse_args()
+
+    if args.list_cases:
+        _list_cases()
+        return
 
     torch.cuda.set_device(0)
     total_failed = 0
 
-    case_ids = (['default', 'v1', 'v2', 'v3', 'v4', 'v5', 'v6']
-                if 'all' in args.case else list(args.case))
+    case_ids = []
+    case_indices = {}
+    for token in args.case:
+        group, index = _parse_case_token(token)
+        if group == 'all':
+            if index is not None:
+                raise SystemExit(
+                    "error: --case all:N is ambiguous; select a single group")
+            groups = ['default', 'v1', 'v2', 'v3', 'v4', 'v5', 'v6']
+        else:
+            if group not in _CASE_DESCRIPTIONS:
+                raise SystemExit(
+                    f"error: unknown case group {group!r} "
+                    f"(valid: default, v1..v6, all)")
+            groups = [group]
+        for g in groups:
+            case_ids.append(g)
+            if index is not None:
+                case_indices[g] = index
 
     for case_id in case_ids:
+        sel = case_indices.get(case_id)
+        header = f'{case_id}:{sel}' if sel is not None else case_id
         print('=' * 72)
-        print(f'[CASE {case_id}] {_CASE_DESCRIPTIONS[case_id]}')
+        print(f'[CASE {header}] {_CASE_DESCRIPTIONS[case_id]}')
         print('=' * 72)
         if args.bench_only and case_id == 'v5':
             # 异常断言组在 --bench-only 下无正确性可跳。
             print('  skipped under --bench-only (exception case)')
             continue
         passed, failed, avg = run_case(case_id, bench_only=args.bench_only,
-                                       warmup=args.warmup, iters=args.iters)
+                                       warmup=args.warmup, iters=args.iters,
+                                       case_index=sel)
         if avg is not None:
             print(f"\n[CASE {case_id}] average speedup: {avg:.2f}x   "
                   f"correctness: {passed} passed, {failed} failed")

@@ -1413,3 +1413,74 @@ h, v_new = aiter.chunk_gated_delta_rule_fwd_sglang_hip_blockdim64(
    - 优先由 vLLM/SGLang 等上层准备并跨层复用；若缺失或为空，HIP wrapper 会在当次调用内补齐（内部 helper，不对外导出）。
 4. **Kernel 路径：** launcher 在 BV16 / BV32 间自动选择；当估计 BV32 block 数 `ceil(V/32) * N * H` 达到阈值（48 blocks，即 `V=128` 时约 `N * H >= 12`）时走 BV32，否则回退 BV16。
 5. **测试与源码：** 详见 `csrc/fla/README.md`；可运行 `op_tests/test_chunk_gated_hip_vllm.py` 与 `op_tests/test_chunk_gated_hip_sglang.py` 做数值对照。
+
+# 9. KVCache
+
+**KVCache** 节点收录分页注意力推理中的 KV cache 元数据类算子：在一次 kernel launch 内完成长度换算、前缀和与页表 gather 等轻量元数据准备，避免多 kernel 串联的 launch 开销与中间缓冲。
+
+## 9.1 fused_metadata 算子介绍
+
+### 功能描述
+
+面向分页注意力推理的 KV cache 元数据融合准备，单次 kernel launch 完成三步计算并可选生成 SWA（滑动窗口注意力）页表：
+
+```text
+cache_seqlens_int32[i] = seq_lens[i] + seq_len_delta
+cu_seqlens_k[0] = 0;  cu_seqlens_k[i+1] = Σ_{j<=i} cache_seqlens_int32[j]
+page_table[i, c] = req_to_token[req_pool_indices[i], c*page_size] >> log2(page_size)
+swa_page_table[i, c] = full_to_swa_mapping[req_to_token[req_pool_indices[i], c*page_size]] >> log2(page_size)   # 仅 use_swa=True
+```
+
+输出**原地写入**调用方缓冲，接口无返回值；前缀和在 int64 上累加后写回 int32。`page_table` / `swa_page_table` 覆盖每行全部 `max_seq_pages` 列（与各请求实际序列长度无关，有效页范围由调用方结合 `cache_seqlens_int32` 解释）。`page_size` 必须为 2 的幂，`page_size=1` 时为 token 级直拷；`B=0` 空批仅将 `cu_seqlens_k[0]` 置 0，不启动 kernel。接口用于推理，不提供反向计算；首次调用触发 `module_kvcache` 模块 JIT 编译。
+
+### 参数说明
+
+| 参数 | 类型/默认值 | 说明 |
+|---|---|---|
+| `seq_lens` | int32/int64 Tensor `[B]` | 每请求 KV 长度；支持非零行步长 |
+| `req_to_token` | int32 Tensor `[R, max_tokens]` | token 级映射表，第 r 行第 t 列为该请求第 t 个 token 的物理槽位；行/列步长任意 |
+| `req_pool_indices` | int32/int64 Tensor `[B]` | 每请求在 `req_to_token` 中的行号，取值 `[0, R)` |
+| `cache_seqlens_int32` | int32 Tensor `[B]`，连续 | 输出：`seq_lens + seq_len_delta` |
+| `cu_seqlens_k` | int32 Tensor `[B+1]`，连续 | 输出：专属前缀和，首项 0、末项为总 token 数 |
+| `page_table` | int32 Tensor `[B, P]`，连续 | 输出：每请求页表，第 c 页取 `req_to_token[pool, c*ps] >> log2(ps)`，覆盖全部 P 列 |
+| `swa_page_table` | 可选 int32 Tensor `[B, P]`，默认 `None` | 输出：SWA 页表；`use_swa=True` 时必填 |
+| `full_to_swa_mapping` | 可选 int32/int64 Tensor `[max_tokens]`，默认 `None` | full→SWA 槽位映射；`use_swa=True` 时必填 |
+| `B` / `max_seq_pages` | Python int，默认 0 | 批内请求数 / 每请求最大页数 P，非负且不超 int32 |
+| `page_size` | Python int，默认 1 | 页大小，必须为正的 2 的幂 |
+| `seq_len_delta` | Python int，默认 0 | 长度偏移，直接计入 `cache_seqlens_int32` |
+| `use_swa` | Python bool，默认 `False` | 是否同步生成 SWA 页表 |
+| 返回值 | `None` | 输出原地写入，无返回张量 |
+
+所有张量须在同一 GPU；输出必须为连续 int32；`seq_lens` / `req_pool_indices` / `full_to_swa_mapping` 接受 int32 或 int64（内部零拷贝分发）。接口完整校验 device / dtype / shape / contiguity 契约（违反抛 `RuntimeError`），但不校验 GPU 上的索引取值；调用方保证 `req_pool_indices` 落在 `[0, R)`、前缀总和不溢出 int32、`full_to_swa_mapping` 覆盖所引用槽位。
+
+### 调用示例
+
+```python
+import torch
+from aiter.ops.kvcache_metadata import fused_metadata_kernel_general
+
+device = "cuda:0"
+B, R, P, ps = 4, 8, 512, 16           # 请求数 / 池行数 / 每请求最大页数 / 页大小
+max_tokens = P * ps
+seq_lens = torch.tensor([8000, 4096, 16, 123], device=device, dtype=torch.int32)
+req_to_token = torch.arange(R * max_tokens, device=device,
+                            dtype=torch.int32).reshape(R, max_tokens)
+req_pool_indices = torch.arange(B, device=device, dtype=torch.int32)
+# 输出缓冲由调用方分配并保持存活；全部 int32 且连续。
+cache_seqlens_int32 = torch.empty(B, device=device, dtype=torch.int32)
+cu_seqlens_k = torch.empty(B + 1, device=device, dtype=torch.int32)
+page_table = torch.empty(B, P, device=device, dtype=torch.int32)
+with torch.inference_mode():
+    fused_metadata_kernel_general(
+        seq_lens, req_to_token, req_pool_indices,
+        cache_seqlens_int32, cu_seqlens_k, page_table,
+        B=B, max_seq_pages=P, page_size=ps,
+    )
+assert torch.equal(cu_seqlens_k, torch.tensor(
+    [0, 8000, 12096, 12112, 12235], device=device, dtype=torch.int32))
+# 第 i 行第 c 页 = req_to_token[req_pool_indices[i], c*ps] // ps；全部 P 列都会写入。
+row = req_to_token[req_pool_indices[0]]
+assert torch.equal(page_table[0], row[::ps] // ps)
+```
+
+实现采用同一算法的三个 tile 变体（2048/1024/256）在宿主侧按 workgroup 数路由，2D grid 并行 gather，分级前缀和扫描；无 gfx 特化分支，各支持架构通用。完整参数约束、SWA / Graph 说明与 AITER / LightOp / Triton 三方性能对比见 [fused_metadata 算子说明与性能报告](docs/fused_metadata.md)。
