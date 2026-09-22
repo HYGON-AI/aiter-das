@@ -9,6 +9,15 @@ S1/S64 页、负权重、非正规数、非对齐视图、随机共享页和 Gra
 --bench 是已有的预分配 Graph 基准，功能正确性应先通过再测性能。
 
 From repository root:
+  # HY4 verification: 16 requests x 4 queries, flattened Q=[64,1,32,128].
+  # N/M presets: 4096/8192, 46080/46080, 87040/87040; page64, no DCP scaling.
+  python -B op_tests/test_paged_mqa_logits.py --hy4
+  python -B op_tests/test_paged_mqa_logits.py --hy4 --bench --json-out hy4_aiter.json
+  # Optional original dense API and the same TopK2048 for both implementations:
+  python -B op_tests/test_paged_mqa_logits.py --hy4 --bench --compare-original --with-topk --json-out hy4_compare.json
+  python -B op_tests/test_paged_mqa_logits.py --hy4 --bench --hy4-kv-lens 46080 87040
+  python -B -m pytest -q op_tests/test_paged_mqa_logits.py -k TestPagedMQAHY4
+
   python -B op_tests/test_paged_mqa_logits.py
   python -B op_tests/test_paged_mqa_logits.py --backend baseline --json-out results.json
   python -B op_tests/test_paged_mqa_logits.py --backend opus --kernel-id 1 --json-out opus.json
@@ -34,7 +43,19 @@ Pytest runs all applicable cases from this file: gfx936/gfx938 use
 TestPagedMQAHCU for ID6/7, S1/S64, sharing fallback, FP8 limits, offset
 storage and graph replay. Public API checks also run on both architectures.
 gfx946 runs the CPU-reference matrix for Auto/ID4/ID5; HCU-only cases skip.
-All timing is a preallocated GPU Graph sequence including required cleanup.
+The existing --bench mode uses preallocated output. --hy4 --bench instead
+times default-output-allocation public APIs via Graph replay, seven rounds,
+five paired sampling blocks and 20 calls/graph by default. It reports logical
+bytes/latency, not measured HBM traffic. --with-topk includes producer+TopK;
+metadata preparation and the final framework output copy are excluded on both
+sides. AITER clean_logits=True; original dense clean_logits=False. The optional
+original provider (default lightop.attention) must expose paged_mqa_logits and,
+with --with-topk, fast_topk_transform_fused. --original-module selects another
+importable provider; its path/source hash is recorded. No sparse-mask route is
+used. Different requests have disjoint pages; the four queries of one request
+share its page table with lengths N-3,N-2,N-1,N. B=64 here counts interface
+rows, not 64 independent business requests. HY4 inputs use normal FP8 and zero
+to match the comparison's numerical domain; existing tests cover subnormals.
 
 Triton compatibility is owned by utility/paged_mqa_logits/paged_mqa_logits_triton_baseline.py.
 """
@@ -43,6 +64,7 @@ import argparse
 import importlib
 import hashlib
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 import statistics
@@ -463,6 +485,260 @@ def _skip_unless_hcu():
         pytest.skip("ID6/7 and S64 regression requires gfx936/gfx938")
 
 
+HY4_CASES = {4096: 8192, 46080: 46080, 87040: 87040}
+
+
+def _make_hy4_case(kv_len, max_len, requests=16):
+    """R1 ABI, four causal rows per request, disjoint request-owned S64 pages."""
+    if not (4 <= kv_len <= max_len and max_len % 64 == 0 and requests > 0):
+        raise ValueError("HY4 requires 4<=kv_len<=max_len, page64 capacity, requests>0")
+    torch.manual_seed(20260921 + kv_len)
+    width, rows = max_len // 64, requests * 4
+    pages = requests * width
+    request_table = torch.randperm(pages, device="cuda", dtype=torch.int32).reshape(requests, width)
+    cache = torch.zeros((pages, 64, 1, 132), device="cuda", dtype=torch.uint8)
+    keys = (torch.randn(pages, 64, 128, device="cuda") * 0.25).to(torch.float8_e4m3fn)
+    key_bytes = keys.view(torch.uint8)
+    key_bytes.masked_fill_((key_bytes & 0x7f) < 8, 0)
+    scales = torch.exp2(torch.rand(pages, 64, device="cuda") * 4 - 2)
+    packed = torch.empty((pages, 64 * 132), device="cuda", dtype=torch.uint8)
+    packed[:, :8192] = key_bytes.reshape(pages, 8192)
+    packed[:, 8192:] = scales.view(torch.uint8).reshape(pages, 256)
+    cache.reshape(pages, -1)[request_table.reshape(-1).long()] = packed
+    q = (torch.randn(rows, 1, 32, 128, device="cuda") * 0.25).to(torch.float8_e4m3fn)
+    q_bytes = q.view(torch.uint8)
+    q_bytes.masked_fill_((q_bytes & 0x7f) < 8, 0)
+    weights = torch.randn(rows, 32, device="cuda")
+    weights[:, ::7] = 0
+    lengths = torch.tensor(list(range(kv_len - 3, kv_len + 1)) * requests,
+                           dtype=torch.int32, device="cuda")
+    tables = request_table.repeat_interleave(4, dim=0).contiguous()
+    return q, cache, weights, lengths, tables, max_len
+
+
+def _hy4_reference(args):
+    """Independent page-byte decoding and chunked FP32 reference for the R1 ABI."""
+    q, cache, weights, lengths, tables, max_len = args
+    pages = cache.shape[0]
+    raw = cache.reshape(pages, 8448)
+    keys = raw[:, :8192].view(torch.float8_e4m3fn).reshape(pages, 64, 128)
+    scales = raw[:, 8192:].contiguous().view(torch.float32)
+    ref = torch.full((q.shape[0], max_len), -float("inf"), device=q.device)
+    valid = torch.zeros_like(ref, dtype=torch.bool)
+    for row, length in enumerate(lengths.cpu().tolist()):
+        for start in range(0, length, 8192):
+            end = min(length, start + 8192)
+            positions = torch.arange(start, end, device=q.device)
+            physical, offset = tables[row, positions // 64].long(), positions % 64
+            key = keys[physical, offset].float() * scales[physical, offset, None]
+            scores = q[row, 0].float() @ key.T
+            ref[row, start:end] = (scores.relu() * weights[row, :, None]).sum(dim=0)
+        valid[row, :length] = True
+    return ref, valid
+
+
+def _hy4_stats(samples):
+    return {"median_us": statistics.median(samples), "samples_us": samples,
+            "cv_percent": statistics.pstdev(samples) / statistics.mean(samples) * 100}
+
+
+def _hy4_measure(functions, checkers, rounds, blocks, calls):
+    """Public-API Graph timing; retain every output and all extended samples."""
+    graphs, outputs, checks = {}, {}, {}
+    for name, fn in functions.items():
+        checks[name] = {"eager": checkers[name](fn())}
+        for _ in range(5):
+            fn()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            retained = [fn() for _ in range(calls)]
+        for _ in range(5):
+            graph.replay()
+        torch.cuda.synchronize()
+        checks[name]["graph"] = checkers[name](retained[-1])
+        graphs[name], outputs[name] = graph, retained
+    begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+
+    def sample(name):
+        begin.record()
+        graphs[name].replay()
+        end.record()
+        end.synchronize()
+        return begin.elapsed_time(end) * 1000 / calls
+
+    measurements = {name: [] for name in functions}
+    for round_id in range(rounds):
+        order = list(functions)
+        if round_id % 2:
+            order.reverse()
+        order += list(reversed(order))
+        for _ in range(3):
+            for name in order:
+                sample(name)
+        samples = {name: [] for name in functions}
+        for _ in range(blocks):
+            for name in order:
+                samples[name].append(sample(name))
+        primary = {name: _hy4_stats(values.copy()) for name, values in samples.items()}
+        extended = any(value["cv_percent"] > 5 for value in primary.values())
+        if extended:
+            for _ in range(blocks):
+                for name in order:
+                    samples[name].append(sample(name))
+        for name in functions:
+            measurements[name].append({"round": round_id, "extended": extended,
+                                       "primary": primary[name], **_hy4_stats(samples[name])})
+    summary = {}
+    for name, fn in functions.items():
+        checks[name]["post_eager"] = checkers[name](fn())
+        graphs[name].replay()
+        torch.cuda.synchronize()
+        checks[name]["post_graph"] = checkers[name](outputs[name][-1])
+        stats = _hy4_stats([item["median_us"] for item in measurements[name]])
+        max_cv = max(stats["cv_percent"], *(item["cv_percent"] for item in measurements[name]))
+        summary[name] = {**stats, "rounds": measurements[name],
+                         "max_cv_percent": max_cv, "stable": max_cv <= 5}
+    return summary, checks
+
+
+def _hy4_topk_check(indices, ref, lengths):
+    ids = indices.long()
+    assert indices.dtype == torch.int32 and ids.shape == (ref.shape[0], 2048)
+    assert bool(((ids >= 0) & (ids < lengths[:, None])).all()), "TopK index out of range"
+    sorted_ids = ids.sort(dim=1).values
+    assert bool((sorted_ids[:, 1:] > sorted_ids[:, :-1]).all()), "duplicate TopK index"
+    expected = ref.topk(2048, dim=1)
+    cutoff = expected.values[:, -1:]
+    selected = ref.gather(1, ids)
+    assert bool((selected >= cutoff - (0.05 + 0.05 * cutoff.abs())).all()), "TopK threshold mismatch"
+    present = torch.zeros_like(ref, dtype=torch.bool).scatter_(1, expected.indices, True)
+    return {"topk_overlap_percent": present.gather(1, ids).float().mean().item() * 100}
+
+
+def _hy4_contract(args, kv_len):
+    q, cache, weights, lengths, tables, max_len = args
+    requests = q.shape[0] // 4
+    visits = requests * (4 * kv_len - 6)
+    bytes_read = q.numel() + weights.numel() * 4 + requests * kv_len * 132
+    bytes_written = q.shape[0] * max_len * 4
+    tensors = {name: {"shape": list(t.shape), "dtype": str(t.dtype),
+                      "stride": list(t.stride()), "contiguous": t.is_contiguous(),
+                      "sha256": hashlib.sha256(t.view(torch.uint8).cpu().numpy().tobytes()).hexdigest()}
+               for name, t in zip(("q", "kv_cache", "weights", "context_lens", "block_tables"), args[:5])}
+    return {"business_requests": requests, "queries_per_request": 4, "total_queries": q.shape[0],
+            "interface_B": q.shape[0], "interface_R": 1, "H": 32, "D": 128,
+            "page_size": 64, "P": cache.shape[0], "T": tables.shape[1], "kv_len": kv_len,
+            "max_model_len": max_len, "dcp_size": 1, "tensors": tensors,
+            "context_lens": lengths.cpu().tolist(), "block_tables": tables.cpu().tolist(),
+            "output_shape": [q.shape[0], max_len], "seed": 20260921 + kv_len,
+            "bytes_read": bytes_read, "bytes_written": bytes_written,
+            "total_bytes": bytes_read + bytes_written, "tensor_flops": 2 * 32 * 128 * visits,
+            "query_visit_bytes_read": q.numel() + weights.numel() * 4 + visits * 132,
+            "physical_cache_bytes": cache.numel(), "metadata_bytes": lengths.numel() * 4 + tables.numel() * 4}
+
+
+def run_hy4(opts):
+    from aiter import paged_mqa_logits
+    import aiter
+    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    if arch not in ("gfx936", "gfx938"):
+        raise RuntimeError("HY4 page64 cases require gfx936/gfx938")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    if opts.with_topk:
+        os.environ.setdefault("SGL_USE_LIGHTOP_TOPK_BACKEND", "0")
+    original = importlib.import_module(opts.original_module) if opts.compare_original else None
+    if original is not None and not callable(getattr(original, "paged_mqa_logits", None)):
+        raise RuntimeError("original provider must expose paged_mqa_logits")
+    if opts.with_topk and not callable(getattr(original, "fast_topk_transform_fused", None)):
+        raise RuntimeError("original provider must expose fast_topk_transform_fused")
+    def provenance(module):
+        path = Path(module.__file__).resolve()
+        return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    result = {"finished": False, "gpu": str(torch.cuda.get_device_properties(0)), "arch": arch,
+              "torch": str(torch.__version__), "hip": torch.version.hip,
+              "source": {"aiter": provenance(aiter), "test": provenance(sys.modules[__name__])},
+              "method": {"mode": "graph" if opts.bench else "correctness", "rounds": opts.rounds,
+                         "blocks": opts.blocks, "calls": opts.calls, "max_cv_percent": 5,
+                         "out": None, "aiter_clean_logits": True, "original_clean_logits": False,
+                         "kernel_id": opts.kernel_id, "original_schedule_metadata": None,
+                         "original_is_prefill": False, "input_domain": "normal_fp8_and_zero",
+                         "topk_backend": os.environ.get("SGL_USE_LIGHTOP_TOPK_BACKEND") if opts.with_topk else None,
+                         "scope": "logits; optional logits+same dense TopK; metadata and final framework copy excluded"},
+              "records": []}
+    if original is not None:
+        result["source"]["original"] = provenance(original)
+    opts.json_out.parent.mkdir(parents=True, exist_ok=True)
+    for kv_len in opts.hy4_kv_lens:
+        args = _make_hy4_case(kv_len, HY4_CASES[kv_len])
+        ref, valid = _hy4_reference(args)
+        contract = _hy4_contract(args, kv_len)
+        functions = {"aiter_logits": lambda: paged_mqa_logits(*args, out=None, clean_logits=True,
+                                                              kernelId=opts.kernel_id)}
+        if original is not None:
+            functions["original_logits"] = lambda: original.paged_mqa_logits(*args[:5], None, args[5], False, False)
+        checkers = {name: lambda out: check_output(out, ref, valid) for name in functions}
+        if opts.with_topk:
+            rows, max_len = ref.shape
+            identity = torch.arange(max_len, dtype=torch.int32, device="cuda").repeat(rows, 1)
+            cu = torch.arange(rows + 1, dtype=torch.int32, device="cuda")
+            topk = lambda logits: original.fast_topk_transform_fused(
+                score=logits, lengths=args[3], page_table_size_1=identity,
+                cu_seqlens_q=cu, topk=2048, row_starts=None)
+            for name, producer in list(functions.items()):
+                pair_name = name.replace("_logits", "_logits_topk")
+                functions[pair_name] = lambda producer=producer: topk(producer())
+                checkers[pair_name] = lambda ids: _hy4_topk_check(ids, ref, args[3])
+            contract["topk"] = {"k": 2048, "lengths_shape": [rows], "lengths_dtype": "int32",
+                                "identity_table_shape": [rows, max_len], "identity_table_dtype": "int32",
+                                "cu_seqlens_q": list(range(rows + 1)), "cu_seqlens_q_dtype": "int32",
+                                "row_starts": None, "output_shape": [rows, 2048], "output_dtype": "int32"}
+        record = {"parameters": contract}
+        if opts.bench:
+            record["timings"], record["checks"] = _hy4_measure(functions, checkers, opts.rounds, opts.blocks, opts.calls)
+            for name, timing in record["timings"].items():
+                if name.endswith("_logits"):
+                    timing["logical_bandwidth_GBps"] = contract["total_bytes"] / timing["median_us"] / 1e3
+                    timing["tensor_TFLOPS"] = contract["tensor_flops"] / timing["median_us"] / 1e6
+                print(f"HY4 N={kv_len} M={args[5]} Q={list(args[0].shape)} {name} "
+                      f"{timing['median_us']:.3f} us max_CV={timing['max_cv_percent']:.3f}% "
+                      f"{'OK' if timing['stable'] else 'NOISY'}", flush=True)
+        else:
+            record["checks"] = {name: checker(functions[name]()) for name, checker in checkers.items()}
+            print(f"HY4 N={kv_len} M={args[5]} Q={list(args[0].shape)} PASS", flush=True)
+        result["records"].append(record)
+        opts.json_out.write_text(json.dumps(result, indent=2))
+    result["finished"] = True
+    opts.json_out.write_text(json.dumps(result, indent=2))
+
+
+class TestPagedMQAHY4:
+    @pytest.mark.parametrize("kv_len", [67, 128, 193])
+    def test_flattened_mtp_equivalence(self, kv_len):
+        """R1 retains R4 causal boundaries and never shares pages across requests."""
+        _skip_unless_hcu()
+        from aiter import paged_mqa_logits
+        torch.backends.cuda.matmul.allow_tf32 = False
+        args = _make_hy4_case(kv_len, (kv_len + 127) // 64 * 64, requests=2)
+        q, cache, weights, lengths, tables, max_len = args
+        owned = tables[::4]
+        assert torch.unique(owned).numel() == owned.numel()
+        assert torch.equal(tables, owned.repeat_interleave(4, dim=0))
+        assert lengths.cpu().tolist() == list(range(kv_len - 3, kv_len + 1)) * 2
+        ref, valid = _hy4_reference(args)
+        grouped = (q.reshape(2, 4, 32, 128), cache, weights,
+                   lengths.reshape(2, 4)[:, -1].contiguous(), owned.contiguous(), max_len)
+        for case in (args, grouped):
+            check_output(paged_mqa_logits(*case, clean_logits=True), ref, valid)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = paged_mqa_logits(*args, clean_logits=True)
+        graph.replay()
+        torch.cuda.synchronize()
+        check_output(out, ref, valid)
+
+
 def _make_hcu_paged_case(b,r,h,n,s,*,shared=False,offset=False):
     capacity=(n+63)//64*64 if s==64 else n
     args=list(make_case(b,r,h,capacity,seed=20260914+n, lengths=[n]*b if shared else None))
@@ -680,19 +956,38 @@ if __name__ == "__main__":
     parser.add_argument("--bench", action="store_true")
     parser.add_argument("--shape-set", choices=("smoke", "models"), default="smoke",
                         help="benchmark matrix: smoke (default) or model indexer shapes with independent per-request KV pages")
-    parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--blocks", type=int, default=15)
+    parser.add_argument("--hy4", action="store_true", help="HY4 MTP3 verification, same flattened R1 ABI for both implementations")
+    parser.add_argument("--hy4-kv-lens", type=int, nargs="+", choices=tuple(HY4_CASES), default=list(HY4_CASES))
+    parser.add_argument("--compare-original", action="store_true", help="also run the optional original dense provider")
+    parser.add_argument("--original-module", default="lightop.attention", help="importable original API provider")
+    parser.add_argument("--with-topk", action="store_true", help="also measure each producer + the same original dense TopK2048")
+    parser.add_argument("--rounds", type=int, default=None, help="default: 7 for HY4, 3 otherwise")
+    parser.add_argument("--blocks", type=int, default=None, help="default: 5 for HY4, 15 otherwise")
     parser.add_argument("--calls", type=int, default=20)
     parser.add_argument("--kernel-id", type=int, default=None)
     opts = parser.parse_args()
+    if opts.rounds is None:
+        opts.rounds = 7 if opts.hy4 else 3
+    if opts.blocks is None:
+        opts.blocks = 5 if opts.hy4 else 15
+    if min(opts.rounds, opts.blocks, opts.calls) < 1:
+        parser.error("--rounds, --blocks and --calls must be positive")
+    if (opts.compare_original or opts.with_topk) and not opts.hy4:
+        parser.error("--compare-original and --with-topk require --hy4")
+    if opts.with_topk and not opts.compare_original:
+        parser.error("--with-topk requires --compare-original")
+    if opts.hy4 and (opts.cpu_reference or opts.api_only or opts.backend != "opus" or opts.shape_set != "smoke"):
+        parser.error("--hy4 cannot be combined with other case sets/reference modes")
     if opts.cpu_graph and not opts.cpu_reference:
         parser.error("--cpu-graph requires --cpu-reference")
     if opts.json_out is None:
-        mode = "benchmark" if opts.bench else "api" if opts.api_only else f"{opts.backend}_correctness"
+        mode = "hy4" if opts.hy4 else "benchmark" if opts.bench else "api" if opts.api_only else f"{opts.backend}_correctness"
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         opts.json_out = Path(__file__).resolve().parents[1]/"hygon_tmp"/"paged_mqa_logits"/f"{mode}_{stamp}.json"
     print(f"JSON_OUT={opts.json_out.resolve()}", flush=True)
-    if opts.cpu_reference:
+    if opts.hy4:
+        run_hy4(opts)
+    elif opts.cpu_reference:
         if opts.bench or opts.api_only or opts.backend != "opus":
             parser.error("--cpu-reference requires Opus correctness mode")
         from op_tests.utility.paged_mqa_logits.cpu_reference import run_cpu_reference

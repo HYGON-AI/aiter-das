@@ -5,27 +5,29 @@ Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 # paged_mqa_logits 算子说明与性能报告
 
-`aiter.paged_mqa_logits` 面向分页 KV cache 的稀疏注意力索引阶段，计算 FP8 Query 与共享 Key 的加权 ReLU 分数。本报告比较 AITER 公开接口与固定版本的 **original 实现**；original 是本次性能测试的对照实现，不是 AITER 的旧 kernelId。
+`aiter.paged_mqa_logits` 面向分页 KV cache 的稀疏注意力索引阶段，计算 FP8 Query 与其页表所指向 Key 的加权 ReLU 分数。
 
-测试日期为 **2026-09-17**，文档整理日期为 **2026-09-18**。gfx936、gfx938 各测试 32 个 shape / 页布局组合，共 64 个 case。按 ±2% 持平区间，gfx936 的 Graph / eager 均为 32 项领先；gfx938 的 Graph 为 31 项领先、1 项持平，eager 为 32 项领先。完整数据和适用范围见下文。
+原有模型矩阵测试日期为 **2026-09-17**；**2026-09-22** 补充整理 HY4 验证调用的参数与结果，见独立的 HY4 小节。原有矩阵在 gfx936、gfx938 各测试 32 个 shape / 页布局组合，共 64 个 case。按 ±2% 持平区间，gfx936 的 Graph / eager 均为 32 项领先；gfx938 的 Graph 为 31 项领先、1 项持平，eager 为 32 项领先。完整数据和适用范围见下文。
 
 ## 算子功能
 
-对每个请求的每个 Query，算子通过页表找到历史 Key，依次完成 QK 点积、ReLU、按 head 加权求和，输出用于候选 token 排序的分数。所有 head 共享同一份 Key；本接口不执行 softmax、Value 聚合或 TopK 选择，也不隐式乘以 `1/sqrt(D)`。
+对每个请求的每个 Query，算子通过页表找到历史 Key，依次完成 QK 点积、ReLU、按 head 加权求和，输出用于候选 token 排序的分数。同一个 Query 的所有索引 head 使用同一组 Key；本接口不执行 softmax、Value 聚合或 TopK 选择，也不隐式乘以 `1/sqrt(D)`。
+
+本文的“请求间 KV 独立”指不同业务请求使用不重叠的有效物理页，不会因 batch 中有多个请求而自动复用 KV。同一请求的多个 MTP Query 仍访问该请求的同一份 cache，但各自的因果可见长度不同。上述“索引 head 共用 Key”“同一请求内多 Query 使用同一份 KV”和“不同请求之间共享物理页”是三个不同概念。算子通过 `block_tables` 接受这些布局，不能仅根据 Q 的 B/R 形状判断是否发生跨请求共享。
 
 记：
 
 | 符号 | 含义 |
 |---|---|
-| `B` | 请求数 / batch size |
-| `R` | 每个请求的 Query 数，支持 1、2、4；多 Query 可用于 MTP 场景 |
+| `B` | 接口 batch 维度；未展开时可对应业务请求数，MTP 展平后可对应 Query 行数，不能仅凭 B 推断业务请求数 |
+| `R` | 每个接口 batch 项的 Query 数，支持 1、2、4；同一项内使用相同页表、不同因果可见长度 |
 | `H` | 当前 rank 的索引 head 数，支持 32、64 |
 | `D` | 每个 head 的特征维度，固定为 128 |
 | `N` | 输出候选列数，即 `max_model_len` |
 | `P` | KV cache 中分配的物理页数 |
 | `S` | 每页容纳的 Key 数，即 page size |
-| `T` | 每个请求的页表容量，最多覆盖 `T*S` 个候选 |
-| `L_b` | 请求 `b` 的有效上下文长度，即 `context_lens[b]` |
+| `T` | 每个接口 batch 项的页表容量，最多覆盖 `T*S` 个候选 |
+| `L_b` | 接口 batch 项 `b` 的末尾有效长度，即 `context_lens[b]` |
 
 对于逻辑候选位置 `n`，物理页为 `p = block_tables[b, n // S]`，页内位置为 `j = n % S`。将 FP8 字节解码后的 Key 记为 `K[p,j,d]`，对应 FP32 反量化系数记为 `s[p,j]`，则：
 
@@ -65,13 +67,13 @@ logits = paged_mqa_logits(
 | `q` | `torch.float8_e4m3fn [B,R,H,128]` | 已量化的 Query；`B>0`、`B*R<=65535`、`R∈{1,2,4}`、`H∈{32,64}` |
 | `kv_cache` | `torch.uint8 [P,S,1,132]` | 打包的 FP8 Key 与 FP32 scale；`P>0`、`P*S*132<=2**31-1`；实际字节布局见下一节 |
 | `weights` | `torch.float32 [B*R,H]` | 每个 Query、每个 head 的权重；允许正数、负数和零 |
-| `context_lens` | `torch.int32 [B]` | 每个请求的有效长度；调用方保证 `R<=L_b<=min(N,T*S)` |
+| `context_lens` | `torch.int32 [B]` | 每个接口 batch 项的末尾有效长度；调用方保证 `R<=L_b<=min(N,T*S)` |
 | `block_tables` | `torch.int32 [B,T]` | 逻辑页到物理页的映射；`0<T<2**31`；所有被使用的物理页编号必须位于 `[0,P)` |
 | `max_model_len` | Python `int` | 输出宽度 `N`；`0<N<2**31`，不接受 `bool` |
 | `out` | 可选 `torch.float32 [B*R,N]` | 默认由接口分配；传入时复用并返回该张量，不得与任一输入共享底层 storage |
 | `clean_logits` | Python `bool`，默认 `True` | 是否要求无效输出全部为 `-inf`；设为 `False` 时，由调用方负责尾部初始化或屏蔽，不能依赖所有 kernel 对无效位置的写入行为 |
 | `kernelId` | 可选 Python `int` | 默认自动选择架构对应路径；显式可选值见架构支持表 |
-| 返回值 | `torch.float32 [B*R,N]` | 第 `b*R+r` 行对应请求 `b` 的第 `r` 个 Query |
+| 返回值 | `torch.float32 [B*R,N]` | 第 `b*R+r` 行对应接口 batch 项 `b` 的第 `r` 个 Query |
 
 所有输入和 `out` 必须位于同一 GPU、连续存储且不需要梯度。Q 和 KV cache 的起始地址至少 4 字节对齐；通常由 `torch.empty` 等分配的张量也满足优化路径所需的 16 字节对齐。接口用于推理，不提供 autograd。
 
@@ -96,8 +98,8 @@ logits = paged_mqa_logits(
 | gfx938 | 1、64 | ID6 / ID7 | 0、1、2、3、6、7 | 实卡功能与本报告的性能矩阵；ID0–3 仅支持 `S=1` |
 | gfx946 | 1 | ID4 | 4、5 | Perf Model 功能验证；无实卡性能结论 |
 
-- **ID6**：独立请求的 HCU 分页计算路径，支持 `H=32/64`、`R=1/2/4`。
-- **ID7**：`H=32、R=1` 的双请求 Key 复用路径，每次调用在 GPU 检查所用页编号及长度；不匹配的组、未配对的请求按独立请求计算。
+- **ID6**：按接口 batch 项及页表计算的 HCU 通用路径，不要求不同项共享物理页，支持 `H=32/64`、`R=1/2/4`。
+- **ID7**：`H=32、R=1` 的双 Query 行 Key 复用路径，每次调用在 GPU 检查所用页编号及长度；不匹配或未配对的行分别计算。两个接口 batch 行可能来自同一个业务请求，不表示要求两个不同请求共享 KV。
 - **自动选择**：满足 `H=32、R=1、B>=32、P*S<=2*N`，且 gfx936 的 `N>=4096` 或 gfx938 的 `N>=16384` 时选择 ID7；其余选择 ID6。页表仍会在 GPU 上检查，不会仅凭容量判定可共享。
 - gfx938 的 **ID0–3** 保留为显式 Opus 路径；本报告的 AITER 性能列使用默认 ID6/7，不能将该性能结论套用到 ID0–3。
 - gfx946 的 **ID4/5** 分别使用 K32 / K64 prefetch 路径。当前支持范围仍为 `S=1`，不支持直接运行本报告的 `S=64` 性能矩阵。
@@ -199,7 +201,7 @@ python -B op_tests/test_paged_mqa_logits.py --cpu-reference --kernel-id 4
 
 现有测试文件的 `--bench` 是预分配输出的 Graph 基准，包含与 Triton baseline 的比较；它与本文使用默认分配公开接口、对比 original 的 A/B 口径不同，不能直接混用结果。
 
-## 测试环境与口径
+## 原有模型矩阵：测试环境与口径（2026-09-17）
 
 | 项目 | gfx936 | gfx938 |
 |---|---|---|
@@ -222,8 +224,8 @@ python -B op_tests/test_paged_mqa_logits.py --cpu-reference --kernel-id 4
 
 - 每个架构包含 **22 个模型典型 shape + 4 个 MTP shape + 6 个共享页 shape**。模型 shape 是合成的算子测试负载，不是线上请求回放。
 - `H=32` 使用 GLM-5.1 的 rank-local 索引 head 数，不再按 TP 除以 head 数。`H=64` 使用已有 DeepSeek-V4-Flash C4 候选配置；这里的 `N` 是 C4 后的候选数，不是压缩前上下文长度，也不是 TopK 的 `k`。
-- **独立页**共 26 项：`P=B*ceil(N/64)`，每个请求在自己的物理页区间内做无放回随机页映射，不同请求互不重叠。
-- **共享页**共 6 项：`P=ceil(N/64)`，所有请求使用同一份随机排列页表。此组体现完全共享 Key 的复用收益，应与独立页分开理解。
+- **请求间独立页**共 26 项：本矩阵未展平，`B` 等于业务请求数，`P=B*ceil(N/64)`；每个请求在自己的物理页区间内做无放回随机页映射，不同请求互不重叠。`R=2` 的两个 Query 仍使用本请求的同一份 KV，独立并不表示每个 Query 复制一份 KV。
+- **请求间完全共享页**共 6 项：`P=ceil(N/64)`，所有请求使用同一份随机排列页表。这是单独构造的复用场景，不代表普通 decode 的请求间 KV 关系，也不同于同一请求内 MTP Query 复用 KV；不能将此组收益用于请求间独立页的性能结论。
 - 性能输入的 `context_lens` 全为 `N`；`R=2` 时，第 0 个 Query 的最后一列按因果可见性屏蔽。更短上下文及远端尾部由功能测试另行覆盖。
 - Q/K 由 `randn*0.25` 转为 FP8，性能输入中的非正规数统一在生成阶段置零；scale 取 `2**U(-2,2)`，weights 包含正数、负数及零。两种实现使用完全相同的输入张量。
 
@@ -405,18 +407,139 @@ Graph 中唯一持平项为独立页 `B16/R1/H32/N4096`；其延迟虽略低于 
 
 ## 优化路径与结果适用范围
 
-gfx936 在大部分独立 S64 页路径中将 Key 直接加载到寄存器并精确转换为 FP16，减少整块 KV 转换缓冲的开销；小缓存或高复用缓存保留向量化预转换。gfx938 对 16 字节对齐的 S64 数据使用 MLS / DS Matrix 与原生 FP8 MMAC，并根据工作量选择不同候选 tile。共享页路径通过逐次检查的双请求 Key 复用减少重复读取。公开接口同时合并了默认分配路径的元数据检查和 native 调用。
+gfx936 在大部分独立 S64 页路径中将 Key 直接加载到寄存器并精确转换为 FP16，减少整块 KV 转换缓冲的开销；小缓存或高复用缓存保留向量化预转换。gfx938 对 16 字节对齐的 S64 数据使用 MLS / DS Matrix 与原生 FP8 MMAC，并根据工作量选择不同候选 tile。共享页路径通过逐次检查两个 Query 行的页表及长度来复用 Key、减少重复读取。公开接口同时合并了默认分配路径的元数据检查和 native 调用。
 
-这些优化的效果已包含在完整公开 API 的 Graph / eager 数据中。预分配 `out`、非默认 kernelId、S1 页、4 字节偏移视图等虽然有对应功能覆盖，但不应直接套用本报告的 S64 默认接口延迟。R=4 通过功能测试，本文性能矩阵仅含 R=1/2。
+这些优化的效果已包含在完整公开 API 的 Graph / eager 数据中。预分配 `out`、非默认 kernelId、S1 页、4 字节偏移视图等虽然有对应功能覆盖，但不应直接套用本报告的 S64 默认接口延迟。R=4 通过功能测试；2026-09-17 的模型性能矩阵仅含 R=1/2，后文 HY4 主对比统一使用展平的 R=1，并单列 R=4 等价控制。
 
 结果限定于所列设备、软件版本、输入分布和 shape；未测试 vLLM 端到端吞吐、其他数据类型、其他 head/page size 或 original 的额外 prefill / 调度元数据模式。gfx946 仅完成 Perf Model 功能验证，不能据此推导实卡性能。
+
+## HY4 验证调用：相同 R=1 接口的对照（2026-09-21/22）
+
+本节整理此前实际测得的 HY4 验证调用结果，不是整模型吞吐或请求延迟。只测试 MTP3 的验证调用：16 个业务请求、每个请求 4 个 Query，共 64 个 Query；不包含草稿调用。AITER 和 original **均传入 `[64,1,32,128]`**，original 使用 dense logits 路径。请求间有效 KV 页独立，每个请求展开后的四行页表相同；这里的接口 `B=64` 不等于 64 份独立请求 KV。
+
+### 环境、计时与数值范围
+
+| 项目 | 本节配置 |
+|---|---|
+| GPU | GPU2，gfx938，64 CU |
+| PyTorch / HIP | 2.10.0 / 6.3.26113 |
+| 短 KV / 长 KV 测试日期 | 2026-09-21 / 2026-09-22 |
+| AITER 测量源码快照 | `fc4b0f172521aa7c68d7d2fadef6b3cd6d601bdd`；不把此表标作最新 checkout 的重新测量 |
+| 采样 | 同卡同进程相同输入；CUDA Graph 每次捕获 20 次调用，7 轮、每轮 5 个正反序采样块；CV>5% 追加同量样本，保留原始样本 |
+| 表中延迟 | 各轮中位数的中位数；所有所列 Graph 记录通过稳定性检查 |
+| 输出分配 | 两端均调用默认输出分配接口；Graph 回放计入其设备工作，不重新执行 Python 分配/检查 |
+| 数值输入 | Q/K 为 `randn*0.25` 转 FP8 后将非正规数置零；scale 为 `exp2(U(-2,2))`；FP32 weights 含正负数和零，每 7 个 head 置零 |
+| 随机种子 / 页映射 | `20260921 + L`；物理页随机无放回分配给 16 个请求，每组页表重复 4 行 |
+| 正确性 | 两端均通过独立 FP32 参考、eager/Graph/计时后检查；原记录 TopK 与参考集合重合率 100%，不承诺所有输入逐位一致 |
+
+`L` 表示每个业务请求最后一个 Query 的 KV 长度；`M` 表示输出宽度 `max_model_len`（对应前文符号 N）。短 KV 使用 L=4096、M=8192；长 KV 将 M 扩展到 L。DCP=1，不做 KV/4 或 Q×4，不包含通信。
+
+### 完整参数
+
+| 参数 | AITER | original dense |
+|---|---|---|
+| 业务请求数 / MTP | 16 / MTP3，每请求4个验证Query | 相同 |
+| 接口 B / R / H / D | 64 / 1 / 32 / 128 | 相同 |
+| `q` | FP8 E4M3FN `[64,1,32,128]`，stride=`[4096,4096,128,1]` | 同一输入张量 |
+| `kv_cache` | uint8 `[P,64,1,132]`，stride=`[8448,132,132,1]` | 同一输入张量 |
+| 页大小 / KV head 数 | 64 / 1 | 相同 |
+| K / scale 页内布局 | 每页先8192字节FP8 K，再256字节FP32 scale；无独立k_scale参数 | 相同 |
+| `weights` | FP32 `[64,32]`，stride=`[32,1]`；接口无单独Q scale参数 | 同一输入张量 |
+| `context_lens` | int32 `[64]`，stride=`[1]`；`[L-3,L-2,L-1,L]` 重复16组 | 同一输入张量 |
+| `block_tables` | int32 `[64,T]`，stride=`[T,1]`；同一请求四行相同，不同请求有效页不重叠 | 同一输入张量 |
+| 连续性 / 梯度 / 对齐 | 所有输入连续、不需要梯度；Q/cache正常分配，至少16字节对齐 | 相同 |
+| `max_model_len` / 返回值 | M / FP32 `[64,M]` | 相同 |
+| `out` | `None`，接口分配 | 接口分配 |
+| `clean_logits` | `True` | `False`；所测版本仍写入无效尾部，检查其为`-inf`，不推广为其他版本保证 |
+| `kernelId` | `None`，这三组自动选择ID6 | 不适用，使用该实现默认选择 |
+| `schedule_metadata` / `is_prefill` | 不适用 | `None` / `False` |
+| sparse-mask / padding / DCP | 不使用 / 无padding / 1 | 相同 |
+
+| L | M | 每请求页表容量 T | 物理页数 P | cache shape | block_tables shape | 每请求四行的context_lens | 输出 shape |
+|---:|---:|---:|---:|---|---|---|---|
+| 4,096 | 8,192 | 128 | 2,048 | `[2048,64,1,132]` | `[64,128]` | `[4093,4094,4095,4096]` | `[64,8192]` |
+| 46,080 | 46,080 | 720 | 11,520 | `[11520,64,1,132]` | `[64,720]` | `[46077,46078,46079,46080]` | `[64,46080]` |
+| 87,040 | 87,040 | 1,360 | 21,760 | `[21760,64,1,132]` | `[64,1360]` | `[87037,87038,87039,87040]` | `[64,87040]` |
+
+P按16个请求的完整输出容量页表分配；短KV中只有前64页/请求有效，分配的未访问页不计入逻辑读字节。上述P是可复现测试的页池选择，不声称是服务实际预分配的全部页池。
+
+| 组合测试中的 TopK 参数 | 两端共同配置 |
+|---|---|
+| API / 后台选择 | 同一个 original `fast_topk_transform_fused` / 0 |
+| `score` | 各自producer生成的FP32 `[64,M]` dense logits |
+| `lengths` | int32 `[64]`，与上述逐Query长度一致 |
+| `page_table_size_1` | 连续int32 `[64,M]`，每行均为`0..M-1`的identity映射，不是物理KV页表 |
+| `cu_seqlens_q` | int32 `[65]`，取值`0..64`，一行一个Query |
+| `topk` / `row_starts` | 2048 / `None` |
+| 返回值 | int32 `[64,2048]`，请求内逻辑token位置 |
+| 计时边界 | producer + TopK两个公开API；metadata预先准备，两端均不含最终框架输出copy，不含后续attention |
+
+### R1主对比结果
+
+“仅logits”列两端都只计paged_mqa_logits；“logits+TopK”列两端都计相同范围。延迟降低的分母为original，与前文“性能提升”的定义不同。
+
+| L | M | AITER仅logits (µs) | original仅logits (µs) | logits延迟降低 | AITER logits+TopK (µs) | original logits+TopK (µs) | 组合延迟降低 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4,096 | 8,192 | 30.276 | 37.436 | 19.13% | 53.976 | 61.240 | 11.86% |
+| 46,080 | 46,080 | 253.216 | 344.444 | 26.49% | 336.344 | 428.012 | 21.42% |
+| 87,040 | 87,040 | 483.340 | 686.048 | 29.55% | 596.116 | 799.204 | 25.41% |
+
+带宽仅对单独logits计算，使用去重后的逻辑输入字节加完整FP32输出字节，不是HBM实测带宽。不同请求的KV分别计入；同一请求四个Query访问的重叠KV只计一次。metadata、硬件实际重读、转换临时缓冲不计入此逻辑口径。
+
+```text
+bytes_read    = 64*32*128 + 64*32*4 + 16*L*132
+bytes_written = 64*M*4
+total_bytes   = bytes_read + bytes_written
+tensor_flops  = 2*32*128*16*(4*L-6)
+GB/s          = total_bytes / latency_us / 1e3
+TFLOPS        = tensor_flops / latency_us / 1e6
+```
+
+| L | 读字节 | 写字节 | 总字节 | AITER逻辑GB/s | original逻辑GB/s | AITER tensor TFLOPS | original tensor TFLOPS |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4,096 | 8,921,088 | 2,097,152 | 11,018,240 | 363.927 | 294.322 | 70.904 | 57.343 |
+| 46,080 | 97,591,296 | 11,796,480 | 109,387,776 | 431.994 | 317.578 | 95.406 | 70.137 |
+| 87,040 | 184,098,816 | 22,282,240 | 206,381,056 | 426.990 | 300.826 | 94.412 | 66.516 |
+
+组合测试包含TopK的额外读写，不能套用单独logits的字节数计算组合带宽。表中的算子收益不能直接解释整模型吞吐或请求延迟，还需确认框架实际分支及该调用在关键路径中的占比。
+
+### R4等价控制与复现
+
+同一份Query可view成`[16,4,32,128]`，同时将页表改为`[16,T]`、context_lens改为`[16]`并传入每请求末尾长度L。R4内部应用L-3、L-2、L-1、L的因果边界；不能只改Q形状而保持错误的长度/页表映射。此控制计算同一业务任务，但不混入上述双方R1主对比。
+
+| L | AITER R4仅logits (µs) | AITER R1仅logits (µs) | original R1仅logits (µs) |
+|---:|---:|---:|---:|
+| 4,096 | 29.412 | 30.276 | 37.436 |
+| 46,080 | 252.248 | 253.216 | 344.444 |
+| 87,040 | 471.632 | 483.340 | 686.048 |
+
+以下命令在仓库根目录、gfx936/gfx938环境运行。主测试固定R1，无DCP参数；参数表、逐Query长度、完整页表、输入hash、读写/FLOPs、原始采样和正确性结果均写入JSON。默认测试上述三个preset；`--hy4-kv-lens 46080 87040`只运行两组长KV。
+
+```bash
+# AITER正确性：三个完整shape
+python -B op_tests/test_paged_mqa_logits.py --hy4 --json-out hy4_correctness.json
+
+# AITER单算子Graph性能：默认7轮、5采样块、20调用/Graph
+python -B op_tests/test_paged_mqa_logits.py --hy4 --bench --json-out hy4_aiter.json
+
+# original dense与AITER单算子及同一个TopK组合对比
+# 环境须提供表中固定版本的original公开API；运行时记录实际导入路径与hash。
+python -B op_tests/test_paged_mqa_logits.py --hy4 --bench --compare-original --with-topk --json-out hy4_compare.json
+
+# 轻量回归：请求间独立页、逐Query因果长度、R1/R4等价、Graph输出
+python -B -m pytest -q op_tests/test_paged_mqa_logits.py -k TestPagedMQAHY4
+```
+
+仅需原算子对比时省略`--with-topk`；原算子provider可通过`--original-module`指定，必须提供相同ABI。脚本不安装依赖、不自动切换到sparse-mask。默认保持AITER-only可运行；原有`--bench`/`--shape-set`的预分配Triton比较入口保留，不能与HY4接口分配口径混用。新增命令用于重测当前checkout；硬件、工具链、原算子版本或当前代码改变后，应以新JSON为准，不保证逐微秒重现历史表值。
+
+新增入口已于2026-09-22在nmz-1/gfx938验证：3项HY4 R1/R4回归、70项原有HCU/API回归通过；三个完整shape的双方logits及同一个TopK组合均通过eager、Graph和计时后检查。两组长KV的Q/cache/weights字节hash与原测量一致。短KV首次采样因尖峰标为NOISY并完整保留，同卡单独复测后全部稳定（最大CV 0.781%）。以上历史性能表没有用本次验证采样替换。
 
 ## 版本与数据追溯
 
 | 项目 | 固定版本 / 标识 |
 |---|---|
-| AITER 当前实现提交 | `d44541829221a87881090cacd34207fa7d4b5182` |
-| original 对照源码提交 | `934f41b0b1e99b414d41c36a2c2dc375619717a6` |
+| 2026-09-17 模型矩阵的 AITER 实现提交 | `d44541829221a87881090cacd34207fa7d4b5182` |
+| 2026-09-17 模型矩阵的 original 对照源码提交 | `934f41b0b1e99b414d41c36a2c2dc375619717a6` |
 
 
 仓库内的接口与验证入口：
@@ -424,4 +547,3 @@ gfx936 在大部分独立 S64 页路径中将 Key 直接加载到寄存器并精
 - [Python 公开接口与参数检查](../aiter/ops/opus/paged_mqa_logits.py)
 - [native 入口与架构分派](../csrc/opus_mqa_logits/paged_mqa_logits.cu)
 - [功能测试与已有基准入口](../op_tests/test_paged_mqa_logits.py)
-
