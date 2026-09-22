@@ -1483,4 +1483,4 @@ row = req_to_token[req_pool_indices[0]]
 assert torch.equal(page_table[0], row[::ps] // ps)
 ```
 
-实现采用同一算法的三个 tile 变体（2048/1024/256）在宿主侧按 workgroup 数路由，2D grid 并行 gather，分级前缀和扫描；无 gfx 特化分支，各支持架构通用。完整参数约束、SWA / Graph 说明与 AITER / LightOp / Triton 三方性能对比见 [fused_metadata 算子说明与性能报告](docs/fused_metadata.md)。
+实现采用同一算法的三个 tile 变体（2048/1024/256）在宿主侧按 workgroup 数路由，2D grid 并行 gather，分级前缀和扫描；无 gfx 特化分支，各支持架构通用。完整参数约束、SWA / Graph 说明与 AITER / 原实现 / Triton 三方性能对比见 [fused_metadata 算子说明与性能报告](docs/fused_metadata.md)。

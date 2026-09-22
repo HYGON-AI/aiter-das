@@ -183,27 +183,27 @@ wg_b >= 256  ->  变体 B
 
 **宿主侧入口**（`fused_metadata_kernel_general`）：完整契约检查 → `B=0` 快速路径（`cu_seqlens_k.zero_()` 后直接返回，不 launch）→ 计算 `shift = log2(ps)` → 按上式整数路由选变体 → dtype 8 组合零拷贝分发（无 `.to()`、无 `.contiguous()`）→ `launch_fused_metadata_variant` 以 `grid=(B, 1+(P-1)/tile)`、`block=256` 启动所选 kernel。`1+(P-1)/tile` 写法避免 `P+tile-1` 溢出；`P=0` 时 grid_y 仍为 1，保证 block `(0,0)` 被启动、Phase-1 可执行。
 
-### 较比 LightOp 的优化内容
+### 较比原实现的优化内容
 
-LightOp 源实现（`fused_metadata_kernel_general_v2`，迁移前基线）为单一 launch 几何：1D grid（每 batch 行一个 block）、Phase-1 恒为 block(0,0) 线程 0 的串行循环、Phase-2 以 int4 向量化（ps=1）或偏移推进 + 4-wide 展开（ps>1）加独立尾部循环实现。AITER 版本在其基础上的优化与修复：
+原实现（`fused_metadata_kernel_general_v2`，迁移前基线）为单一 launch 几何：1D grid（每 batch 行一个 block）、Phase-1 恒为 block(0,0) 线程 0 的串行循环、Phase-2 以 int4 向量化（ps=1）或偏移推进 + 4-wide 展开（ps>1）加独立尾部循环实现。AITER 版本在其基础上的优化与修复：
 
-| # | 维度 | LightOp v2 | AITER | 效果（代表用例） |
+| # | 维度 | 原实现 v2 | AITER | 效果（代表用例） |
 | --- | --- | --- | --- | --- |
-| 1 | grid 形态 | 1D `(B,)`，每行一个 block，P 维串行在 block 内 | 2D `(B, ceil(P/tile))`，P 维切 tile 提升 block 数 | 小 batch 并发从 B 提升到 B×tiles：v1_4（8,4096,ps32）LightOp 8 个 block → AITER（C 变体）128 个，17.683 → 4.715 μs（3.751×）；v0_7（64,1024）12.917 → 4.975 μs（2.596×） |
+| 1 | grid 形态 | 1D `(B,)`，每行一个 block，P 维串行在 block 内 | 2D `(B, ceil(P/tile))`，P 维切 tile 提升 block 数 | 小 batch 并发从 B 提升到 B×tiles：v1_4（8,4096,ps32）原实现 8 个 block → AITER（C 变体）128 个，17.683 → 4.715 μs（3.751×）；v0_7（64,1024）12.917 → 4.975 μs（2.596×） |
 | 2 | Phase-1 前缀和 | 恒为单线程串行 O(B) 循环 | 分级并行扫描（64-lane Hillis-Steele / 组扫描 / 串行回退） | B=128（2 组扫描）v6_7：50.709 → 19.868 μs（2.553×）；B≤64 一趟 6 轮即完成 |
-| 3 | launch 几何自适应 | 单一几何（256 线程、4-wide 展开），不随 shape 调整 | A/B/C 三变体按 WG 数路由，U 谷底实测标定 | 大配置约 1.9–2.1×（v1_7–v1_11 vs LightOp），小配置保住 launch 下限并发 |
+| 3 | launch 几何自适应 | 单一几何（256 线程、4-wide 展开），不随 shape 调整 | A/B/C 三变体按 WG 数路由，U 谷底实测标定 | 大配置约 1.9–2.1×（v1_7–v1_11 vs 原实现），小配置保住 launch 下限并发 |
 | 4 | 尾部覆盖 | ps=1 路径 4-wide 定长 tile + 尾部窗口判定 `tc ∈ [col, col+3)`，P 非 4 对齐时漏写尾部列 | 步长循环以全局列边界为唯一 guard，每页恰好覆盖一次 | 修复 v2 组 6 例（P=5/6/7/1026/1027）与 v6_2（P=259）的对拍失败 |
 | 5 | 对齐 / 布局 | ps=1 路径对 `req_to_token` 行首做 int4 reinterpret 加载，要求 16B 对齐且列步长为 1；Python wrapper 对全部张量强制 `.contiguous()`（非连续视图触发隐藏拷贝，输出非连续时写到副本、结果丢失） | 全程标量 int32 读取 + 显式 stride 寻址，任意行/列步长、任意对齐零拷贝支持 | 修复 v4 组 5 例（行宽 1022/1023 行首失配、乱序 pool indices、非连续视图）；消除 wrapper 级拷贝与写丢隐患 |
 | 6 | 契约检查 | 仅 6 项 `is_cuda` + mapping dtype | device / dtype / shape / contiguity / `page_size` 幂次 / `use_swa` 依赖全量 TORCH_CHECK | 非法输入宿主侧显式报错，而非静默产出错误结果 |
 | 7 | B=0 空批 | `dim3 grid(B)` 以 grid.x=0 启动，触发非法配置错误 | 宿主快速路径：`cu_seqlens_k.zero_()` 后返回，不启动 kernel | 空批安全且零开销 |
 
-沿用 LightOp 的既有设计（非新增优化）：dtype 8 组合零拷贝模板分发、`__launch_bounds__(256, 2)` 的 Occupancy 目标、SWA 以未移位索引查映射的语义。
+沿用原实现的既有设计（非新增优化）：dtype 8 组合零拷贝模板分发、`__launch_bounds__(256, 2)` 的 Occupancy 目标、SWA 以未移位索引查映射的语义。
 
-**代价与权衡**：AITER 移除了 int4 向量化与 4-wide 手工展开，换取任意布局下的正确性与更简单的索引结构——小 shape（v2/v4 组通过用例）上 AITER kernel 与 LightOp 基本持平或略慢（几何平均 1.070×/0.859×）即源于此置换；损失的访存宽度由 2D grid 并发与路由后的 tile 几何在中大 shape 上补回并反超。
+**代价与权衡**：AITER 移除了 int4 向量化与 4-wide 手工展开，换取任意布局下的正确性与更简单的索引结构——小 shape（v2/v4 组通过用例）上 AITER kernel 与原实现基本持平或略慢（几何平均 1.070×/0.859×）即源于此置换；损失的访存宽度由 2D grid 并发与路由后的 tile 几何在中大 shape 上补回并反超。
 
 ## 性能报告
 
-AITER 源码日期：**2026-09-18**（fused_metadata 内核合入于 2026-09-14）。对比三方实现：**AITER** 为本仓库实现（自 LightOp 迁移并优化），**LightOp** 为迁移前源实现，**Triton** 为测试脚本内置的 Triton 参考内核。加速比为 `对方 / AITER`，大于 1 表示 AITER 更快。
+AITER 源码日期：**2026-09-18**（fused_metadata 内核合入于 2026-09-14）。对比三方实现：**AITER** 为本仓库实现（自原实现迁移并优化），**原实现** 为迁移前源实现，**Triton** 为测试脚本内置的 Triton 参考内核。加速比为 `对方 / AITER`，大于 1 表示 AITER 更快。
 
 ### 环境与计时口径
 
@@ -213,21 +213,21 @@ AITER 源码日期：**2026-09-18**（fused_metadata 内核合入于 2026-09-14�
 | 设备 | HCU（HIP）设备 GPU0；具体卡型与软件版本未随数据源记录 |
 | 测试脚本 | `op_tests/test_fused_metadata.py` 三方对拍基准 |
 
-每例先以 `-1` 哨兵做三方对拍（Triton / AITER / 纯 PyTorch 参考逐 buffer `torch.equal` 全量比对，页表未写的位置会保留哨兵值导致比对失败），再以 CUDA event 计时（warmup=20、iters=200、batch=10 取中位数）；AITER / LightOp 计时走 `module_kvcache` 裸 pybind 绑定，绕过 `torch.ops` dispatcher。
+每例先以 `-1` 哨兵做三方对拍（Triton / AITER / 纯 PyTorch 参考逐 buffer `torch.equal` 全量比对，页表未写的位置会保留哨兵值导致比对失败），再以 CUDA event 计时（warmup=20、iters=200、batch=10 取中位数）；AITER / 原实现计时走 `module_kvcache` 裸 pybind 绑定，绕过 `torch.ops` dispatcher。
 
 - **kernel（μs）**：纯 kernel 设备执行时间。
 - **ops（ms）**：经各自 Python 入口的单次调用耗时，含主机分发 / launch 开销。
 - JIT、输入生成与 CPU 参考计算不进入计时；计时输入与正确性输入同形重建（固定种子 42）。
 
-**LightOp 源实现在 12 个配置上正确性对拍失败**（下表 ops 记 `FAIL`），其 kernel 时间不纳入对 LightOp 的加速统计；AITER 56 例全部通过。
+**原实现在 12 个配置上正确性对拍失败**（下表 ops 记 `FAIL`），其 kernel 时间不纳入对原实现的加速统计；AITER 56 例全部通过。
 
 ### Shape 与输入构造
 
 共 6 组 56 个数值配置（组名沿用数据源，`v0` 即测试脚本 `default` 组；`v5` 契约负向组仅断言 `RuntimeError`，不计性能）：
 
-| 组 | 方向 | 用例数 | LightOp 通过 |
+| 组 | 方向 | 用例数 | 原实现通过 |
 | --- | --- | ---: | ---: |
-| v0（default） | 基线配置集（LightOp 源测试逐参数移植） | 11 | 11 |
+| v0（default） | 基线配置集（原实现测试逐参数移植） | 11 | 11 |
 | v1 | 规模扫描：B / P 端点与路由分支两侧 | 12 | 12 |
 | v2 | page_size=1 快路径：尾部缺页 / 大 P / delta / SWA | 10 | 4 |
 | v3 | page_size>1 通用路径：tail 整行重写 / SWA / delta | 8 | 8 |
@@ -238,9 +238,9 @@ AITER 源码日期：**2026-09-18**（fused_metadata 内核合入于 2026-09-14�
 
 ### 汇总
 
-kernel 几何平均加速（对 LightOp 仅统计其通过的 44 例；对 Triton 统计全部 56 例）：
+kernel 几何平均加速（对原实现仅统计其通过的 44 例；对 Triton 统计全部 56 例）：
 
-| 组 | vs LightOp kernel | vs Triton kernel | vs Triton ops |
+| 组 | vs 原实现 kernel | vs Triton kernel | vs Triton ops |
 | --- | ---: | ---: | ---: |
 | v0（default） | 1.375× | 1.434× | 8.912× |
 | v1 | 1.730× | 2.156× | 6.068× |
@@ -250,13 +250,13 @@ kernel 几何平均加速（对 LightOp 仅统计其通过的 44 例；对 Trito
 | v6 | 1.966× | 4.448× | 7.045× |
 | 全部 | **1.472×** | **1.497×** | **7.722×** |
 
-ops 口径对 LightOp（同为原生 pybind 入口，44 例）几何平均加速 1.448×。
+ops 口径对原实现（同为原生 pybind 入口，44 例）几何平均加速 1.448×。
 
 ### 典型配置明细
 
-kernel 时间单位 **μs**、ops 单位 **ms**，保留三位小数；`✗` 表示 LightOp 该配置对拍失败，其 kernel 时间不纳入加速统计。
+kernel 时间单位 **μs**、ops 单位 **ms**，保留三位小数；`✗` 表示原实现该配置对拍失败，其 kernel 时间不纳入加速统计。
 
-| 用例 | B | P | ps | 备注 | AITER kernel | LightOp kernel | Triton kernel | 加速 vs LightOp | 加速 vs Triton | AITER ops | Triton ops |
+| 用例 | B | P | ps | 备注 | AITER kernel | 原实现 kernel | Triton kernel | 加速 vs 原实现 | 加速 vs Triton | AITER ops | Triton ops |
 | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | v0_1 | 1 | 512 | 32 | 基线 | 4.469 | 4.684 | 2.698 | 1.048× | 0.604× | 0.008 | 0.070 |
 | v0_6 | 32 | 512 | 32 | B 扫描 | 4.359 | 7.819 | 15.484 | 1.794× | 3.552× | 0.008 | 0.066 |
@@ -277,17 +277,17 @@ kernel 时间单位 **μs**、ops 单位 **ms**，保留三位小数；`✗` 表
 | v6_7 | 128 | 4096 | 16 | 组扫描 2 组 | 19.868 | 50.709 | 87.912 | 2.553× | 4.425× | 0.021 | 0.096 |
 | v6_8 | 1025 | 16 | 1 | XL 串行回退 | 109.507 | 115.434 | 398.991 | 1.054× | 3.644× | 0.111 | 0.406 |
 
-### LightOp 失败配置
+### 原实现失败配置
 
 12 例失败集中在三类边界：`page_size=1` 且 P 非 4 对齐的尾部缺页（v2_1–v2_4、v2_6、v2_7，P = 5/6/7/1026/1027）；`req_to_token` 行首非 16B 对齐或乱序 `req_pool_indices`（v4_1、v4_2、v4_4、v4_5、v4_7，行宽 1022/1023）；P=259 的二维 tile tail（v6_2）。AITER 实现在全部 56 例上三方对拍通过。
 
 ### 结果分析
 
-常规规模下 kernel 几何平均加速：AITER vs LightOp **1.472×**（44 例）、vs Triton **1.497×**（56 例）。收益随规模扩大：v1 组 vs LightOp 1.730×、vs Triton 2.156×；`B=3, P=67` 的 v6_3 达 vs LightOp **5.482×**、vs Triton **12.610×**。
+常规规模下 kernel 几何平均加速：AITER vs 原实现 **1.472×**（44 例）、vs Triton **1.497×**（56 例）。收益随规模扩大：v1 组 vs 原实现 1.730×、vs Triton 2.156×；`B=3, P=67` 的 v6_3 达 vs 原实现 **5.482×**、vs Triton **12.610×**。
 
-小 shape 的 kernel 时间由 launch 下限主导（AITER 约 4.0–4.8 μs）：56 例中有 26 例 Triton 参考内核的纯 kernel 时间短于 AITER（均为小配置），但 Triton 每次 Python launch 的主机开销（≥55 μs）使其 ops 口径全面落后——AITER ops 几何平均快 **7.722×**。对 LightOp（同为原生 pybind 入口），v2/v4 组通过用例上 AITER 与其基本持平或略慢（1.070×/0.859×），属小 shape 固定开销差异；v6_2/v6_3（B ≤ 3 的结构边界配置：P=259 二维 tail、B=3 ps=2 非 4 对齐 tail）AITER kernel 偏高（11.9/11.0 μs），但同配置 LightOp 或正确性失败、或需 60.2 μs，Triton 参考为 107.2/138.4 μs。
+小 shape 的 kernel 时间由 launch 下限主导（AITER 约 4.0–4.8 μs）：56 例中有 26 例 Triton 参考内核的纯 kernel 时间短于 AITER（均为小配置），但 Triton 每次 Python launch 的主机开销（≥55 μs）使其 ops 口径全面落后——AITER ops 几何平均快 **7.722×**。对原实现（同为原生 pybind 入口），v2/v4 组通过用例上 AITER 与其基本持平或略慢（1.070×/0.859×），属小 shape 固定开销差异；v6_2/v6_3（B ≤ 3 的结构边界配置：P=259 二维 tail、B=3 ps=2 非 4 对齐 tail）AITER kernel 偏高（11.9/11.0 μs），但同配置原实现或正确性失败、或需 60.2 μs，Triton 参考为 107.2/138.4 μs。
 
-正确性方面，迁移在优化性能的同时修复了 LightOp 的 12 个边界缺陷（尾部缺页、对齐 / 布局、二维 tail）。收益来自 tile 路由、2D grid 并行 gather、分级前缀和扫描与 dtype 零拷贝分发等改动的组合，表格不能单独归因各项技术。以上为指定输入分布及平台的 kernel / 单次调用计时结果，不代表模型端到端加速。
+正确性方面，迁移在优化性能的同时修复了原实现的 12 个边界缺陷（尾部缺页、对齐 / 布局、二维 tail）。收益来自 tile 路由、2D grid 并行 gather、分级前缀和扫描与 dtype 零拷贝分发等改动的组合，表格不能单独归因各项技术。以上为指定输入分布及平台的 kernel / 单次调用计时结果，不代表模型端到端加速。
 
 ## 相关实现与测试入口
 

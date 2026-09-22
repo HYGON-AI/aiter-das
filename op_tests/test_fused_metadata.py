@@ -7,11 +7,11 @@ Correctness & benchmark tests for ``aiter.fused_metadata_kernel_general``.
 AITER CUDA kernel vs 纯 PyTorch 参考（``ref_copy``），输出按 ``torch.equal``
 逐 buffer 全量比对。计时走 module_kvcache 的裸 pybind 绑定（``_get_aiter_fn``，
 绕过 torch.ops dispatcher 约 10us 的 Python 开销），CUDA-event 计时口径为
-warmup=20 / iters=200 / batch=10 取中位数，与 LightOp 迁移前一致。
+warmup=20 / iters=200 / batch=10 取中位数，与原实现迁移前一致。
 
 CLI 测试组（--case，按测试方向分组，定义见文件头部）：
 
-  * default  基线配置集（LightOp 源测试 test_configs 逐参数移植）
+  * default  基线配置集（原实现测试 test_configs 逐参数移植）
   * v1       规模扫描：B/P 端点、SWA 与路由分支相关配置
   * v2       page_size=1（SHIFT=0）快路径：尾部缺页 / 大 P / delta / SWA
   * v3       通用路径（page_size>1）：tail 整行重写 / SWA / delta
@@ -57,7 +57,7 @@ _SRC_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 @functools.lru_cache(maxsize=1)
 def _get_aiter_fn():
     """Return the raw module_kvcache binding, bypassing the torch.ops wrapper
-    (see module docstring).  Equivalent to lightop's ``lightop.op.*`` path."""
+    (see module docstring).  Equivalent to the origin implementation's raw pybind path."""
     from aiter.jit.core import get_module
     try:
         md = get_module("module_kvcache")
@@ -91,7 +91,7 @@ def _get_aiter_fn():
 # CUDA-event 计时；v5 异常组：仅断言 RuntimeError，不计性能。
 # ---------------------------------------------------------------------------
 _CASE_DESCRIPTIONS = {
-    'default': '基线配置集（LightOp 源测试逐参数移植）',
+    'default': '基线配置集（原实现测试逐参数移植）',
     'v1':      '规模扫描：B/P 端点、SWA 与路由分支相关配置',
     'v2':      'page_size=1（SHIFT=0）快路径：尾部缺页 / 大 P / delta / SWA',
     'v3':      '通用路径（page_size>1）：tail 整行重写 / SWA / delta',
@@ -100,7 +100,7 @@ _CASE_DESCRIPTIONS = {
     'v6':      '内核结构边界：最小 launch / 扫描 lane / 组扫描 / XL 串行回退',
 }
 
-# default：基线配置集 —— LightOp 源测试 main() test_configs 逐参数移植，
+# default：基线配置集 —— 原实现测试 main() test_configs 逐参数移植，
 # 迁移前后性能可直接对比。
 DEFAULT_CASES = [
     dict(B=1,  num_reqs=64,  max_seq_pages=512,  page_size=32, seq_len_delta=0, use_swa=False, note='B=1 P=512 ps=32'),
@@ -204,7 +204,7 @@ V6_SUITE = [
 
 
 # ---------------------------------------------------------------------------
-# Triton reference kernel (copied verbatim from the LightOp source test so the
+# Triton reference kernel (copied verbatim from the origin source test so the
 # semantics stay identical).
 # ---------------------------------------------------------------------------
 @triton.jit
@@ -822,7 +822,7 @@ def run_case(case_id, bench_only=False, warmup=20, iters=200, case_index=None):
 def test_benchmark_source_equivalent():
     """Benchmark AITER vs the Triton reference on the default config set.
 
-    与 LightOp 源测试 main() test_configs 逐参数一致（同输入、同计时口径），
+    与原实现测试 main() test_configs 逐参数一致（同输入、同计时口径），
     迁移前后性能可直接对比。
     """
     for case in DEFAULT_CASES:
@@ -885,7 +885,7 @@ def main():
                         help='print all case groups with 1-based case indices, then exit')
     parser.add_argument(
         '--case', nargs='+', default=['default'], metavar='GROUP[:N]',
-        help='default: 基线配置集（LightOp 源测试逐参数移植）；'
+        help='default: 基线配置集（原实现测试逐参数移植）；'
              'v1-v6: 按测试方向分组的测试集（见 _CASE_DESCRIPTIONS）；'
              'all = default + v1..v6；'
              'GROUP:N 只运行该组第 N 个 case（1-based，见 --list-cases）')
