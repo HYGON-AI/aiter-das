@@ -35,6 +35,33 @@ except ImportError:
     dynamic_per_token_quant_fp8_i8 = None
 
 
+def _resolve_sorting_num_experts(
+    global_num_experts: int,
+    expert_mask: Optional[torch.Tensor],
+) -> int:
+    """Resolve the routing ID domain independently of local weight slots.
+
+    The ASM expert_map argument is an int32 0/1 mask, not a global-to-local
+    map. It may include fused shared experts and a disabled trailing sentinel.
+    Enabled entries must follow the order of local expert weights; CK maps them
+    to local slots by prefix sum. Inspect metadata only to preserve graph capture.
+    """
+    if expert_mask is None:
+        return global_num_experts
+    if expert_mask.ndim != 1:
+        raise ValueError("expert_mask must be rank-1")
+    if expert_mask.dtype != torch.int32:
+        raise ValueError("expert_mask must be int32")
+    if not expert_mask.is_contiguous():
+        raise ValueError("expert_mask must be contiguous")
+    if expert_mask.numel() < global_num_experts:
+        raise ValueError(
+            f"expert_mask is shorter than global experts: "
+            f"mask={expert_mask.numel()}, global={global_num_experts}"
+        )
+    return expert_mask.numel()
+
+
 def moe_sorting_ck(
     topk_ids,
     topk_weights,
@@ -266,6 +293,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
         assert model_dim == padded_model_dim, "Padded hidden size mismatch"
     if global_num_experts == -1:
         global_num_experts = E
+    sorting_num_experts = _resolve_sorting_num_experts(global_num_experts, expert_map)
     top_k_num = topk_ids.shape[1]
     # We execute the fused_moe kernel in chunks to circumvent this issue:
     # https://github.com/vllm-project/vllm/issues/5938
@@ -354,7 +382,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
                 config = decode_sol_w4a16(solution_id)
                 
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert, moe_buf = (
-                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
+                moe_sorting_ck(curr_topk_ids, curr_topk_weights, sorting_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
             )
             if print_log():
                 print(f"Asm Moe Size: chunk:{chunk}, arch:{arch}, quant:{MoeQuantType.INT4_W4A16}, tokens:{tokens_in_chunk}, inter_dim:{int(N/2)}, model_dim:{w1.size(2)*2}, expert:{E}, topk:{top_k_num}")
@@ -481,7 +509,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
                 config["PERSIST_GROUP2"] = persist_cu
 
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert, moe_buf = (
-                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
+                moe_sorting_ck(curr_topk_ids, curr_topk_weights, sorting_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
             )
             if print_log():
                 print(f"Asm Moe Size: chunk:{chunk}, arch:{arch}, quant:{MoeQuantType.INT8_W8A8_C}, tokens:{tokens_in_chunk}, inter_dim:{int(N/2)}, model_dim:{w1.size(2)}, expert:{E}, topk:{top_k_num}")
@@ -553,7 +581,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
                 config["PERSIST_GROUP2"] = persist_cu
 
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert, moe_buf = (
-                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
+                moe_sorting_ck(curr_topk_ids, curr_topk_weights, sorting_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
             )
             if print_log():
                 print(f"Asm Moe Size: chunk:{chunk}, arch:{arch}, quant:{MoeQuantType.INT4_W4A8}, tokens:{tokens_in_chunk}, inter_dim:{int(N/2)}, model_dim:{w1.size(2)*2}, expert:{E}, topk:{top_k_num}")
@@ -628,7 +656,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
                 config["PERSIST_GROUP2"] = persist_cu
 
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert, moe_buf = (
-                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
+                moe_sorting_ck(curr_topk_ids, curr_topk_weights, sorting_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
             )
             if print_log():
                 print(f"Asm Moe Size: chunk:{chunk}, arch:{arch}, quant:{MoeQuantType.INT8_W8A8}, tokens:{tokens_in_chunk}, inter_dim:{int(N/2)}, model_dim:{w1.size(2)}, expert:{E}, topk:{top_k_num}")
@@ -700,7 +728,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
                 config["PERSIST_GROUP2"] = persist_cu
 
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert, moe_buf = (
-                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
+                moe_sorting_ck(curr_topk_ids, curr_topk_weights, sorting_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
             )
             if print_log():
                 print(f"Asm Moe Size: chunk:{chunk}, arch:{arch}, quant:{MoeQuantType.F8_W8A8_C}, tokens:{tokens_in_chunk}, inter_dim:{int(N/2)}, model_dim:{w1.size(2)}, expert:{E}, topk:{top_k_num}")
@@ -770,7 +798,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
                 config["PERSIST_GROUP2"] = persist_cu
 
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert, moe_buf = (
-                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
+                moe_sorting_ck(curr_topk_ids, curr_topk_weights, sorting_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
             )
             if print_log():
                 print(f"Asm Moe Size: chunk:{chunk}, arch:{arch}, quant:{MoeQuantType.F8_W8A8}, tokens:{tokens_in_chunk}, inter_dim:{int(N/2)}, model_dim:{w1.size(2)}, expert:{E}, topk:{top_k_num}")
@@ -843,7 +871,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
                 config["PERSIST_GROUP2"] = persist_cu
 
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert, moe_buf = (
-                moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
+                moe_sorting_ck(curr_topk_ids, curr_topk_weights, sorting_num_experts, real_model_dim, out_hidden_states[begin_chunk_idx:end_chunk_idx], config["BLOCK_SIZE_M"], expert_map)
             )
             if print_log():
                 print(f"Asm Moe Size: chunk:{chunk}, arch:{arch}, quant:{MoeQuantType.NO_QUANT}, tokens:{tokens_in_chunk}, inter_dim:{int(asm_inter_dim)}, model_dim:{w1.size(2)}, expert:{E}, topk:{top_k_num}")
@@ -901,7 +929,7 @@ def fused_experts_asm_impl(hidden_states: torch.Tensor,
             moe_buf if not inplace else hidden_states[begin_chunk_idx:end_chunk_idx],
             routed_scaling_factor,
             topk_ids=curr_topk_ids,
-            num_experts=global_num_experts,
+            num_experts=sorting_num_experts,
             expert_mask=expert_map,
         )
 
