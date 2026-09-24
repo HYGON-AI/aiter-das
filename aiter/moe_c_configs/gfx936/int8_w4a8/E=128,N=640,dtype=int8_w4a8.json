@@ -56,8 +56,8 @@
     "MODE": 374132
   },
   "1024": {
-    "BLOCK_SIZE_M": 48,
-    "MODE": 374248
+    "BLOCK_SIZE_M": 32,
+    "MODE": 374532
   },
   "2048": {
     "BLOCK_SIZE_M": 32,
