@@ -201,6 +201,37 @@
             "f'{CK_DIR}/example_hcu/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {{}}'"
         ]
     },
+    "module_gdn_ck": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/ck_gdn_pybind.cpp'",
+            "f'{AITER_CSRC_DIR}/ck_gdn/ck_gdn_prefill.cpp'",
+            "f'{AITER_CSRC_DIR}/ck_gdn/ck_gdn_decode.cpp'",
+            "f'{CK_DIR}/example_hcu/ck_tile/21_gdn/prefill'",
+            "f'{CK_DIR}/example_hcu/ck_tile/21_gdn/decode'"
+        ],
+        "flags_extra_cc": [
+            "'-Wno-shadow'",
+            "'-Wno-float-equal'",
+            "'-Wno-unused-variable'",
+            "'-Wno-unused-parameter'",
+            "'-Wno-unused-local-typedef'"
+        ],
+        "flags_extra_hip": [
+            "'-Wno-shadow'",
+            "'-Wno-float-equal'",
+            "'-Wno-unused-variable'",
+            "'-Wno-unused-parameter'",
+            "'-Wno-unused-local-typedef'",
+            "module_vgpr_compiler_flag(module_name)"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/ck_gdn'",
+            "f'{CK_DIR}/example_hcu/ck_tile/21_gdn'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_moe_sum": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_sum_pybind.cu'"

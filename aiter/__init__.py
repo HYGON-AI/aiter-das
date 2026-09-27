@@ -79,6 +79,7 @@ from .ops.opus import *
 # from .ops.trans_ragged_layout import *
 # from . import mla
 from .ops.fla import *
+from .ops.ck_gdn import *
 from .ops.kvcache_metadata import fused_metadata_kernel_general
 from .ops.blockwise_scaling import *
 from .utility import dtypes,fp4_utils
