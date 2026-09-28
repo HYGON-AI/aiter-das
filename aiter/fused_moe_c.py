@@ -2118,6 +2118,30 @@ def _resolve_moe_compute_dtype(
         f"Unsupported hidden_states dtype: {hidden_states_dtype}")
 
 
+def _moe_c_mode_uses_moe_align(mode) -> bool:
+    try:
+        mode = int(mode)
+    except (TypeError, ValueError):
+        return False
+    if mode < 10000000:
+        return False
+    return ((mode // 1000000) % 10) == 1
+
+
+def _moe_c_config_uses_moe_align(config, use_fp8_w8a8: bool) -> bool:
+    mode = int(config.get("MODE", 0))
+    if 10000000 <= mode < 30000000:
+        return _moe_c_mode_uses_moe_align(mode)
+    sorting_method = config.get("SORTING_METHOD")
+    if sorting_method == "moe_align":
+        return True
+    if sorting_method == "ck_sorting":
+        return False
+    if "MODE" in config:
+        return _moe_c_mode_uses_moe_align(config.get("MODE"))
+    return use_fp8_w8a8
+
+
 def _torch_dtype_to_triton(dtype: torch.dtype):
     if dtype == torch.bfloat16:
         return tl.bfloat16
@@ -2205,7 +2229,7 @@ def invoke_fused_moe_kernel_marlin(A: torch.Tensor,
                             use_int4_w4a16_base: bool,
                             use_w16a16: bool,
                             is_bottom: bool,
-                            key_selected:int,
+                            selected_m_key:int,
                             block_shape: Optional[List[int]] = None,
                             real_size_k: Optional[int] = None) -> None:
     find_best = os.getenv("WHICH_TO_TEST")
@@ -2439,39 +2463,39 @@ def invoke_fused_moe_kernel_marlin(A: torch.Tensor,
                         if _is_marlin_tensorwise_scale(B_scale, B.shape[0]):
                             if is_bottom:
                                 aiter.moe_c_moe_gemm_marlin_w8a8_tensorwise(A, B, C, A_scale, B_scale, topk_weights,
-                                                sorted_token_ids, expert_ids, num_tokens_post_padded, 1, config["MODE"], top_k, key_selected)
+                                                sorted_token_ids, expert_ids, num_tokens_post_padded, 1, config["MODE"], top_k, selected_m_key)
                             else:
                                 aiter.moe_c_moe_gemm_marlin_w8a8_tensorwise(A, B, C, A_scale, B_scale, None,
-                                                sorted_token_ids, expert_ids, num_tokens_post_padded, top_k, config["MODE"], top_k, key_selected)
+                                                sorted_token_ids, expert_ids, num_tokens_post_padded, top_k, config["MODE"], top_k, selected_m_key)
                         else:
                             if is_bottom:
                                 assert B.shape[1] in [7168,6144,4096,3072,2048] , f" K = {B.shape[1]} is not in support"
                                 assert B.shape[2] in [128,256,384,512,768,1024,2048] , f" N = {B.shape[2]} is not in support"
                                 aiter.moe_c_moe_gemm_marlin_w8a8(A, B, C, A_scale, B_scale,topk_weights,
-                                                sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"],  top_k,key_selected)
+                                                sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"],  top_k,selected_m_key)
 
 
                             else :
                                 aiter.moe_c_moe_gemm_marlin_w8a8(A, B, C, A_scale, B_scale, None,
-                                                sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"],  top_k,key_selected)
+                                                sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"],  top_k,selected_m_key)
                         return
                     elif (use_int8_w4a8 and block_shape == None):
                         if is_bottom:
                             aiter.moe_c_moe_gemm_marlin_w4a8(A, B, C, A_scale, B_scale,topk_weights,
-                                            sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"], top_k,key_selected)
+                                            sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"], top_k,selected_m_key)
 
                         else :
                             aiter.moe_c_moe_gemm_marlin_w4a8(A, B, C, A_scale, B_scale, None,
-                                            sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"], top_k,key_selected)
+                                            sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"], top_k,selected_m_key)
 
                         return
                     elif (use_fp4_w4a8 and block_shape is None):
                         if is_bottom:
                             aiter.moe_c_moe_gemm_marlin_wfp4a8_channelwise(A, B, C, A_scale, B_scale, topk_weights,
-                                            sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"], top_k,key_selected)
+                                            sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"], top_k,selected_m_key)
                         else:
                             aiter.moe_c_moe_gemm_marlin_wfp4a8_channelwise(A, B, C, A_scale, B_scale, None,
-                                            sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"], top_k,key_selected)
+                                            sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"], top_k,selected_m_key)
                         return
                     elif (use_fp4_w4a8 and block_shape is not None and block_shape[0] == 0 and block_shape[1] == 32):
                         gemm_op_wfp4a8_groupwise = (
@@ -2481,31 +2505,31 @@ def invoke_fused_moe_kernel_marlin(A: torch.Tensor,
                         )
                         if is_bottom:
                             gemm_op_wfp4a8_groupwise(A, B, C, A_scale, B_scale, topk_weights,
-                                            sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"], top_k,key_selected)
+                                            sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"], top_k,selected_m_key)
                         else:
                             gemm_op_wfp4a8_groupwise(A, B, C, A_scale, B_scale, None,
-                                            sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"], top_k,key_selected)
+                                            sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"], top_k,selected_m_key)
                         return
                     elif (use_fp8_w8a8 and block_shape == None):
                         gemm_real_size_k = int(real_size_k or A.shape[1])
                         if _is_marlin_tensorwise_scale(B_scale, B.shape[0]):
                             if is_bottom:
                                 aiter.moe_c_moe_gemm_marlin_w8a8_fp8_tensorwise(A, B, C, A_scale, B_scale,topk_weights,
-                                                sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"],  top_k,key_selected, gemm_real_size_k)
+                                                sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"],  top_k,selected_m_key, gemm_real_size_k)
 
 
                             else :
                                 aiter.moe_c_moe_gemm_marlin_w8a8_fp8_tensorwise(A, B, C, A_scale, B_scale, None,
-                                                sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"],  top_k,key_selected, gemm_real_size_k)
+                                                sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"],  top_k,selected_m_key, gemm_real_size_k)
                         else:
                             if is_bottom:
                                 aiter.moe_c_moe_gemm_marlin_w8a8_fp8(A, B, C, A_scale, B_scale,topk_weights,
-                                                sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"],  top_k,key_selected, gemm_real_size_k)
+                                                sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"],  top_k,selected_m_key, gemm_real_size_k)
 
 
                             else :
                                 aiter.moe_c_moe_gemm_marlin_w8a8_fp8(A, B, C, A_scale, B_scale, None,
-                                                sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"],  top_k,key_selected, gemm_real_size_k)
+                                                sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"],  top_k,selected_m_key, gemm_real_size_k)
                         return
 
 
@@ -2540,11 +2564,15 @@ def get_config_file_name_marlin(E: int,
                          block_shape: Optional[List[int]] = None,
                          is_bottom: bool = False,
                          use_moe_wna16_cuda: bool = False,
-                         K: Optional[int] = None) -> str:
+                         K: Optional[int] = None,
+                         top_k: Optional[int] = None,
+                         num_cu: Optional[int] = None) -> str:
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     k_selector = "" if K is None else f",K={K}"
+    topk_selector = "" if top_k is None else f",topk={top_k}"
+    cu_selector = "" if num_cu is None else f",cu={num_cu}"
     is_bottom_selector = ("" if is_bottom == False else ",is_bottom=True")
-    return f"E={E},N={N}{k_selector}{dtype_selector}{is_bottom_selector}.json"  # noqa: E501
+    return f"E={E},N={N}{k_selector}{topk_selector}{cu_selector}{dtype_selector}{is_bottom_selector}.json"  # noqa: E501
 
 
 def get_legacy_config_file_name_marlin(E: int,
@@ -2667,6 +2695,8 @@ def get_moe_configs_marlin(
     is_bottom: bool = False,
     use_moe_wna16_cuda: bool = False,
     K: Optional[int] = None,
+    top_k: Optional[int] = None,
+    num_cu: Optional[int] = None,
 ) -> Optional[Dict[int, Any]]:
     """
     Return optimized configurations for the fused MoE kernel.
@@ -2680,6 +2710,13 @@ def get_moe_configs_marlin(
     block_shape = [block_n if block_n is not None else 0, block_k] if block_k is not None else None
     arch = _get_gfx_version()
     json_file_names = []
+    if top_k is not None:
+        resolved_cu = num_cu if num_cu is not None else torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        if K is not None:
+            json_file_names.append(get_config_file_name_marlin(
+                E, N, dtype, block_shape, is_bottom, use_moe_wna16_cuda, K, top_k, resolved_cu))
+        json_file_names.append(get_config_file_name_marlin(
+            E, N, dtype, block_shape, is_bottom, use_moe_wna16_cuda, top_k=top_k, num_cu=resolved_cu))
     if K is not None:
         json_file_names.append(get_config_file_name_marlin(
             E, N, dtype, block_shape, is_bottom, use_moe_wna16_cuda, K))
@@ -2900,112 +2937,6 @@ def try_get_optimal_moe_config(
                                         is_marlin, block_shape, is_bottom)
     return config
 
-_FP8_W8A8_PREFILL_BM_CHOICES = {32, 48, 64, 80, 96, 112, 128}
-_FP8_W8A8_PREFILL_NLOOP_CHOICES = {1, 2, 3, 4, 5}
-_FP8_W8A8_PREFILL_MODE_BASE = 80000
-_FP8_W8A8_PREFILL_MODE_BASE_CHOICES = {70000, 80000, 90000, 100000}
-_FP8_W8A8_DECODE_MODE_BASE = 60000
-_FP8_W8A8_DECODE_MODE_BASE_CHOICES = {60000}
-_FP8_W8A8_MODE_BASE_CHOICES = (
-    _FP8_W8A8_DECODE_MODE_BASE_CHOICES | _FP8_W8A8_PREFILL_MODE_BASE_CHOICES
-)
-
-
-def _strip_fp8_w8a8_mode_base(mode: int) -> int:
-    for mode_base in _FP8_W8A8_MODE_BASE_CHOICES:
-        if mode_base <= mode < mode_base + 10000:
-            return mode - mode_base
-    return mode
-
-
-def _encode_fp8_w8a8_mode(config: dict, mode_base: int, mode_suffix: int) -> dict:
-    if mode_base not in _FP8_W8A8_MODE_BASE_CHOICES:
-        raise ValueError(
-            f"Unsupported fp8_w8a8 mode base={mode_base}; "
-            f"supported values are {sorted(_FP8_W8A8_MODE_BASE_CHOICES)}"
-        )
-
-    config = dict(config)
-    config["MODE"] = mode_base + mode_suffix
-    return config
-
-
-def _maybe_encode_fp8_w8a8_decode_mode(
-    config: dict,
-    dtype: Optional[str],
-    block_shape: Optional[List[int]],
-    key_selected: int,
-    is_bottom: bool,
-) -> dict:
-    if dtype != "fp8_w8a8" or block_shape is not None or key_selected > 512:
-        return config
-
-    final_mode = config.get("MODE")
-    if final_mode is not None and int(final_mode) >= _FP8_W8A8_DECODE_MODE_BASE:
-        return config
-
-    decode_mode = config.get("DECODE_MODE", final_mode)
-    if decode_mode is None:
-        return config
-
-    decode_mode = _strip_fp8_w8a8_mode_base(int(decode_mode))
-
-    mode_base = int(config.get("MODE_BASE", config.get("DECODE_MODE_BASE", _FP8_W8A8_DECODE_MODE_BASE)))
-    if mode_base not in _FP8_W8A8_DECODE_MODE_BASE_CHOICES:
-        raise ValueError(
-            f"Unsupported fp8_w8a8 decode mode base={mode_base}; "
-            f"supported values are {sorted(_FP8_W8A8_DECODE_MODE_BASE_CHOICES)}"
-        )
-    config = _encode_fp8_w8a8_mode(config, mode_base, decode_mode)
-    stage_nloop_key = "N_LOOP2" if is_bottom else "N_LOOP1"
-    config[stage_nloop_key] = int(config.get(stage_nloop_key, config.get("N_LOOP", 1)))
-    config["DECODE_MODE"] = decode_mode
-    config["DECODE_MODE_BASE"] = mode_base
-    return config
-
-
-def _maybe_encode_fp8_w8a8_prefill_mode(
-    config: dict,
-    dtype: Optional[str],
-    block_shape: Optional[List[int]],
-    key_selected: int,
-    is_bottom: bool,
-) -> dict:
-    if dtype != "fp8_w8a8" or block_shape is not None or key_selected <= 512:
-        return config
-
-    final_mode = config.get("MODE")
-    if final_mode is not None and int(final_mode) >= min(_FP8_W8A8_PREFILL_MODE_BASE_CHOICES):
-        return config
-
-    block_size_m = config.get("BLOCK_SIZE_M")
-    if block_size_m not in _FP8_W8A8_PREFILL_BM_CHOICES:
-        return config
-
-    stage_nloop_key = "N_LOOP2" if is_bottom else "N_LOOP1"
-    n_loop = config.get(stage_nloop_key, config.get("N_LOOP"))
-    if n_loop is None:
-        return config
-
-    n_loop = int(n_loop)
-    if n_loop not in _FP8_W8A8_PREFILL_NLOOP_CHOICES:
-        raise ValueError(
-            f"Unsupported fp8_w8a8 prefill N_LOOP={n_loop}; "
-            f"supported values are {sorted(_FP8_W8A8_PREFILL_NLOOP_CHOICES)}"
-        )
-
-    mode_base = int(config.get("MODE_BASE", config.get("PREFILL_MODE_BASE", _FP8_W8A8_PREFILL_MODE_BASE)))
-    if mode_base not in _FP8_W8A8_PREFILL_MODE_BASE_CHOICES:
-        raise ValueError(
-            f"Unsupported fp8_w8a8 prefill mode base={mode_base}; "
-            f"supported values are {sorted(_FP8_W8A8_PREFILL_MODE_BASE_CHOICES)}"
-        )
-    mode_suffix = int(block_size_m) * 10 + n_loop
-    config = _encode_fp8_w8a8_mode(config, mode_base, mode_suffix)
-    config[stage_nloop_key] = n_loop
-    config["PREFILL_MODE_BASE"] = mode_base
-    return config
-
 def try_get_optimal_moe_config_marlin(
     w1_shape: Tuple[int, ...],
     w2_shape: Tuple[int, ...],
@@ -3036,9 +2967,9 @@ def try_get_optimal_moe_config_marlin(
                 K=logical_k,
             )
             if configs:
-                key_selected = min(configs.keys(), key=lambda x: abs(x - M))
-                config = dict(configs[key_selected])
-                config["key_selected"] = key_selected
+                selected_m_key = min(configs.keys(), key=lambda x: abs(x - M))
+                config = dict(configs[selected_m_key])
+                config["selected_m_key"] = selected_m_key
             else:
                 logger.warning("W16A16 Marlin config fallback for M=%s", M)
                 config = get_default_config(
@@ -3049,7 +2980,7 @@ def try_get_optimal_moe_config_marlin(
         logical_k = None
         if dtype in ("int8_w4a8", "fp4_w4a8"):
             logical_k = w2_shape[1]
-        elif dtype == "fp8_w8a8" and block_shape is None:
+        elif dtype in ("fp8_w8a8", "int8_w8a8") and block_shape is None:
             logical_k = w2_shape[1] if is_bottom else w1_shape[2]
 
         if dtype in ("int4_w4a16", "fp4_w4a16", "int8_w4a8", "fp4_w4a8"):
@@ -3059,18 +2990,14 @@ def try_get_optimal_moe_config_marlin(
         block_k = block_shape[1] if block_shape else 0
         configs = get_moe_configs_marlin(
             E, N, dtype, block_n, block_k, is_bottom, use_moe_wna16_cuda,
-            K=logical_k)
+            K=logical_k, top_k=top_k)
 
         if configs:
             # If an optimal configuration map has been found, look up the
             # optimal config
-            key_selected = min(configs.keys(), key=lambda x: abs(x - M))
-            config = dict(configs[key_selected])
-            config = _maybe_encode_fp8_w8a8_decode_mode(
-                config, dtype, block_shape, key_selected, is_bottom)
-            config = _maybe_encode_fp8_w8a8_prefill_mode(
-                config, dtype, block_shape, key_selected, is_bottom)
-            config["key_selected"] = key_selected
+            selected_m_key = min(configs.keys(), key=lambda x: abs(x - M))
+            config = dict(configs[selected_m_key])
+            config["selected_m_key"] = selected_m_key
         else:
             # Else use the default config
             config = get_default_config(M, E, N, w1_shape[2], top_k, dtype,
@@ -3918,12 +3845,12 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                 "MODE": int(w16a16_config[0]),
                 "BLOCK_SIZE_M": int(w16a16_config[1]),
                 "DELTA": int(w16a16_config[2]),
-                "key_selected": tokens_in_chunk,
+                "selected_m_key": tokens_in_chunk,
             }, {
                 "MODE": int(w16a16_config[3]),
                 "BLOCK_SIZE_M": int(w16a16_config[4]),
                 "DELTA": int(w16a16_config[5]),
-                "key_selected": tokens_in_chunk,
+                "selected_m_key": tokens_in_chunk,
             })
         elif use_w16a16:
             config = get_config_func(
@@ -3958,11 +3885,7 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                          if a2_scale is not None else None)
 
         find_best = os.environ.get("WHICH_TO_TEST")
-        sorting_method = config.get("SORTING_METHOD")
-        use_moe_align_sorting = (
-            sorting_method == "moe_align"
-            or (sorting_method is None and use_fp8_w8a8)
-        )
+        use_moe_align_sorting = _moe_c_config_uses_moe_align(config, use_fp8_w8a8)
         if use_w16a16:
             assert config2 is not None
             block_size_m1 = int(BM if find_best else config["BLOCK_SIZE_M"])
@@ -4057,7 +3980,7 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                                 use_int4_w4a16_base=use_int4_w4a16_base,
                                 use_w16a16=use_w16a16,
                                 is_bottom = False,
-                                key_selected=config.get("key_selected"),
+                                selected_m_key=config.get("selected_m_key"),
                                 block_shape=block_shape,
                                 real_size_k=fp8_original_k if use_fp8_w8a8 else None)
 
@@ -4124,7 +4047,7 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                                 use_int4_w4a16_base=use_int4_w4a16_base,
                                 use_w16a16=use_w16a16,
                                 is_bottom = True,
-                                key_selected=config.get("key_selected") ,
+                                selected_m_key=config.get("selected_m_key") ,
                                 block_shape=block_shape,
                                 real_size_k=None)
         mode_use_triton_moe_sum = out_hidden_states.dtype == torch.float16 or  \
