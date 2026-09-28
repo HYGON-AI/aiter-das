@@ -556,7 +556,7 @@
     "module_moe_c_kernel": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_c_pybind.cu'",
-            "f'{MOE_C_DIR}/csrc_for_aiter'",
+            "f'{MOE_C_CSRC_FOR_AITER_DIR}'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/moe_c_api_kernels.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_moe_c/moe_c.cu'"
         ],
@@ -574,10 +574,10 @@
     "module_moe_c_wfp4a16_kernel": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_c_wfp4a16_pybind.cu'",
-            "f'{MOE_C_DIR}/csrc_for_aiter/moe_wna16_utils.h'",
-            "f'{MOE_C_DIR}/csrc_for_aiter/moe_wfp4a16_utils.h'",
-            "f'{MOE_C_DIR}/csrc_for_aiter/moe_wfp4a16_config.h'",
-            "f'{MOE_C_DIR}/csrc_for_aiter/moe_wfp4a16_opt.h'",
+            "f'{MOE_C_CSRC_FOR_AITER_DIR}/moe_wna16_utils.h'",
+            "f'{MOE_C_CSRC_FOR_AITER_DIR}/moe_wfp4a16_utils.h'",
+            "f'{MOE_C_CSRC_FOR_AITER_DIR}/moe_wfp4a16_config.h'",
+            "f'{MOE_C_CSRC_FOR_AITER_DIR}/moe_wfp4a16_opt.h'",
             "f'{AITER_CSRC_DIR}/py_itfs_moe_c/moe_c_wfp4a16.cu'"
         ],
         "flags_extra_cc": [
@@ -587,7 +587,7 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [
-            "f'{MOE_C_DIR}/csrc_for_aiter'"
+            "f'{MOE_C_CSRC_FOR_AITER_DIR}'"
         ],
         "verbose": "False",
         "hipify": "True",
@@ -596,9 +596,9 @@
     "module_moe_c_w4a8_kernel": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_c_w4a8_pybind.cu'",
-            "f'{MOE_C_DIR}/csrc_for_aiter/moe_w4a8_utils.h'",
-            "f'{MOE_C_DIR}/csrc_for_aiter/moe_w4a8_config.h'",
-            "f'{MOE_C_DIR}/csrc_for_aiter/moe_w4a8_opt.h'",
+            "f'{MOE_C_CSRC_FOR_AITER_DIR}/moe_w4a8_utils.h'",
+            "f'{MOE_C_CSRC_FOR_AITER_DIR}/moe_w4a8_config.h'",
+            "f'{MOE_C_CSRC_FOR_AITER_DIR}/moe_w4a8_opt.h'",
             "f'{AITER_CSRC_DIR}/py_itfs_moe_c/moe_c_w4a8.cu'"
         ],
         "flags_extra_cc": [
@@ -608,7 +608,7 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [
-            "f'{MOE_C_DIR}/csrc_for_aiter'"
+            "f'{MOE_C_CSRC_FOR_AITER_DIR}'"
         ],
         "verbose": "False",
         "hipify": "True",
@@ -617,9 +617,9 @@
     "module_moe_c_wfp4a8_kernel": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_c_wfp4a8_pybind.cu'",
-            "f'{MOE_C_DIR}/csrc_for_aiter/moe_wfp4a8_utils.h'",
-            "f'{MOE_C_DIR}/csrc_for_aiter/moe_wfp4a8_config.h'",
-            "f'{MOE_C_DIR}/csrc_for_aiter/moe_wfp4a8_opt.h'",
+            "f'{MOE_C_CSRC_FOR_AITER_DIR}/moe_wfp4a8_utils.h'",
+            "f'{MOE_C_CSRC_FOR_AITER_DIR}/moe_wfp4a8_config.h'",
+            "f'{MOE_C_CSRC_FOR_AITER_DIR}/moe_wfp4a8_opt.h'",
             "f'{AITER_CSRC_DIR}/py_itfs_moe_c/moe_c_wfp4a8.cu'"
         ],
         "flags_extra_cc": [
@@ -629,7 +629,7 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [
-            "f'{MOE_C_DIR}/csrc_for_aiter'"
+            "f'{MOE_C_CSRC_FOR_AITER_DIR}'"
         ],
         "verbose": "False",
         "hipify": "True",
@@ -647,7 +647,7 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [
-            "f'{MOE_C_DIR}/csrc_for_aiter'"
+            "f'{MOE_C_CSRC_FOR_AITER_DIR}'"
         ],
         "verbose": "False",
         "hipify": "True",
@@ -665,7 +665,7 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [
-            "f'{MOE_C_DIR}/csrc_for_aiter'"
+            "f'{MOE_C_CSRC_FOR_AITER_DIR}'"
         ],
         "verbose": "False",
         "hipify": "True",
@@ -683,7 +683,7 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [
-            "f'{MOE_C_DIR}/csrc_for_aiter'"
+            "f'{MOE_C_CSRC_FOR_AITER_DIR}'"
         ],
         "verbose": "False",
         "hipify": "True",

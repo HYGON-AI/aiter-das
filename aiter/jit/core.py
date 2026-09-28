@@ -275,6 +275,22 @@ MOE_C_3RDPARTY_DIR = os.environ.get(
 
 MOE_C_DIR = MOE_C_3RDPARTY_DIR
 
+def get_moe_c_arch_source_variant() -> str:
+    override = os.environ.get("MOE_C_ARCH_SOURCE_VARIANT", "").strip()
+    if override:
+        return override
+    return "936_938"
+
+
+MOE_C_ARCH_SOURCE_VARIANT = get_moe_c_arch_source_variant()
+MOE_C_CSRC_FOR_AITER_DIR = f"{MOE_C_DIR}/csrc_for_aiter/{MOE_C_ARCH_SOURCE_VARIANT}"
+if not os.path.isdir(MOE_C_CSRC_FOR_AITER_DIR):
+    raise RuntimeError(
+        "moe_c architecture source directory does not exist: "
+        f"{MOE_C_CSRC_FOR_AITER_DIR}. "
+        "Set MOE_C_ARCH_SOURCE_VARIANT explicitly if needed."
+    )
+
 os.environ["AITER_META_DIR"] = AITER_META_DIR
 
 
