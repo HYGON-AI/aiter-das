@@ -980,8 +980,19 @@ def get_args_of_build(
     def convert(d_ops: dict, module_name: str):
         # optCompilerConfig.json is executable build configuration shipped with
         # this module, not a user/model input. Treat changes to it as code changes.
+        resolved_build_args = copy.deepcopy(d_opt_build_args)
+        skip_if = d_ops.get("skip_if", False)
+        if isinstance(skip_if, str):
+            skip_if = eval(skip_if)
+        resolved_build_args["skip_if"] = skip_if
+        # Skipped modules must not evaluate sources, flags or optional imports.
+        if skip_if:
+            return resolved_build_args
+
         converted_ops = {}
         for k, val in d_ops.items():
+            if k == "skip_if":
+                continue
             if isinstance(val, list):
                 converted_list = []
                 for el in val:
@@ -1002,7 +1013,6 @@ def get_args_of_build(
                 converted_ops[k] = val
 
         # undefined compile features will be replaced with default value
-        resolved_build_args = copy.deepcopy(d_opt_build_args)
         resolved_build_args.update(converted_ops)
         return resolved_build_args
 
