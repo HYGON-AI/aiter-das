@@ -80,5 +80,6 @@ from .ops.opus import *
 # from . import mla
 from .ops.fla import *
 from .ops.kvcache_metadata import fused_metadata_kernel_general
+from .ops.blockwise_scaling import *
 from .utility import dtypes,fp4_utils
 from .ops.fused_rmsnorm_rope import *
