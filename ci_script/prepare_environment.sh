@@ -103,6 +103,9 @@ fi
 # requirements.txt dependency.  Do not replace its compatible runtime.
 python -c 'import boltops, einops, ninja, numpy, packaging, pandas, psutil, pybind11, pytest, tabulate, torch, triton, yaml, zmq'
 
+# Match the build-tool version required by the source release.
+python -m pip install --index-url https://pypi.org/simple setuptools==79.0.1
+
 # These build tools are absent from the SGLang image but are published on
 # public PyPI. Do not reinstall them when a future CI image already provides
 # them.

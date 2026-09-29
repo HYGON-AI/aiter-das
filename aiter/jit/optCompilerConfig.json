@@ -98,6 +98,18 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_kvcache": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/kvcache_metadata_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/fused_metadata_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_cpp_api": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/cpp_api_pybind.cu'",
@@ -112,6 +124,9 @@
             "f'{AITER_CSRC_DIR}/fla/fused_sigmoid_gating_delta_rule.cu'",
             "f'{AITER_CSRC_DIR}/fla/fused_recurrent_gated_delta_rule_packed_decode.cu'",
             "f'{AITER_CSRC_DIR}/fla/chunk_fwd_o.cu'",
+            "f'{AITER_CSRC_DIR}/fla/chunk_gated_delta_rule_fwd_kkt_solve.cu'",
+            "f'{AITER_CSRC_DIR}/fla/instances/chunk_gated_delta_rule_fwd_kkt_solve_fp16.cu'",
+            "f'{AITER_CSRC_DIR}/fla/instances/chunk_gated_delta_rule_fwd_kkt_solve_bf16.cu'",
             "f'{AITER_CSRC_DIR}/fla/instances/fla_hdimk128_hdimv128_bf16_statefp32_bv16.cu'",
             "f'{AITER_CSRC_DIR}/fla/instances/fla_hdimk128_hdimv128_bf16_statefp32_bv32.cu'",
             "f'{AITER_CSRC_DIR}/fla/instances/fla_hdimk128_hdimv128_bf16_statebf16_bv16.cu'",
@@ -647,6 +662,19 @@
         "hipify": "True",
         "blob_gen_cmd": "''"
     },
+    "module_sampling": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/sampling_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/sampling.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "hipify": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_prefer_hipcc": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/topk_per_row_pybind.cu'",
@@ -670,7 +698,11 @@
             "f'{AITER_CSRC_DIR}/kernels/topk_transform.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "'-O1' if get_gfx() == 'gfx946' else None",
+            "'-mllvm -enable-post-misched=1' if get_gfx() in ('gfx936', 'gfx938') else None"
+        ],
+        "prefer_hipcc": "get_gfx() in ('gfx936', 'gfx938')",
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",

@@ -83,9 +83,10 @@ mkdir -p "${BUILD_DIR}"
 # shellcheck source=../hcu_build_helpers.sh
 source "${SCRIPT_DIR}/../hcu_build_helpers.sh"
 PY_LDFLAGS="$(python3-config --ldflags --embed 2>/dev/null || python3-config --ldflags 2>/dev/null || true)"
+PY_INCLUDES="$(python3-config --includes 2>/dev/null || true)"
 hcu_cxx_link "${BUILD_DIR}" "${CXX}" -std=c++20 -O2 \
     -D_GLIBCXX_USE_CXX11_ABI="${CXX11_ABI}" \
-    -I"${AITER_CSRC}/include" ${TORCH_INCLUDES} \
+    -I"${AITER_CSRC}/include" ${PY_INCLUDES} ${TORCH_INCLUDES} \
     "${SCRIPT_DIR}/test_chunk_fwd_o_torch_api.cpp" \
     -L"${SO_DIR}" ${TORCH_LIB_DIRS} \
     -Wl,-rpath,"${SO_DIR}" -Wl,-rpath,"${TORCH_LIB}" \

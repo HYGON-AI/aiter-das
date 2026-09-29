@@ -357,7 +357,7 @@ prefetch_h_stage64_to_lds_doc(Element *__restrict__ rhs_lds,
         const int offset_v = element_offset * int(sizeof(Element));
         const int target_addr =
             lds_base + k_stage64 * kStageBytes + area * kAreaBytes +
-            (area << 16);
+            (area << kFlaLdsWrapShift);
         fla_buffer_load_dwordx4_to_lds_inline(
             buffer.buffer_res, target_addr, offset_v);
     }
@@ -401,7 +401,7 @@ prefetch_k_stage64_to_lds_doc(Element *__restrict__ rhs_lds,
             t_local < valid_t ? element_offset * int(sizeof(Element)) : -1;
         const int target_addr =
             lds_base + k_stage64 * kStageBytes + area * kAreaBytes +
-            (area << 16);
+            (area << kFlaLdsWrapShift);
         fla_buffer_load_dwordx4_to_lds_inline(
             buffer.buffer_res, target_addr, offset_v);
     }
@@ -583,7 +583,7 @@ prefetch_v_stage32_to_lds_doc(Element *__restrict__ v_lds,
     }
     const int target_addr =
         lds_base + area * kAreaBytes +
-        ((t_parity * kOddRowWrapDwordx4) << 16);
+        ((t_parity * kOddRowWrapDwordx4) << kFlaLdsWrapShift);
     fla_buffer_load_dwordx4_to_lds_inline(
         buffer.buffer_res, target_addr, offset_v);
 }

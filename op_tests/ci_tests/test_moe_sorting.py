@@ -398,9 +398,16 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--invalid-routes", action="store_true")
+    parser.add_argument("--mask-abi", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     options = parser.parse_args()
-    if options.invalid_routes:
+    if options.mask_abi:
+        if __package__:
+            from .moe_sorting_res.moe_mask_abi_cases import run_mask_abi_suite
+        else:
+            from moe_sorting_res.moe_mask_abi_cases import run_mask_abi_suite
+        run_mask_abi_suite(smoke=options.smoke)
+    elif options.invalid_routes:
         if __package__:
             from .moe_sorting_res.moe_sorting_invalid_cases import run_invalid_suite
         else:

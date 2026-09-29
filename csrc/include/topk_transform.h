@@ -1,4 +1,9 @@
-// These interfaces were ported from sglang.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2025 SGLang Team. All Rights Reserved.
+//
+// These declarations were ported from SGLang's sgl-kernel/include/sgl_kernel_ops.h
+// by Hygon: split into an AITER header and use torch::Tensor in the declarations.
+// See LICENSE.Apache-2.0 for the applicable terms.
 #pragma once
 
 #include <ATen/ATen.h>

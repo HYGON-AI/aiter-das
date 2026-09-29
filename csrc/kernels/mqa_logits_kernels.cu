@@ -1668,6 +1668,7 @@ torch::Tensor mqa_logits(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     MQA_LOGITS_PYBIND;
+    m.def("paged_mqa_logits_alloc", &paged_mqa_logits_alloc,"Validated allocating paged MQA launch");
     m.def("paged_mqa_logits_opus", &paged_mqa_logits_opus,
           "gfx938/gfx946 FP8 paged MQA Opus launch (output preallocated)");
 }

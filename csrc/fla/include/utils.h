@@ -17,6 +17,14 @@ namespace FLA_NAMESPACE {
 #define FLA_BV16_PROJECTION_INLANE_ASM 1
 #endif
 
+// For dwordx4 LDS loads, WRAP values 0..7 select 16-byte slots. gfx92a
+// moves this encoding from M0[18:16] to the low bits of M0[28:24].
+#if defined(__gfx92a__)
+constexpr int kFlaLdsWrapShift = 24;
+#else
+constexpr int kFlaLdsWrapShift = 16;
+#endif
+
 // Gate/state scaling exp: UseSafeExp clamps x > 0 to 0 with natural exp;
 // otherwise UseExp2 selects exp2 vs e^x via HIP multiply + exp2 builtin.
 template <bool UseSafeExp, bool UseExp2>
@@ -72,7 +80,7 @@ fla_make_gemm0_projection_v4(const fla_f32x4 c0, const int lane_k_group)
     const uint32_t c0_3 = ck_tile::bit_cast<uint32_t>(c0[3]);
 
 #if FLA_BV16_PROJECTION_INLANE_ASM && \
-    (defined(__gfx928__) || defined(__gfx936__) || defined(__gfx938__))
+    (defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__))
     uint32_t r0 = c0_0;
     uint32_t r1 = c0_1;
     uint32_t r2 = c0_2;
@@ -372,7 +380,7 @@ fla_prefetch_w_to_lds(Element *w_lds_base, const Element *w_gmem_src,
             const int lds_offset =
                 64 * kElemsPerAccess * sizeof(Element) *
                 (ir + ic * kIteratorRow) * kNWarps;
-            const int wrap_offset = (warp_id + ir * kNWarps) << 16;
+            const int wrap_offset = (warp_id + ir * kNWarps) << kFlaLdsWrapShift;
             const int target_addr =
                 __builtin_amdgcn_readfirstlane(
                     lds_addr_per_wave + lds_offset + wrap_offset);
@@ -468,7 +476,7 @@ fla_prefetch_k_to_lds(Element *k_lds_base, const Element *k_gmem_src,
          warp_id * stride_src) *
         sizeof(Element);
     const int warp_lds_offset = warp_id * 64 * kElemsPerAccess * sizeof(Element);
-    const int wrap_offset = (4 << 16) * (warp_id & 1);
+    const int wrap_offset = (4 << kFlaLdsWrapShift) * (warp_id & 1);
 
     const AccessType *vec_ptr = reinterpret_cast<const AccessType *>(k_gmem_src);
     const int lds_addr_per_wave =
@@ -491,7 +499,7 @@ fla_prefetch_k_to_lds(Element *k_lds_base, const Element *k_gmem_src,
                 ir * kLanesInRow * kNWarps;
             offset_v = load_row < valid_t ? offset_v : -1;
         }
-#if defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
         if constexpr (CheckBounds || !FLA_BV16_INLINE_K_LDS) {
             auto *lds_addr =
                 reinterpret_cast<__attribute__((address_space(3))) int *>(

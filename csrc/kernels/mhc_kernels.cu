@@ -60,12 +60,7 @@
 static_assert(opus::get_warp_size() == 64, "HCU expects wave64");
 
 #if defined(__gfx946__)
-// TODO(gfx946 toolchain): this target needs the HCU spelling for raw-buffer
-// loads into LDS.  K8 FP32/TF32 MMAC has also been disabled below, but the
-// complete MHC translation unit still terminates in the compiler backend with
-// "Operand has incorrect register class" and no source location.  Keep this
-// branch isolated from gfx936/gfx938 and revalidate it after the gfx946
-// compiler/PMD image is updated; do not infer a PMD runtime failure here.
+// gfx946 needs the HCU spelling for raw-buffer loads into LDS.
 #define AITER_MHC_RAW_BUFFER_LOAD_LDS __builtin_hcu_raw_buffer_load_lds
 #else
 #define AITER_MHC_RAW_BUFFER_LOAD_LDS __builtin_amdgcn_raw_buffer_load_lds
@@ -2586,6 +2581,10 @@ namespace aiter {
         int loop = sub_hidden_size / round_elems;
 
         auto global_direct_to_lds = [&](int buf, int round) {
+            // Buffer byte offsets are 32-bit. Multiplying by sizeof(DTYPE_I)
+            // directly promotes them to 64-bit size_t; the gfx946 HCU builtin
+            // then lowers a VGPR pair into an invalid V_MOV_B32 source operand.
+            constexpr uint32_t element_bytes = sizeof(DTYPE_I);
             int global_x_offset = round * round_elems + tid * elems_per_thread;
             int global_residual_offset0 = round * round_elems + tid * elems_per_thread + hidden_size * 0;
             int global_residual_offset1 = round * round_elems + tid * elems_per_thread + hidden_size * 1;
@@ -2624,7 +2623,7 @@ namespace aiter {
                 x_addr,
                 (__attribute__((address_space(3))) int*)smem_x_warp_addr,
                 8 * 2, // 单位是字节, 此处读取4 * sizeof(bf16)字节
-                global_x_offset * sizeof(DTYPE_I),
+                global_x_offset * element_bytes,
                 0,
                 0, /* immediate offset, instruction offset */
                 0 /* auxilariy data| bit 0: glc, bit 1: slc, bit 2: dlc, bit 3: cache swizzle */
@@ -2634,7 +2633,7 @@ namespace aiter {
                 residual_addr,
                 (__attribute__((address_space(3))) int*)smem_residual_warp_addr0,
                 8 * 2, // 单位是字节, 此处读取4 * sizeof(bf16)字节
-                global_residual_offset0 * sizeof(DTYPE_I),
+                global_residual_offset0 * element_bytes,
                 0,
                 0, /* immediate offset, instruction offset */
                 0 /* auxilariy data| bit 0: glc, bit 1: slc, bit 2: dlc, bit 3: cache swizzle */
@@ -2643,7 +2642,7 @@ namespace aiter {
                 residual_addr,
                 (__attribute__((address_space(3))) int*)smem_residual_warp_addr1,
                 8 * 2, // 单位是字节, 此处读取4 * sizeof(bf16)字节
-                global_residual_offset1 * sizeof(DTYPE_I),
+                global_residual_offset1 * element_bytes,
                 0,
                 0, /* immediate offset, instruction offset */
                 0 /* auxilariy data| bit 0: glc, bit 1: slc, bit 2: dlc, bit 3: cache swizzle */
@@ -2652,7 +2651,7 @@ namespace aiter {
                 residual_addr,
                 (__attribute__((address_space(3))) int*)smem_residual_warp_addr2,
                 8 * 2, // 单位是字节, 此处读取4 * sizeof(bf16)字节
-                global_residual_offset2 * sizeof(DTYPE_I),
+                global_residual_offset2 * element_bytes,
                 0,
                 0, /* immediate offset, instruction offset */
                 0 /* auxilariy data| bit 0: glc, bit 1: slc, bit 2: dlc, bit 3: cache swizzle */
@@ -2661,7 +2660,7 @@ namespace aiter {
                 residual_addr,
                 (__attribute__((address_space(3))) int*)smem_residual_warp_addr3,
                 8 * 2, // 单位是字节, 此处读取4 * sizeof(bf16)字节
-                global_residual_offset3 * sizeof(DTYPE_I),
+                global_residual_offset3 * element_bytes,
                 0,
                 0, /* immediate offset, instruction offset */
                 0 /* auxilariy data| bit 0: glc, bit 1: slc, bit 2: dlc, bit 3: cache swizzle */

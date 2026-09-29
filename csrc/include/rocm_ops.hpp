@@ -118,33 +118,33 @@ namespace py = pybind11;
             py::arg("out"), py::arg("input"), py::arg("alpha"), py::arg("limit"),                        \
             py::arg("mode"), py::arg("rows_per_block") = 1, py::arg("vec_size") = 2);                    \
       m.def("fuse_silu_mul_quant", &aiter::fuse_silu_mul_quant,                                          \
-            "Fused silu_and_mul + per-token int8 dynamic quant (lightop port).",                         \
+            "Fused silu_and_mul + per-token int8 dynamic quant.",                         \
             py::arg("out"), py::arg("input"), py::arg("scales"),                                         \
             py::arg("num_local_tokens_tensor") = std::nullopt,                                           \
             py::arg("topk") = 1, py::arg("expect_m") = -1,                                               \
             py::arg("expert_ids") = std::nullopt);                                                       \
       m.def("fuse_silu_mul_fp8_quant", &aiter::fuse_silu_mul_fp8_quant,                                  \
-            "Fused silu_and_mul + per-token fp8 dynamic quant (lightop port).",                          \
+            "Fused silu_and_mul + per-token fp8 dynamic quant.",                          \
             py::arg("out"), py::arg("input"), py::arg("scales"), py::arg("fp8type") = 0,                 \
             py::arg("num_local_tokens_tensor") = std::nullopt,                                           \
             py::arg("topk") = 1, py::arg("expect_m") = -1,                                               \
             py::arg("expert_ids") = std::nullopt);                                                       \
       m.def("fuse_silu_mul_quant_ep", &aiter::fuse_silu_mul_quant_ep,                                    \
-            "Fused silu_and_mul + per-token int8 quant, EP layout (lightop port).",                      \
+            "Fused silu_and_mul + per-token int8 quant, EP layout.",                      \
             py::arg("out"), py::arg("input"), py::arg("scales"),                                         \
             py::arg("tokens_per_expert") = std::nullopt,                                                 \
             py::arg("num_local_tokens_tensor") = std::nullopt,                                           \
             py::arg("topk") = 1, py::arg("expect_m") = -1);                                              \
       m.def("fuse_silu_mul_fp8_quant_ep", &aiter::fuse_silu_mul_fp8_quant_ep,                            \
-            "Fused silu_and_mul + per-token fp8 quant, EP layout (lightop port).",                       \
+            "Fused silu_and_mul + per-token fp8 quant, EP layout.",                       \
             py::arg("out"), py::arg("input"), py::arg("scales"), py::arg("fp8type") = 0,                 \
             py::arg("tokens_per_expert") = std::nullopt,                                                 \
             py::arg("num_local_tokens_tensor") = std::nullopt,                                           \
             py::arg("topk") = 1, py::arg("expect_m") = -1);                                              \
       m.def("fuse_silu_and_mul_ep", &aiter::fuse_silu_and_mul_ep,                                        \
-            "Masked silu_and_mul on EP layout (lightop port).",                                          \
+            "Masked silu_and_mul on EP layout.",                                          \
             py::arg("out"), py::arg("input"), py::arg("mask_m"), py::arg("expect_m") = -1);              \
-      m.def("relu2", &aiter::relu2, "out = relu(x)^2 (lightop port).",                                   \
+      m.def("relu2", &aiter::relu2, "out = relu(x)^2.",                                   \
             py::arg("out"), py::arg("input"));
 
 #define MOE_C_ACTIVATION_PYBIND                                                        \
@@ -459,6 +459,16 @@ namespace py = pybind11;
             "Tensor block_table, Tensor k_scale, Tensor v_scale, "                           \
             "str kv_cache_dtype) -> ()");
 
+#define KVCACHE_METADATA_PYBIND                                                             \
+      m.def("fused_metadata_kernel_general", &fused_metadata_kernel_general,                \
+            "fused_metadata_kernel_general",                                                \
+            py::arg("seq_lens"), py::arg("req_to_token"), py::arg("req_pool_indices"),      \
+            py::arg("cache_seqlens_int32"), py::arg("cu_seqlens_k"), py::arg("page_table"), \
+            py::arg("swa_page_table") = std::nullopt,                                       \
+            py::arg("full_to_swa_mapping") = std::nullopt,                                  \
+            py::arg("B") = 0, py::arg("max_seq_pages") = 0, py::arg("page_size") = 1,       \
+            py::arg("seq_len_delta") = 0, py::arg("use_swa") = false);
+
 #define CPP_API_PYBIND                                                                         \
     m.def("moe_sorting_fwd",                                                                    \
           &aiter::native::moe_sorting_fwd,                                                      \
@@ -625,6 +635,12 @@ namespace py = pybind11;
           py::arg("scale") = 1.0, py::arg("cu_seqlens") = std::nullopt,                       \
           py::arg("chunk_indices") = std::nullopt, py::arg("chunk_size") = 64,                \
           py::arg("use_exp2") = false, py::arg("transpose_state_layout") = true);             \
+                                                                                                \
+    m.def("chunk_gated_delta_rule_fwd_kkt_solve_hip",                                          \
+          &aiter::native::chunk_gated_delta_rule_fwd_kkt_solve_hip,                            \
+          py::arg("k"), py::arg("beta"), py::arg("g") = std::nullopt,                       \
+          py::arg("cu_seqlens") = std::nullopt, py::arg("chunk_indices") = std::nullopt,      \
+          py::arg("chunk_size") = 64);                                                        \
                                                                                                 \
 
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \
@@ -1203,8 +1219,47 @@ namespace py = pybind11;
             "                         int block_size, Tensor! sorted_token_ids," \
             "                         Tensor! experts_ids,"                      \
             "                         Tensor! num_tokens_post_pad) -> ()");      \
-
-
+      m.def("ep_scatter", &aiter::ep_scatter,                                    \
+            "ep_scatter(Tensor aq, Tensor aq_scale, Tensor topk_ids,"            \
+            "           Optional[Tensor] expert_map, Tensor! expert_num_tokens," \
+            "           Tensor! aq_out, Tensor! aq_scale_out, Tensor! m_indices," \
+            "           Tensor! inv_perm, int local_num_experts,"                \
+            "           int alignment) -> ()");                                  \
+      m.def("ep_gather", &aiter::ep_gather,                                      \
+            "ep_gather(Tensor a, Tensor topk_ids, Tensor topk_weights,"          \
+            "          Tensor inv_perm, Optional[Tensor] expert_map,"            \
+            "          Tensor! output) -> ()");                                  \
+      m.def("ep_build_m_indices", &aiter::ep_build_m_indices,                    \
+            "ep_build_m_indices(Tensor topk_ids, Tensor! m_indices,"             \
+            "                   int local_num_experts, int alignment) -> ()");   \
+      m.def("ep_fused_quant_scatter", &aiter::ep_fused_quant_scatter,            \
+            "ep_fused_quant_scatter(Tensor input, Tensor topk_ids,"              \
+            "                       Optional[Tensor] expert_map,"                \
+            "                       Tensor! expert_num_tokens, Tensor! aq_out,"  \
+            "                       Tensor! aq_scale_out, Tensor! m_indices,"    \
+            "                       Tensor! inv_perm, int local_num_experts,"    \
+            "                       int alignment) -> ()");                      \
+      m.def("ep_fused_fp8_quant_scatter", &aiter::ep_fused_fp8_quant_scatter,    \
+            "ep_fused_fp8_quant_scatter(Tensor input, Tensor topk_ids,"          \
+            "                           Optional[Tensor] expert_map,"            \
+            "                           Tensor! expert_num_tokens,"              \
+            "                           Tensor! aq_out, Tensor! aq_scale_out,"   \
+            "                           Tensor! m_indices, Tensor! inv_perm,"    \
+            "                           int local_num_experts, int alignment,"   \
+            "                           int fp8type,"                            \
+            "                           bool fill_padded_m_indices) -> ()");     \
+      m.def("ep_fused_smooth_quant_scatter",                                     \
+            &aiter::ep_fused_smooth_quant_scatter,                               \
+            "ep_fused_smooth_quant_scatter(Tensor input, Tensor topk_ids,"       \
+            "                               Optional[Tensor] expert_map,"        \
+            "                               Tensor! expert_offsets,"             \
+            "                               Tensor smooth_scale, Tensor! aq_out,"\
+            "                               Tensor! aq_scale_out,"               \
+            "                               Tensor! m_indices,"                  \
+            "                               Tensor! inv_perm,"                   \
+            "                               int local_num_experts,"              \
+            "                               int alignment) -> ()");              \
+            
 #define MOE_OP_PYBIND                                                            \
       m.def("fmoe", &fmoe);                                                      \
       m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0,                                   \
@@ -1601,6 +1656,40 @@ namespace py = pybind11;
           py::arg("numRows"),                                                     \
           py::arg("stride0"),                                                     \
           py::arg("stride1"));
+
+#define SAMPLING_PYBIND                                                        \
+    m.def("top_k_sampling_from_probs",                                         \
+          &aiter::sampling::c_top_k_sampling_from_probs,                       \
+          py::arg("probs"),                                                            \
+          py::arg("output"),                                                           \
+          py::arg("maybe_indices"),                                                    \
+          py::arg("maybe_top_k_arr"),                                                  \
+          py::arg("top_k_val"),                                                        \
+          py::arg("deterministic"),                                                    \
+          py::arg("philox_seed"),                                                      \
+          py::arg("philox_offset"));                                                   \
+    m.def("top_p_sampling_from_probs",                                         \
+          &aiter::sampling::c_top_p_sampling_from_probs,                       \
+          py::arg("probs"),                                                            \
+          py::arg("output"),                                                           \
+          py::arg("maybe_indices"),                                                    \
+          py::arg("maybe_top_p_arr"),                                                  \
+          py::arg("top_p_val"),                                                        \
+          py::arg("deterministic"),                                                    \
+          py::arg("philox_seed"),                                                      \
+          py::arg("philox_offset"));                                                   \
+    m.def("top_k_top_p_sampling_from_probs",                                   \
+          &aiter::sampling::c_top_k_top_p_sampling_from_probs,                 \
+          py::arg("probs"),                                                            \
+          py::arg("output"),                                                           \
+          py::arg("maybe_indices"),                                                    \
+          py::arg("maybe_top_k_arr"),                                                  \
+          py::arg("top_k_val"),                                                        \
+          py::arg("maybe_top_p_arr"),                                                  \
+          py::arg("top_p_val"),                                                        \
+          py::arg("deterministic"),                                                    \
+          py::arg("philox_seed"),                                                      \
+          py::arg("philox_offset"));
 
 #define TOPK_TRANSFORM_PYBIND                         \
     m.def("fast_topk_interface",                      \

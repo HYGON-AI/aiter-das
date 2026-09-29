@@ -175,5 +175,23 @@ chunk_fwd_o_vllm_hip_blockdim64(
         transpose_state_layout);
 }
 
+AITER_CPP_TORCH_API torch::Tensor
+chunk_gated_delta_rule_fwd_kkt_solve_hip(
+    const torch::Tensor& k,
+    const torch::Tensor& beta,
+    const std::optional<torch::Tensor>& g,
+    const std::optional<torch::Tensor>& cu_seqlens,
+    const std::optional<torch::Tensor>& chunk_indices,
+    int chunk_size)
+{
+    return ::chunk_gated_delta_rule_fwd_kkt_solve_hip(
+        k,
+        beta,
+        g,
+        cu_seqlens,
+        chunk_indices,
+        chunk_size);
+}
+
 } // namespace native
 } // namespace aiter

@@ -267,9 +267,13 @@ void run_chunk_gated_delta_rule_fwd(
     int selected_bv = force_bv;
     if (selected_bv == 0) {
         const int64_t p = int64_t(params.N) * params.H;
-        // Preserve the established selector on devices not covered by tuning.
+        const bool is_gfx92a_120 =
+            props != nullptr && props->multiProcessorCount == 120 &&
+            std::strncmp(props->gcnArchName, "gfx92a", 6) == 0;
+        // Measured boundary for 120-CU gfx92a; retain the gfx936 fallback.
+        const int bv32_threshold = is_gfx92a_120 ? 16 : 12;
         selected_bv = wide_target_eligible && 2 * p >= 128 ? 64
-                    : (4 * p >= 48 ? 32 : 16);
+                    : (p < bv32_threshold ? 16 : 32);
         if (wide_target_eligible && props->multiProcessorCount == 72) {
             selected_bv = fla_select_bv_gfx938_72(p);
         }

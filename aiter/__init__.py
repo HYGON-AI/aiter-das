@@ -79,5 +79,6 @@ from .ops.opus import *
 # from .ops.trans_ragged_layout import *
 # from . import mla
 from .ops.fla import *
+from .ops.kvcache_metadata import fused_metadata_kernel_general
 from .utility import dtypes,fp4_utils
 from .ops.fused_rmsnorm_rope import *

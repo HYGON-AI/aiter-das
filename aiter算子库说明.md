@@ -943,9 +943,201 @@ fuse_rms_mrope(
 output, scales = moe_swiglu_dynamic_quant_wrapper(scatter_tokens, smooth, experts_tokens_count, experts_tokens_start)
 ```
 
-# 5\. Quant
+### 4\.1\.2 add_swiglu
 
-### 5\.1\.1 per_token_group_quant_fp8
+#### 功能描述
+
+融合两个同形状张量的逐元素加法与 split-half SwiGLU，支持一阶自动求导。
+适用于 LoRA 主干投影输出与增量相加后执行激活的场景；不是 GEMM epilogue，
+也不是交错布局或带裁剪的 SwiGLU 变体。等价参考表达式为：
+
+```Python
+gate, up = (base + delta).chunk(2, dim=-1)
+out = torch.nn.functional.silu(gate) * up
+```
+
+#### 参数说明
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `base` | `torch.Tensor` | 连续的 FP16/BF16 CUDA/HIP 张量，shape 为 `(..., 2 * D)`，至少二维，`D > 0`。 |
+| `delta` | `torch.Tensor` | 与 `base` 的 shape、dtype、device 相同，且连续。不支持广播或隐式类型转换。 |
+| 返回值 | `torch.Tensor` | shape 为 `(..., D)`，dtype、device 与输入一致。 |
+
+#### 调用示例
+
+```Python
+import torch
+from aiter.ops.triton.add_swiglu import add_swiglu
+
+base = torch.randn(128, 512, device="cuda", dtype=torch.bfloat16)
+delta = torch.randn_like(base).requires_grad_()
+out = add_swiglu(base, delta)
+out.float().sum().backward()
+```
+
+#### 注意事项与测试
+
+- 不修改输入，支持空的前导维度及任一或两个输入求导；不支持高阶梯度，未承诺 fullgraph compile/export 兼容性。
+- 显式保留加法、SiLU 等中间结果的输入 dtype 舍入边界；指数等运算仍可能与其他后端不同，不保证逐位一致。
+- 反向保存两个输入并重算加法，不额外保存相加结果；峰值显存收益取决于实际张量生命周期。
+- 上层应分别传入 `base`、`delta`，保留 LoRA scaling、dtype 和模块 hooks 语义。
+- BW1000/gfx936 用户验证：独立测试 25 项、DiffSynth 集成测试 4 项通过；实际训练反馈 loss 无异常，单步约减少 0.3 s。该结果为特定工作负载反馈，不是通用性能保证。
+
+在已配置 AITER 的环境中，选择空闲卡执行（下例为卡 1）：
+
+```Bash
+HIP_VISIBLE_DEVICES=1 python -m pytest -q -s op_tests/test_add_swiglu_training.py
+```
+
+# 5\. TopK
+
+TopK 系列算子用于按元素值或评分选出指定数量的候选，并按接口返回候选值、索引或其他选择结果。本章按选择功能归类，收录基础 TopK 选择、与 softmax 等操作融合的选择，以及选择后的索引转换等相关算子；后续可在本章增加 `topk_plain`、`topk_softmax` 等接口的独立小节。
+
+不同算子的选择维度、K 取值范围、输入类型、输出形式、排序规则及融合行为可能不同，具体约束以各小节为准。章节按算子功能组织，应用场景与模型相关语义在对应算子的功能描述中说明。
+
+## 5\.1 fast_topk_v2
+
+### 功能描述
+
+对第 r 行的 `[start_r,start_r+lengths[r])` 区间执行 TopK，返回相对该有效区间的局部位置 j。若需要访问 score，对应列为 `start_r+j`。`row_starts=None` 时 start 为 0；短行直接返回全部有效位置。
+
+本接口固定 K=2048，返回新分配的 int32 `[Q,2048]`。输出不保证排序，同分允许不同合法选择；有效长度不足 K 时其余位置填 `-1`。`row_starts` 不会加到返回索引中。
+
+### 参数说明
+
+| 参数 | 类型/默认值 | 说明 |
+|---|---|---|
+| `score` | FP32 Tensor `[Q,W]` | 候选分数，列连续 |
+| `lengths` | int32 Tensor `[Q]` | 有效长度，须非负 |
+| `topk` | Python `int` | 固定 2048 |
+| `row_starts` | int32 Tensor `[Q]` 或 `None` | score 起点；须保证起点非负且起点加长度不超过 W |
+| 返回值 | int32 Tensor `[Q,2048]` | 有效区间内的局部索引；无效槽位 -1 |
+
+所有张量须在同一 GPU，lengths 和 row_starts（若提供）为连续 int32；score 为 FP32，列步长为 1，允许非连续行步长。本接口用于推理，不提供反向计算或公开的 `out` 参数。
+
+### 调用示例
+
+```python
+import torch
+from aiter.ops.topk_transform import fast_topk_v2
+
+score = torch.arange(4100, device="cuda", dtype=torch.float32).repeat(2, 1)
+lengths = torch.tensor([4096, 1024], device="cuda", dtype=torch.int32)
+row_starts = torch.tensor([3, 5], device="cuda", dtype=torch.int32)
+indices = fast_topk_v2(score, lengths, 2048, row_starts=row_starts)
+# indices 为 int32 [2,2048]，相对各行有效区间编号；第二行尾部填 -1。
+assert torch.equal(indices[0].sort().values,
+                   torch.arange(2048, 4096, device="cuda", dtype=torch.int32))
+assert (indices[1, 1024:] == -1).all()
+```
+
+## 5\.2 fast_topk_transform_fused
+
+### 功能描述
+
+面向稀疏注意力的分页 KV cache 候选选择，融合 TopK 选择与 page-size-1 页表映射。第 r 行属于请求 s，选中局部位置 j 后输出 `page_table_size_1[s,j]`。decode 每请求一个 Query，prefill 根据 `cu_seqlens_q` 关联多个 Query；接口不计算 logits，也不执行 KV gather。
+
+本接口固定 K=2048，返回新分配的 int32 `[Q,2048]`。输出不保证排序，同分允许不同合法选择；有效长度不足 K 时其余位置填 `-1`。`row_starts` 只指定 score 的有效区间，不会加到查页表的局部位置中。
+
+### 参数说明
+
+| 参数 | 类型/默认值 | 说明 |
+|---|---|---|
+| `score` | FP32 Tensor `[Q,W]` | 候选分数，列连续 |
+| `lengths` | int32 Tensor `[Q]` | 每行有效长度，须落在 score 有效区间和页表容量内 |
+| `page_table_size_1` | int32 Tensor `[S,C]` | 局部 KV 位置到物理编号的页表，page size 必须为 1；列连续，C 覆盖所有有效 KV 位置，不是固定 2048 |
+| `cu_seqlens_q` | int32 Tensor `[S+1]` | Query 分组前缀和，0 开始、Q 结束、单调不减，S 不超过 Q |
+| `topk` | Python `int` | 固定 2048 |
+| `row_starts` | int32 Tensor `[Q]` 或 `None` | 仅影响 score 读取；查页表不加该起点 |
+| 返回值 | int32 Tensor `[Q,2048]` | 页表映射后的物理编号，填充为 -1 |
+
+所有张量须在同一 GPU，lengths、cu_seqlens_q 和 row_starts（若提供）为连续 int32；score 为 FP32，score 与页表的列步长为 1，允许非连续行步长。本接口用于推理，不提供反向计算或公开的 `out` 参数。
+
+当 `row_starts=None` 且 S=Q 时使用 decode 快捷路径，必须保证每请求一个 Query、前缀和为 `[0,1,...,Q]`。所用页编号须有效、非负且不溢出 int32。
+
+### 调用示例
+
+```python
+import torch
+from aiter.ops.topk_transform import fast_topk_transform_fused
+
+device = "cuda:0"
+Q, N, K = 2, 4096, 2048
+score = torch.arange(N, device=device, dtype=torch.float32).repeat(Q, 1)
+lengths = torch.tensor([4096, 3000], device=device, dtype=torch.int32)
+# 一请求一个 Query，因此 S=Q，cu_seqlens_q=[0,1,...,Q]。
+cu_seqlens_q = torch.arange(Q + 1, device=device, dtype=torch.int32)
+# page_size=1；每个有效 KV 位置均有映射，表宽是 N，不是 K。
+pages = torch.arange(N, device=device, dtype=torch.int32)[None, :] * 7
+pages = (pages + torch.tensor([[11], [40000]], device=device,
+                             dtype=torch.int32)).contiguous()
+with torch.inference_mode():
+    indices = fast_topk_transform_fused(
+        score, lengths, pages, cu_seqlens_q, K,
+    )
+assert indices.shape == (Q, K) and indices.dtype == torch.int32
+for r in range(Q):
+    end = int(lengths[r])
+    assert torch.equal(indices[r].sort().values, pages[r, end-K:end])
+```
+
+完整参数约束、prefill / Graph 示例与双架构性能数据见 [fast_topk_transform_fused 算子说明与性能报告](docs/fast_topk_transform_fused.md)。
+
+## 5\.3 fast_topk_transform_ragged_fused
+
+### 功能描述
+
+面向稀疏注意力的 ragged KV 候选选择，融合 TopK 选择与 ragged KV 拼接地址转换，适用于 prefill / extend。选中第 r 行局部位置 j 后返回 `topk_indices_offset[r]+j`。offset 是真实 KV 的拼接起点，独立于 score 的 row_starts；同一序列的多个 Query 可以共用 offset。
+
+本接口固定 K=2048，返回新分配的 int32 `[Q,2048]`。输出不保证排序，同分允许不同合法选择；有效长度不足 K 时其余位置填 `-1`。`row_starts` 不会自动加到输出的 KV 全局索引中。
+
+### 参数说明
+
+| 参数 | 类型/默认值 | 说明 |
+|---|---|---|
+| `score` | FP32 Tensor `[Q,W]` | 候选分数，列连续 |
+| `lengths` | int32 Tensor `[Q]` | 有效长度，须非负且落在 score 有效范围内 |
+| `topk_indices_offset` | int32 Tensor `[Q]` | 每行的 ragged KV 全局起点；加局部索引后须为有效 int32 地址 |
+| `topk` | Python `int` | 固定 2048 |
+| `row_starts` | int32 Tensor `[Q]` 或 `None` | score 起点，None 表示 0，包括长行；不会加到输出索引 |
+| 返回值 | int32 Tensor `[Q,2048]` | ragged KV 全局索引；填充为 -1 |
+
+所有张量须在同一 GPU，lengths、topk_indices_offset 和 row_starts（若提供）为连续 int32；score 为 FP32，列步长为 1，允许非连续行步长。本接口用于推理，不提供反向计算或公开的 `out` 参数。
+
+### 调用示例
+
+```python
+import torch
+from aiter.ops.topk_transform import fast_topk_transform_ragged_fused
+
+device = "cuda:0"  # HCU/ROCm 也使用 PyTorch 的 cuda 设备名
+Q, W, K = 2, 8205, 2048
+# 用递增分数方便核对；实际模型传入已计算好的 FP32 logits。
+score = torch.arange(W, device=device, dtype=torch.float32).repeat(Q, 1)
+lengths = torch.tensor([4096, 3000], device=device, dtype=torch.int32)
+row_starts = torch.tensor([3, 4106], device=device, dtype=torch.int32)
+# KV 拼接地址与 score 列起点不同，不能混用。
+offsets = torch.tensor([0, 8192], device=device, dtype=torch.int32)
+
+with torch.inference_mode():
+    indices = fast_topk_transform_ragged_fused(
+        score, lengths, offsets, K, row_starts=row_starts,
+    )
+assert indices.shape == (Q, K) and indices.dtype == torch.int32
+for r in range(Q):
+    expected = torch.arange(
+        int(offsets[r]) + int(lengths[r]) - K,
+        int(offsets[r]) + int(lengths[r]), device=device,
+    )
+    assert torch.equal(indices[r].sort().values, expected.to(torch.int32))
+```
+
+完整接口契约、Graph 示例与双架构性能数据见 [fast_topk_transform_ragged_fused 算子说明与性能报告](docs/fast_topk_transform_ragged_fused.md)。首次调用可能触发 JIT，应在捕获和性能计时前预热。三个算子统一通过 `python -m pytest -q op_tests/ci_tests/test_topk_transform.py` 验证，不需要新增测试脚本。
+
+# 6\. Quant
+
+### 6\.1\.1 per_token_group_quant_fp8
 
 ### 功能描述
 
@@ -969,9 +1161,9 @@ aiter.per_token_group_quant_fp8(out_q, x, out_s, group_size, eps, use_ue8m0)
 return out_q, out_s
 ```
 
-# 5\. MQA
+# 7\. MQA
 
-### 5\.1\.1 mqa_logits
+## 7\.1 mqa_logits
 
 ### 功能描述
 
@@ -1007,11 +1199,92 @@ logits = mqa_logits(
 )
 ```
 
-# 6. FLA
+## 7\.2 paged_mqa_logits
+
+### 功能描述
+
+`aiter.paged_mqa_logits` 用于分页 KV cache 的 MQA 索引分数计算，所有 head 共享同一份 Key，适用于稀疏注意力的候选 token 评分阶段：
+
+1. 根据 `block_tables` 将逻辑候选位置映射到物理页，读取 FP8 Key 及对应的 FP32 反量化 scale。
+2. 对每个 Query、每个 head 计算 Q 与反量化 Key 的点积，并应用 ReLU。
+3. 使用 `weights` 对各 head 的结果加权求和，输出 FP32 分数矩阵 `[B*R, N]`；权重允许为负数，因此输出也可能为负数。
+4. 根据 `context_lens` 和 Query 位置执行因果屏蔽。请求 `b` 的第 `r` 个 Query 对应输出第 `b*R+r` 行，有效候选范围为 `0 <= n < context_lens[b]-R+r+1`；默认将其余位置填为 `-inf`。
+
+接口不执行 softmax、Value 聚合或 TopK 选择，也不隐式乘以 `1/sqrt(D)`。当前支持 gfx936/gfx938 的 `S=1/64` 页，以及 gfx946 的 `S=1` 页；gfx946 已完成 Perf Model 功能验证，尚无实卡性能结论。
+
+### 参数说明
+
+记 `B` 为请求数，`R` 为每个请求的 Query 数，`H` 为当前 rank 的索引 head 数，`D=128` 为 head 维度，`N=max_model_len` 为输出候选列数，`P` 为物理页数，`S` 为每页 Key 数，`T` 为每个请求的页表容量。
+
+| 参数 | 类型/默认值 | 说明 |
+| --- | --- | --- |
+| `q` | `torch.Tensor` | 连续的 `torch.float8_e4m3fn [B,R,H,128]` Query；要求 `B>0`、`B*R<=65535`、`R∈{1,2,4}`、`H∈{32,64}`。 |
+| `kv_cache` | `torch.Tensor` | 连续的 `torch.uint8 [P,S,1,132]`，存放 FP8 Key 和 FP32 scale；要求 `P>0`、`P*S*132<=2**31-1`。每页的实际打包布局见下文。 |
+| `weights` | `torch.Tensor` | 连续的 `torch.float32 [B*R,H]`，每个 Query 对各 head 的权重，允许正数、负数和零。 |
+| `context_lens` | `torch.Tensor` | 连续的 `torch.int32 [B]`，每个请求的有效长度；调用方保证 `R<=context_lens[b]<=min(N,T*S)`。 |
+| `block_tables` | `torch.Tensor` | 连续的 `torch.int32 [B,T]`，逻辑页到物理页的映射；`0<T<2**31`，所有被使用的物理页编号必须位于 `[0,P)`。 |
+| `max_model_len` | Python `int` | 输出宽度 `N`；要求 `0<N<2**31`，不接受 `bool`。 |
+| `out` | `torch.Tensor 或 None`，默认 `None` | 可选的连续 FP32 输出缓冲区 `[B*R,N]`；为 `None` 时内部分配，传入时复用并返回该张量，不得与任一输入共享底层 storage。 |
+| `clean_logits` | `bool`，默认 `True` | 默认保证全部无效位置为 `-inf`，包括远端尾部；设为 `False` 时由调用方负责尾部初始化或屏蔽。 |
+| `kernelId` | `int 或 None`，默认 `None` | 默认自动选择。gfx936 支持 ID6/7；gfx938 支持 ID0–3、6/7，其中 ID0–3 仅支持 `S=1`；ID7 仅用于 `H=32、R=1`。gfx946 支持 ID4/5，默认 ID4，且仅支持 `S=1`。 |
+| 返回值 | `torch.Tensor` | FP32 分数矩阵 `[B*R,N]`，与输入位于同一 GPU。 |
+
+`out`、`clean_logits`、`kernelId` 为仅限关键字参数。所有输入及 `out` 必须位于同一 GPU、连续存储且不需要梯度；Q 和 KV cache 的起始地址至少 4 字节对齐。接口用于推理，不提供 autograd。
+
+KV cache 按整页打包：先存放 `S*128` 个 FP8 Key 字节，再存放 `S*4` 个 FP32 scale 字节，每个 Key 对应一个正的有限 scale。例如 `S=64` 时，每页前 8192 字节是 Key，后 256 字节是 scale，不能按每个 token 的 128+4 字节交错排列。接口不会在热路径把设备上的长度、页表和 scale 内容拷回 CPU 检查，调用方须保证这些数值有效。
+
+### 调用示例
+
+以下示例在 gfx936/gfx938 上构造 `S=64` 的独立物理页并调用公开接口；如在 gfx946 Perf Model 上验证，将 `S` 改为 1 后重新构造输入即可。
+
+```Python
+import torch
+import aiter
+
+device = "cuda:0"  # ROCm/HCU 环境同样使用 PyTorch 的 cuda 命名
+B, R, H, D = 2, 1, 32, 128
+S, N = 64, 256
+T = (N + S - 1) // S
+P = B * T  # 每个请求使用互不重叠的物理页
+
+q = (torch.randn(B, R, H, D, device=device) * 0.25).to(
+    torch.float8_e4m3fn
+)
+keys = (torch.randn(P, S, D, device=device) * 0.25).to(
+    torch.float8_e4m3fn
+)
+scales = torch.ones(P, S, device=device, dtype=torch.float32)
+
+# 每页先放全部 Key 字节，再放全部 scale 字节。
+raw = torch.empty(P, S * (D + 4), device=device, dtype=torch.uint8)
+raw[:, :S * D].copy_(keys.view(torch.uint8).reshape(P, S * D))
+raw[:, S * D:].copy_(scales.view(torch.uint8).reshape(P, S * 4))
+kv_cache = raw.view(P, S, 1, D + 4)
+
+weights = torch.randn(B * R, H, device=device, dtype=torch.float32)
+context_lens = torch.tensor([N, N - 13], device=device, dtype=torch.int32)
+block_tables = torch.arange(P, device=device, dtype=torch.int32).reshape(B, T)
+
+logits = aiter.paged_mqa_logits(
+    q, kv_cache, weights, context_lens, block_tables, N,
+    clean_logits=True, kernelId=None,
+)
+# logits 为 FP32 [2, 256]；第二个请求的最后 13 列为 -inf。
+
+# 可选：复用输出缓冲区。
+out = torch.empty(B * R, N, device=device, dtype=torch.float32)
+aiter.paged_mqa_logits(
+    q, kv_cache, weights, context_lens, block_tables, N, out=out,
+)
+```
+
+首次调用可能触发 JIT 编译，进行 Graph 捕获或性能计时前应先预热。完整接口说明、Graph 示例及 gfx936/gfx938 典型 shape 性能数据见 [paged_mqa_logits 算子说明与性能报告](docs/paged_mqa_logits.md)。
+
+# 8. FLA
 
 FLA（Flash Linear Attention）相关算子面向 vLLM / SGLang 前端的 gated delta-rule 推理路径。当前 HIP 实现对外提供 `chunk_gated_delta_rule_fwd` 系列接口，参数名与 Triton 参考实现对齐，便于一行替换调用。
 
-## 6.1 chunk_gated_delta_rule_fwd 算子介绍
+## 8.1 chunk_gated_delta_rule_fwd 算子介绍
 
 `chunk_gated_delta_rule_fwd` 是 FLA Triton `chunk_gated_delta_rule_fwd_h` 的 HIP 实现，按 chunk 递推 gated delta-rule 隐状态，并可选写出 `v_new` 与 `final_state`。
 
@@ -1023,7 +1296,7 @@ FLA（Flash Linear Attention）相关算子面向 vLLM / SGLang 前端的 gated 
 
 JIT 模块为 `module_cpp_api`（见 `aiter/jit/optCompilerConfig.json`）。当前支持的 shape 特化：`headDimK == 128`、`headDimV == 128`、`chunk_size == 64`、`transpose_state_layout=True`。元素类型为 fp16/bf16，状态以 fp32 累加；gate 张量 `g` / `gk` 必须为 fp32。
 
-### 6.1.1 chunk_gated_delta_rule_fwd_vllm_hip_blockdim64
+### 8.1.1 chunk_gated_delta_rule_fwd_vllm_hip_blockdim64
 
 #### 功能描述
 
@@ -1077,7 +1350,7 @@ h, v_new, final_state = aiter.chunk_gated_delta_rule_fwd_vllm_hip_blockdim64(
 # 兼容别名：aiter.chunk_gated_delta_rule_fwd(...) 等价
 ```
 
-### 6.1.2 chunk_gated_delta_rule_fwd_sglang_hip_blockdim64
+### 8.1.2 chunk_gated_delta_rule_fwd_sglang_hip_blockdim64
 
 #### 功能描述
 
@@ -1140,3 +1413,74 @@ h, v_new = aiter.chunk_gated_delta_rule_fwd_sglang_hip_blockdim64(
    - 优先由 vLLM/SGLang 等上层准备并跨层复用；若缺失或为空，HIP wrapper 会在当次调用内补齐（内部 helper，不对外导出）。
 4. **Kernel 路径：** launcher 在 BV16 / BV32 间自动选择；当估计 BV32 block 数 `ceil(V/32) * N * H` 达到阈值（48 blocks，即 `V=128` 时约 `N * H >= 12`）时走 BV32，否则回退 BV16。
 5. **测试与源码：** 详见 `csrc/fla/README.md`；可运行 `op_tests/test_chunk_gated_hip_vllm.py` 与 `op_tests/test_chunk_gated_hip_sglang.py` 做数值对照。
+
+# 9. KVCache
+
+**KVCache** 节点收录分页注意力推理中的 KV cache 元数据类算子：在一次 kernel launch 内完成长度换算、前缀和与页表 gather 等轻量元数据准备，避免多 kernel 串联的 launch 开销与中间缓冲。
+
+## 9.1 fused_metadata 算子介绍
+
+### 功能描述
+
+面向分页注意力推理的 KV cache 元数据融合准备，单次 kernel launch 完成三步计算并可选生成 SWA（滑动窗口注意力）页表：
+
+```text
+cache_seqlens_int32[i] = seq_lens[i] + seq_len_delta
+cu_seqlens_k[0] = 0;  cu_seqlens_k[i+1] = Σ_{j<=i} cache_seqlens_int32[j]
+page_table[i, c] = req_to_token[req_pool_indices[i], c*page_size] >> log2(page_size)
+swa_page_table[i, c] = full_to_swa_mapping[req_to_token[req_pool_indices[i], c*page_size]] >> log2(page_size)   # 仅 use_swa=True
+```
+
+输出**原地写入**调用方缓冲，接口无返回值；前缀和在 int64 上累加后写回 int32。`page_table` / `swa_page_table` 覆盖每行全部 `max_seq_pages` 列（与各请求实际序列长度无关，有效页范围由调用方结合 `cache_seqlens_int32` 解释）。`page_size` 必须为 2 的幂，`page_size=1` 时为 token 级直拷；`B=0` 空批仅将 `cu_seqlens_k[0]` 置 0，不启动 kernel。接口用于推理，不提供反向计算；首次调用触发 `module_kvcache` 模块 JIT 编译。
+
+### 参数说明
+
+| 参数 | 类型/默认值 | 说明 |
+|---|---|---|
+| `seq_lens` | int32/int64 Tensor `[B]` | 每请求 KV 长度；支持非零行步长 |
+| `req_to_token` | int32 Tensor `[R, max_tokens]` | token 级映射表，第 r 行第 t 列为该请求第 t 个 token 的物理槽位；行/列步长任意 |
+| `req_pool_indices` | int32/int64 Tensor `[B]` | 每请求在 `req_to_token` 中的行号，取值 `[0, R)` |
+| `cache_seqlens_int32` | int32 Tensor `[B]`，连续 | 输出：`seq_lens + seq_len_delta` |
+| `cu_seqlens_k` | int32 Tensor `[B+1]`，连续 | 输出：专属前缀和，首项 0、末项为总 token 数 |
+| `page_table` | int32 Tensor `[B, P]`，连续 | 输出：每请求页表，第 c 页取 `req_to_token[pool, c*ps] >> log2(ps)`，覆盖全部 P 列 |
+| `swa_page_table` | 可选 int32 Tensor `[B, P]`，默认 `None` | 输出：SWA 页表；`use_swa=True` 时必填 |
+| `full_to_swa_mapping` | 可选 int32/int64 Tensor `[max_tokens]`，默认 `None` | full→SWA 槽位映射；`use_swa=True` 时必填 |
+| `B` / `max_seq_pages` | Python int，默认 0 | 批内请求数 / 每请求最大页数 P，非负且不超 int32 |
+| `page_size` | Python int，默认 1 | 页大小，必须为正的 2 的幂 |
+| `seq_len_delta` | Python int，默认 0 | 长度偏移，直接计入 `cache_seqlens_int32` |
+| `use_swa` | Python bool，默认 `False` | 是否同步生成 SWA 页表 |
+| 返回值 | `None` | 输出原地写入，无返回张量 |
+
+所有张量须在同一 GPU；输出必须为连续 int32；`seq_lens` / `req_pool_indices` / `full_to_swa_mapping` 接受 int32 或 int64（内部零拷贝分发）。接口完整校验 device / dtype / shape / contiguity 契约（违反抛 `RuntimeError`），但不校验 GPU 上的索引取值；调用方保证 `req_pool_indices` 落在 `[0, R)`、前缀总和不溢出 int32、`full_to_swa_mapping` 覆盖所引用槽位。
+
+### 调用示例
+
+```python
+import torch
+from aiter.ops.kvcache_metadata import fused_metadata_kernel_general
+
+device = "cuda:0"
+B, R, P, ps = 4, 8, 512, 16           # 请求数 / 池行数 / 每请求最大页数 / 页大小
+max_tokens = P * ps
+seq_lens = torch.tensor([8000, 4096, 16, 123], device=device, dtype=torch.int32)
+req_to_token = torch.arange(R * max_tokens, device=device,
+                            dtype=torch.int32).reshape(R, max_tokens)
+req_pool_indices = torch.arange(B, device=device, dtype=torch.int32)
+# 输出缓冲由调用方分配并保持存活；全部 int32 且连续。
+cache_seqlens_int32 = torch.empty(B, device=device, dtype=torch.int32)
+cu_seqlens_k = torch.empty(B + 1, device=device, dtype=torch.int32)
+page_table = torch.empty(B, P, device=device, dtype=torch.int32)
+with torch.inference_mode():
+    fused_metadata_kernel_general(
+        seq_lens, req_to_token, req_pool_indices,
+        cache_seqlens_int32, cu_seqlens_k, page_table,
+        B=B, max_seq_pages=P, page_size=ps,
+    )
+assert torch.equal(cu_seqlens_k, torch.tensor(
+    [0, 8000, 12096, 12112, 12235], device=device, dtype=torch.int32))
+# 第 i 行第 c 页 = req_to_token[req_pool_indices[i], c*ps] // ps；全部 P 列都会写入。
+row = req_to_token[req_pool_indices[0]]
+assert torch.equal(page_table[0], row[::ps] // ps)
+```
+
+实现采用同一算法的三个 tile 变体（2048/1024/256）在宿主侧按 workgroup 数路由，2D grid 并行 gather，分级前缀和扫描；无 gfx 特化分支，各支持架构通用。完整参数约束、SWA / Graph 说明与 AITER / 原实现 / Triton 三方性能对比见 [fused_metadata 算子说明与性能报告](docs/fused_metadata.md)。

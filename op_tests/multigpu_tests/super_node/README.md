@@ -11,6 +11,35 @@ Fabric 内存完成通信。测试按每节点4张HCU组织，支持以下常用
 以下命令使用 `aiter` 作为工程目录名。通信网卡默认为 `em1`，可通过
 `AITER_SUPERNODE_IFACE` 覆盖。
 
+### 普通 AllReduce 输入大小
+
+普通 `CustomAllreduce.should_custom_ar()` / `custom_all_reduce()` 默认允许
+每 rank 最大 **256 MiB** 的输入，并始终受 `max_size / 2` 的容量约束。
+框架无需传入 `prefill_support=True`；SGLang 的外层筛选与 AITER 包装函数
+内部复检会采用同一策略。默认 `max_size=1 GiB`，本次调整不会改变其预分配
+input/meta 缓冲区大小，也不会固定按256MiB复制数据，实际复制量等于输入大小。
+
+可在启动所有 rank 前设置正整数环境变量 `AITER_AR_MAX_SIZE_MB`（单位为
+MiB，即1024×1024字节）覆盖普通 AllReduce 门限，例如 `64` 可恢复旧的
+普通 AllReduce 大小策略；未设置时为 `256`。显式传入
+`prefill_support=True` 的已有调用仍按 `max_size / 2` 检查。
+ReduceScatter 和原先共用此筛选函数的融合入口保留原有64MiB限制；
+AllGather的大小策略保持不变。
+
+大小门限控制是否选择此后端，不代表所有输入都比NCCL更快。大输入基本
+功能测试可在同节点IPC或超节点Fabric上执行，以下使用TP4：
+
+```bash
+python -B op_tests/multigpu_tests/test_custom_allreduce_size_limit.py --policy-only
+AITER_AR_TRANSPORT=ipc HIP_VISIBLE_DEVICES=0,1,2,3 \
+  torchrun --standalone --nproc-per-node=4 \
+  op_tests/multigpu_tests/test_custom_allreduce_size_limit.py
+```
+
+默认覆盖FP16/BF16/FP32，1/56/64/84/112/168/256MiB输入，eager和Graph
+copy-in各3次更换输入后比较全部元素；另检查256MiB以上、容量、布局等拒绝
+条件。该测试直接调用AITER并断言返回有效输出，不通过框架回退到NCCL。
+
 ## 1. 通信模型：不依赖 MPI
 
 本测试和 Aiter 超节点 `custom_all_reduce` 实现不依赖 MPI。
@@ -54,6 +83,41 @@ Shell runner。它会：
 - shape：`(2, 7168)`、`(128, 8192)`
 - repeats：5
 - Graph：默认关闭，传入 `--with-graph` 后开启
+
+### Fabric Graph 注册回归
+
+`check_custom_allreduce_graph_registration.py` 是不依赖 GPU、Torch 安装或
+JIT 构建的控制流回归。它加载当前 communicator 源码，用桩替换 Torch 和
+native 接口，检查 all-reduce、all-gather、reduce-scatter 及四个融合入口
+在关闭直接注册时传递预注册 buffer 地址，同时检查 IPC 直接注册路径、
+eager 路径、all-gather 预热形状和 Fabric 非空待注册队列的异常检查。
+
+```bash
+python -B op_tests/multigpu_tests/super_node/check_custom_allreduce_graph_registration.py
+```
+
+`test_custom_allreduce_graph_copyin.py` 用于真实 GPU Graph 回放。它直接调用
+AITER，覆盖 all-reduce、首维/末维 all-gather、reduce-scatter、融合
+all-reduce + RMSNorm；使用 FP16/BF16，每次回放更换输入并检查结果，且要求
+捕获结束后的待注册地址数量为零。此测试支持总计 2、4、8 ranks，可通过
+单节点或多节点 torchrun 启动；四卡模式对应 TP4/PP8 任务中的一个 TP 组。
+输入形状为 `(2 * world_size, 512)`，满足融合 RMSNorm 对 FP16/BF16 的
+最小宽度要求。
+
+在包含本次修复的 AITER 环境中执行：
+
+```bash
+AITER_AR_TRANSPORT=fabric HIP_VISIBLE_DEVICES=0,1,2,3 \
+  timeout --signal=TERM --kill-after=15s 180s \
+  torchrun --standalone --nproc-per-node=4 \
+  op_tests/multigpu_tests/super_node/test_custom_allreduce_graph_copyin.py \
+  --transport fabric --repeats 3
+```
+
+改为 `--transport ipc` 可检查同节点 IPC copy-in 回放。测试会打印实际导入的
+communicator 路径及 SHA256；各 rank、两种 dtype 均通过后，rank 0 输出
+`CUSTOM_AR_GRAPH_COPYIN_PASS world_size=4 transport=fabric`。CPU 控制流检查
+不能替代该 GPU 回放，也不能代替原 SGLang 模型的启动回归。
 
 ### `build_custom_allreduce_transport.sh`
 

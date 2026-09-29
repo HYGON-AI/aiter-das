@@ -19,6 +19,7 @@ from aiter.test_common import  perftest
 import aiter
 from aiter import dtypes
 from aiter import moe_c_moe_sum, moe_c_silu_and_mul,moe_c_moe_sum_opt_v2, per_token_quant_hip,moe_c_situ_glu
+from aiter.ops.quant import dynamic_per_token_scaled_quant
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.fused_moe import triton_moe_sum
 from triton.language.extra import libdevice
@@ -156,12 +157,31 @@ def _per_token_quant_int8(
 def per_token_quant_int8(x):
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]
+    backend = os.getenv("AITER_PTQ_I8_BACKEND", "auto")
+    if backend in ("legacy", "triton"):
+        pass  # triton path below
+    elif backend == "hip" or (
+        backend == "auto"
+        and x.numel() < int(os.getenv("AITER_PTQ_I8_HIP_MAX_ELEMS", "25000000"))
+    ):
+        x_q = torch.empty_like(x, device=x.device, dtype=torch.int8)
+        scales = torch.empty(x.shape[:-1] + (1,),
+                             device=x.device, dtype=torch.float32)
+        dynamic_per_token_scaled_quant(x_q, x, scales)
+        return x_q, scales
+
     x_q = torch.empty_like(x, device=x.device, dtype=torch.int8)
     scales = torch.empty(x.shape[:-1] + (1,),
                          device=x.device, dtype=torch.float32)
     BLOCK = triton.next_power_of_2(N)
     # heuristics for number of warps
     num_warps = min(max(BLOCK // 256, 1), 8)
+    
+    if backend != "legacy":
+        if BLOCK >= 4096:
+            num_warps = 4
+        elif BLOCK >= 2048:
+            num_warps = 2
 
     assert x.is_contiguous()
     _per_token_quant_int8[(M,)](

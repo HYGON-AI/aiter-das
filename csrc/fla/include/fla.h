@@ -169,6 +169,42 @@ void run_chunk_gated_delta_rule_fwd_bf16_state_fp32_bv128(
 void run_chunk_gated_delta_rule_fwd_bf16_state_bf16_bv128(
     Delta_rule_params &params, hipStream_t stream, ExpMode exp_mode);
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// KktSolveParams
+//
+// Device-visible state for the standalone fused KKT + lower-triangular solve.
+// Strides are implicit because the aiter/SGLang integration requires contiguous
+// k/beta/g tensors before launch.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+struct KktSolveParams
+{
+    void *__restrict__ k_ptr;              // (B, T, Hg, K)
+    void *__restrict__ g_ptr;              // (B, T, H), fp32, optional
+    void *__restrict__ beta_ptr;           // (B, T, H), fp32 or input dtype
+    void *__restrict__ A_ptr;              // (B, T, H, BT)
+    void *__restrict__ cu_seqlens;         // int32/int64, optional varlen metadata
+    void *__restrict__ chunk_indices;      // int32/int64, optional varlen metadata
+
+    int B;
+    int T;
+    int H;
+    int Hg;
+    int K;
+    int BT;
+    int NT;
+
+    bool use_g;
+    bool is_varlen;
+    bool beta_is_float;
+    bool cu_seqlens_i64;
+    bool chunk_indices_i64;
+};
+
+void run_chunk_gated_delta_rule_fwd_kkt_solve_fp16(
+    KktSolveParams &params, hipStream_t stream);
+void run_chunk_gated_delta_rule_fwd_kkt_solve_bf16(
+    KktSolveParams &params, hipStream_t stream);
+
 }  // namespace FLA_NAMESPACE
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -311,3 +347,12 @@ chunk_fwd_o_sglang_hip_blockdim64(
     int const chunk_size,
     bool const use_exp2,
     bool const transpose_state_layout);
+
+at::Tensor
+chunk_gated_delta_rule_fwd_kkt_solve_hip(
+    at::Tensor const &k,                                      // (B, T, Hg, K)
+    at::Tensor const &beta,                                   // (B, T, H)
+    std::optional<at::Tensor> const &g,                       // (B, T, H)
+    std::optional<at::Tensor> const &cu_seqlens,              // (N+1,)
+    std::optional<at::Tensor> const &chunk_indices,           // (NT, 2)
+    int const chunk_size);

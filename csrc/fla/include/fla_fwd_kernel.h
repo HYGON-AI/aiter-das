@@ -1202,7 +1202,7 @@ fla_prefetch_g_chunk_bv64(
 __device__ __forceinline__ void
 fla_broadcast_g_cur_bv64(uint32_t (&g_cur_bits)[4])
 {
-#if defined(__gfx928__) || defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
     const int p = threadIdx.x & 15;
     // The builtin lowers to ds_bpermute_b32 and carries its LGKM data
     // dependency to LLVM.  Leave wait placement to the compiler so the four
@@ -1248,7 +1248,7 @@ fla_recover_g_last_bits_bv64(const int valid_t,
             break;
         }
     }
-#if defined(__gfx928__) || defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
     return static_cast<uint32_t>(__builtin_amdgcn_readlane(
         static_cast<int32_t>(source_bits), source_lane));
 #else

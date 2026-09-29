@@ -1,10 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Copyright 2023-2024 SGLang Team
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+#
+# Derived from sgl-kernel/python/sgl_kernel/top_k.py (SGLang, Apache-2.0).
+# Hygon modifications: AITER JIT integration and native eager dispatch with
+# torch.compile support. Hygon modifications are licensed under MIT.
+# See LICENSE.Apache-2.0 and LICENSE for the applicable terms.
+
 # user interface
 
 import torch
 from typing import Optional
 from ..jit.core import (
     compile_ops,
+    get_module,
 )
+
+
+_is_compiling = torch.compiler.is_compiling
 
 
 @compile_ops("module_topk_transform")
@@ -38,6 +51,16 @@ def fast_topk_transform_ragged_interface(
     pass
 
 
+def _initialize_ragged_native_interface(*args):
+    global _ragged_native_interface
+    fast_topk_transform_ragged_interface(*args)
+    _ragged_native_interface = get_module(
+        "module_topk_transform"
+    ).fast_topk_transform_ragged_interface
+
+
+_ragged_native_interface = _initialize_ragged_native_interface
+
 
 def fast_topk_v2(
     score: torch.Tensor,
@@ -54,7 +77,7 @@ def fast_topk_v2(
         lengths: The lengths tensor of shape (B)
         topk: The number of topk indices to get
         row_starts: The start index of each row in the score tensor of shape (B).
-            For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i]]
+            For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i])
             of the score tensor.
     Returns:
         The topk indices tensor of shape (B, topk)
@@ -84,11 +107,12 @@ def fast_topk_transform_fused(
             between the query and the key whose layout is either ragged or paged.
             row_starts is only required when the key is ragged.
         lengths: The lengths tensor of shape (B)
-        page_table_size_1: The page table tensor of shape (Batch, topk)
+        page_table_size_1: The page table tensor of shape (Batch, capacity), where
+            capacity covers every valid local KV position (not just topk)
         cu_seqlens_q: The cumulative sequence lengths tensor of shape (Batch + 1)
         topk: The number of topk indices to get
         row_starts: The start index of each row in the score tensor of shape (B).
-            For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i]]
+            For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i])
             of the score tensor. It's only used for cases where the key is
             ragged, i.e. during extend and draft extend.
     Returns:
@@ -125,10 +149,9 @@ def fast_topk_transform_ragged_fused(
         topk_indices_offset: The offset of topk indices in ragged kv of shape (B)
         topk: The number of topk indices to get
         row_starts: The start index of each row in the score tensor of shape (B).
-            For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i]]
-            of the score tensor. It can be None if only the fast path is triggered,
-            in the case of all values in lengths <= topk (not checked in the kernel,
-            guaranteed by the caller).
+            For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i])
+            of the score tensor. None means every row starts at column zero,
+            including rows whose lengths exceed topk.
     Returns:
         The topk indices tensor of shape (B, topk)
     """
@@ -137,7 +160,14 @@ def fast_topk_transform_ragged_fused(
     ), "fast_topk_transform_ragged_fused is only optimized for deepseek v3.2 model, where topk=2048"
     assert score.dim() == 2
     topk_indices_ragged = score.new_empty((score.shape[0], topk), dtype=torch.int32)
-    fast_topk_transform_ragged_interface(
-        score, lengths, topk_indices_ragged, topk_indices_offset, row_starts
-    )
+    # 编译模式保留已注册的自定义算子。eager 首次调用仍走 JIT/参数检查，
+    # 随后缓存同一模块的 native 入口，避免短 kernel 的 Python 分发开销。
+    if _is_compiling():
+        fast_topk_transform_ragged_interface(
+            score, lengths, topk_indices_ragged, topk_indices_offset, row_starts
+        )
+    else:
+        _ragged_native_interface(
+            score, lengths, topk_indices_ragged, topk_indices_offset, row_starts
+        )
     return topk_indices_ragged

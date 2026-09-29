@@ -149,6 +149,9 @@ def build_junit(data: dict, log_dir: Path) -> str:
             classname=f"{_RUNNER_TAG}.aiter.acc",
             name=f"{name} (p:{row_passed} f:{row_failed} s:{row_skipped})",
         )
+        duration = row.get("duration_s")
+        if duration is not None:
+            tc.set("time", str(duration))
         if row_failed > 0:
             failed += 1
             failure = SubElement(

@@ -11,6 +11,7 @@ from torch.distributed import ProcessGroup
 
 import aiter as ops
 from ..parallel_state import in_the_same_node_as
+from .topology import is_fully_connected
 from aiter import logger
 
 logger = logging.getLogger(__name__)
@@ -137,30 +138,16 @@ class QuickAllReduce:
         assert isinstance(device, torch.device)
         self.device = device
 
-        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-        if cuda_visible_devices:
-            device_ids = list(map(int, cuda_visible_devices.split(",")))
-        else:
-            device_ids = list(range(torch.cuda.device_count()))
-        physical_device_id = device_ids[device.index]
-        tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
-        gather_list = [
-            torch.tensor([0], dtype=torch.int, device="cpu")
-            for _ in range(self.world_size)
-        ]
-        dist.all_gather(gather_list, tensor, group=self.group)
-        physical_device_ids = [t.item() for t in gather_list]
-
-        # test nvlink first, this will filter out most of the cases
-        # where custom quick allreduce is not supported
-        # this checks hardware and driver support for NVLink
-
-        # self.fully_connected = is_full_nvlink(physical_device_ids, self.world_size)
+        # The helper resolves each rank's visible device through HIP PCI BDF,
+        # gathers the identities and broadcasts one topology decision. Parsing
+        # CUDA_VISIBLE_DEVICES here would miss HIP/ROCR masks and remapping.
         self.fully_connected = True
+        if self.world_size > 2 and torch.version.hip:
+            self.fully_connected = is_fully_connected(self.group, self.device)
         if self.world_size > 2 and not self.fully_connected:
             logger.debug(
-                "Custom quick allreduce is disabled because it's not supported "
-                "on more than two PCIe-only GPUs. "
+                "Custom quick allreduce is disabled: the selected GPU group "
+                "does not have confirmed type=2, hops=1 connectivity for every pair."
             )
             return
 

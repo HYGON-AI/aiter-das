@@ -175,6 +175,17 @@ def _chunk_fwd_o_vllm_hip_blockdim64(
 ) -> torch.Tensor:
     ...
 
+@compile_ops("module_cpp_api", fc_name="chunk_gated_delta_rule_fwd_kkt_solve_hip")
+def _chunk_gated_delta_rule_fwd_kkt_solve_hip(
+    k: torch.Tensor,
+    beta: torch.Tensor,
+    g: Optional[torch.Tensor],
+    cu_seqlens: Optional[torch.Tensor],
+    chunk_indices: Optional[torch.Tensor],
+    chunk_size: int,
+) -> torch.Tensor:
+    ...
+
 def chunk_gated_delta_rule_fwd_vllm_hip_blockdim64(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -384,6 +395,36 @@ def chunk_fwd_o_vllm_hip_blockdim64(
         chunk_size,
         use_exp2,
         transpose_state_layout,
+    )
+
+def chunk_gated_delta_rule_fwd_kkt_solve_hip(
+    k: torch.Tensor,
+    beta: torch.Tensor,
+    g: Optional[torch.Tensor] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    chunk_size: int = 64,
+    chunk_indices: Optional[torch.Tensor] = None,
+    kernel_cfg: Optional[dict[str, Any]] = None,
+) -> torch.Tensor:
+    """HIP implementation of SGLang gated delta-rule fused KKT + solve_tril.
+
+    Returns the solved A tensor with shape ``[B, T, H, chunk_size]``.
+    """
+    del kernel_cfg
+    cu_seqlens, chunk_indices, _ = _ensure_varlen_meta(
+        cu_seqlens,
+        chunk_size,
+        chunk_indices,
+        None,
+        need_chunk_offsets=False,
+    )
+    return _chunk_gated_delta_rule_fwd_kkt_solve_hip(
+        k,
+        beta,
+        g,
+        cu_seqlens,
+        chunk_indices,
+        chunk_size,
     )
 
 # Backward-compatible Python aliases. New callers should use the explicit names above.
