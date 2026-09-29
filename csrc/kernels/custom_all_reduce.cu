@@ -343,8 +343,8 @@ int64_t ar_handle_size(int64_t transport)
     return sizeof(hsa_ext_rpc_memory_t);
 #else
     throw std::runtime_error(
-        "fabric custom allreduce was not compiled; set AITER_ENABLE_SUPERNODE_AR=1 "
-        "before building module_custom_all_reduce");
+        "fabric custom allreduce was not compiled; rebuild module_custom_all_reduce "
+        "with supernode support enabled (the build default)");
 #endif
 }
 
@@ -369,8 +369,8 @@ int64_t allocate_meta_buffer(int64_t size, int64_t transport)
 #else
             HIP_CALL(hipThreadExchangeStreamCaptureMode(&mode));
             throw std::runtime_error(
-                "fabric custom allreduce was not compiled; set AITER_ENABLE_SUPERNODE_AR=1 "
-                "before building module_custom_all_reduce");
+                "fabric custom allreduce was not compiled; rebuild module_custom_all_reduce "
+                "with supernode support enabled (the build default)");
 #endif
         }
         else if(transport == static_cast<int64_t>(ARTransport::IPC))
@@ -426,8 +426,8 @@ void get_meta_buffer_handle(int64_t inp_ptr,
                                  std::to_string(static_cast<int>(status)));
 #else
     throw std::runtime_error(
-        "fabric custom allreduce was not compiled; set AITER_ENABLE_SUPERNODE_AR=1 "
-        "before building module_custom_all_reduce");
+        "fabric custom allreduce was not compiled; rebuild module_custom_all_reduce "
+        "with supernode support enabled (the build default)");
 #endif
 }
 

@@ -447,7 +447,8 @@ class CustomAllreduce:
                 logger.warning(
                     "Custom allreduce auto transport selected fabric for a multi-node "
                     "group, but fabric support is not compiled; falling back to the "
-                    "next communicator. Rebuild with AITER_ENABLE_SUPERNODE_AR=1."
+                    "next communicator. Rebuild module_custom_all_reduce with "
+                    "supernode support enabled (the build default)."
                 )
                 return
         else:
@@ -455,8 +456,8 @@ class CustomAllreduce:
             if not _fabric_ar_available():
                 raise RuntimeError(
                     "AITER_AR_TRANSPORT=fabric was requested, but fabric support is "
-                    "not compiled. Set AITER_ENABLE_SUPERNODE_AR=1 before building "
-                    "module_custom_all_reduce."
+                    "not compiled. Rebuild module_custom_all_reduce with supernode "
+                    "support enabled (the build default)."
                 )
         self.transport_id = _AR_TRANSPORT_IDS[self.transport]
 

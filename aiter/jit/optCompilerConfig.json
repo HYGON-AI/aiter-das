@@ -46,10 +46,10 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-DAITER_ENABLE_SUPERNODE_AR' if os.environ.get('AITER_ENABLE_SUPERNODE_AR', '0').strip().lower() in ('1', 'true', 'yes', 'on') else ''"
+            "'-DAITER_ENABLE_SUPERNODE_AR' if os.environ.get('AITER_ENABLE_SUPERNODE_AR', '1').strip().lower() in ('1', 'true', 'yes', 'on') else ''"
         ],
         "extra_ldflags": [
-            "'-lhsa-runtime64' if os.environ.get('AITER_ENABLE_SUPERNODE_AR', '0').strip().lower() in ('1', 'true', 'yes', 'on') else ''"
+            "'-lhsa-runtime64' if os.environ.get('AITER_ENABLE_SUPERNODE_AR', '1').strip().lower() in ('1', 'true', 'yes', 'on') else ''"
         ],
         "extra_include": [],
         "verbose": "False",

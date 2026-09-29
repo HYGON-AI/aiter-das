@@ -22,13 +22,7 @@ from jit.utils.cpp_extension import IS_HIP_EXTENSION, BuildExtension
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
 
 
-def env_flag_enabled(name):
-    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
-
-
-PACKAGE_NAME = (
-    "aiter_rpc" if env_flag_enabled("AITER_ENABLE_SUPERNODE_AR") else "aiter"
-)
+PACKAGE_NAME = "aiter"
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 
 if BUILD_TARGET == "auto":

@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 set -euo pipefail
 
-enable_fabric="${1:-0}"
+enable_fabric="${1:-1}"
 case "${enable_fabric}" in
   0|1) ;;
   *) echo "usage: $0 [0|1]" >&2; exit 2 ;;

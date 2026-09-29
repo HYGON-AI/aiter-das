@@ -2635,8 +2635,8 @@ class CustomAllreduce
 #else
         if(transport_ == ARTransport::Fabric)
             throw std::runtime_error(
-                "fabric custom allreduce was not compiled; set AITER_ENABLE_SUPERNODE_AR=1 "
-                "before building module_custom_all_reduce");
+                "fabric custom allreduce was not compiled; rebuild module_custom_all_reduce "
+                "with supernode support enabled (the build default)");
 #endif
         for(int i = 0; i < world_size_; i++)
         {

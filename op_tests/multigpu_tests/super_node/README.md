@@ -128,7 +128,7 @@ communicator 路径及 SHA256；各 rank、两种 dtype 均通过后，rank 0 �
 bash op_tests/multigpu_tests/super_node/build_custom_allreduce_transport.sh
 ```
 
-- 不传参数：默认按参数 `0` 构建IPC-only版本，与工程编译默认值一致。
+- 不传参数：默认按参数 `1` 构建支持超节点 Fabric 的版本，与工程编译默认值一致。
 - 参数 `1`：设置 `AITER_ENABLE_SUPERNODE_AR=1`，重新构建 Fabric 版本。
 - 参数 `0`：构建不包含 HSA RPC 的 IPC-only 版本，用于兼容性回归。
 - 脚本设置 `AITER_REBUILD=1`，强制重新检查/构建对应 JIT 模块。
@@ -268,9 +268,14 @@ bash op_tests/multigpu_tests/super_node/final_verify_custom_allreduce.sh
 | `fabric` | 强制使用 HSA RPC Fabric；未编译或初始化失败时明确报错 |
 | `auto` | 同节点选择 IPC；跨节点在已编译 Fabric feature 时选择 Fabric，初始化失败时按上层契约回退 |
 
-默认编译不启用Fabric能力，也不链接HSA runtime；默认运行时transport仍是
-`ipc`。需要超节点Fabric时，必须在JIT构建/重建前显式设置
-`AITER_ENABLE_SUPERNODE_AR=1`，或使用本目录构建脚本的参数 `1`。
+wheel 预编译和 JIT 默认启用 Fabric 能力，并链接 `hsa-runtime64`，无需设置
+`AITER_ENABLE_SUPERNODE_AR`。编译环境需要提供 HSA RPC 头文件和库；安装后的
+运行环境也需要能加载带 RPC 接口的 HSA runtime。默认运行时 transport 仍是
+`ipc`，使用超节点通信时选择 `fabric` 或 `auto`。
+
+需要 IPC-only 兼容性构建时，可显式设置 `AITER_ENABLE_SUPERNODE_AR=0`，
+或使用本目录构建脚本的参数 `0`。无论是否启用 Fabric，wheel 发行包名统一为
+`aiter`，Python 导入名也为 `aiter`。
 
 注意：在一个已经构建完成的 `.so` 上临时修改
 `AITER_ENABLE_SUPERNODE_AR` 不会改变该模块；该变量必须在JIT构建/重建时
@@ -317,13 +322,13 @@ export MASTER_ADDR=master-node-address
 ping -c 2 "${MASTER_ADDR}"
 ```
 
-## 5. 构建 Fabric 版本
+## 5. 构建默认支持 Fabric 的版本
 
 推荐使用聚焦构建脚本。在共享工程根目录执行一次：
 
 ```bash
 cd aiter
-bash op_tests/multigpu_tests/super_node/build_custom_allreduce_transport.sh 1
+bash op_tests/multigpu_tests/super_node/build_custom_allreduce_transport.sh
 ```
 
 预期输出包含：
@@ -338,7 +343,6 @@ CUSTOM_AR_BUILD fabric_handle_size=256
 ```bash
 cd aiter
 
-export AITER_ENABLE_SUPERNODE_AR=1
 AITER_REBUILD=1 python - <<'PY'
 from aiter.ops import custom_all_reduce as ops
 
@@ -585,10 +589,10 @@ torchrun \
   --with-graph
 ```
 
-验证默认宏关闭构建时可执行：
+验证显式关闭 Fabric 的构建时可执行：
 
 ```bash
-bash op_tests/multigpu_tests/super_node/build_custom_allreduce_transport.sh
+bash op_tests/multigpu_tests/super_node/build_custom_allreduce_transport.sh 0
 ```
 
 宏关闭回归完成后，如还要继续运行跨节点 Fabric 测试，必须重新执行：
