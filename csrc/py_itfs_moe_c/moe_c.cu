@@ -69,7 +69,7 @@ using at::device_of;
     return __VA_ARGS__();                   \
   } \
    else {                                                  \
-    std::cout<<"unsupported BIT"<<std::endl;                \
+    TORCH_CHECK(false, "unsupported BIT: ", bit);           \
   }                                                         \
 }()
 
@@ -88,7 +88,7 @@ using at::device_of;
     constexpr static int BLOCK_SIZE_M_ = 64;                 \
     return __VA_ARGS__(); \
   }else {                                                  \
-    std::cout<<"unsupported BLOCK_SIZE_M"<<std::endl;       \
+    TORCH_CHECK(false, "unsupported BLOCK_SIZE_M: ", BLOCK_SIZE_M); \
   }                                                         \
 }()
 
@@ -98,7 +98,7 @@ using at::device_of;
     constexpr static int BLOCK_SIZE_N_ = 64;               \
     return __VA_ARGS__();                                   \
   }else {                                                  \
-    std::cout<<"unsupported BLOCK_SIZE_N"<<std::endl;       \
+    TORCH_CHECK(false, "unsupported BLOCK_SIZE_N: ", BLOCK_SIZE_N); \
   }                                                         \
 }()
 
@@ -108,7 +108,7 @@ using at::device_of;
     constexpr static int BLOCK_SIZE_K_ = 128;               \
     return __VA_ARGS__();                                   \
   }else {                                                  \
-    std::cout<<"unsupported BLOCK_SIZE_K"<<std::endl;       \
+    TORCH_CHECK(false, "unsupported BLOCK_SIZE_K: ", BLOCK_SIZE_K); \
   }                                                         \
 }()
 
@@ -132,7 +132,7 @@ using at::device_of;
     constexpr static int TOPK = 1;          \
     return __VA_ARGS__();                   \
   }else {                                  \
-    std::cout<<"unsupported TOPK"<<std::endl;\
+    TORCH_CHECK(false, "unsupported TOPK: ", topk);\
   }                                         \
 }()
 
@@ -142,7 +142,7 @@ using at::device_of;
     constexpr static int GROUP_SIZE_N = 128;                   \
     return __VA_ARGS__();                                   \
   }else {                                                  \
-    std::cout<<"unsupported GROUP_SIZE_N"<<std::endl;         \
+    TORCH_CHECK(false, "unsupported GROUP_SIZE_N: ", group_size_n); \
   }                                                         \
 }()
 
@@ -155,7 +155,7 @@ using at::device_of;
     constexpr static int GROUP_SIZE_K = 64;            \
     return __VA_ARGS__();                                   \
   }else {                                                  \
-    std::cout<<"unsupported GROUP_SIZE_K"<<std::endl;         \
+    TORCH_CHECK(false, "unsupported GROUP_SIZE_K: ", group_size_k); \
   }                                                         \
 }()
 
@@ -165,7 +165,7 @@ using at::device_of;
     constexpr static int BLOCK_SIZE_M_LOOPS = 1;            \
     return __VA_ARGS__();                                   \
   } else {                                                  \
-    std::cout<<"unsupported BLOCK_SIZE_M_LOOPS"<<std::endl;         \
+    TORCH_CHECK(false, "unsupported BLOCK_SIZE_M_LOOPS: ", block_size_m_loops); \
   }                                                         \
 }()
 
@@ -181,7 +181,7 @@ using at::device_of;
      constexpr static int BLOCK_SIZE_N_LOOPS = 2;            \
     return __VA_ARGS__();                                   \
   }else {                                                  \
-    std::cout<<"unsupported BLOCK_SIZE_N_LOOPS"<<std::endl;         \
+    TORCH_CHECK(false, "unsupported BLOCK_SIZE_N_LOOPS: ", block_size_n_loops); \
   }                                                         \
 }()
 
@@ -212,7 +212,7 @@ using at::device_of;
     constexpr static int BLOCK_SIZE_K_LOOPS = 56;            \
     return __VA_ARGS__();                                   \
   }else {                                                  \
-    std::cout<<"unsupported BLOCK_SIZE_K_LOOPS"<<std::endl;         \
+    TORCH_CHECK(false, "unsupported BLOCK_SIZE_K_LOOPS: ", block_size_k_loops); \
   }                                                         \
 }()
 
@@ -222,7 +222,7 @@ using at::device_of;
     constexpr static int GROUP_SIZE = 64;                   \
     return __VA_ARGS__();                                   \
   }else {                                                  \
-    std::cout<<"unsupported GROUP_SIZE"<<std::endl;         \
+    TORCH_CHECK(false, "unsupported GROUP_SIZE: ", group_size); \
   }                                                         \
 }()
 
@@ -569,8 +569,11 @@ static torch::Tensor moe_c_moe_gemm_marlin_w8a8_fp8_impl(torch::Tensor input,
   int64_t real_size_k_arg,
   bool tensorwise_scale
   ) {
-
-
+    TORCH_CHECK(input.scalar_type() == at::ScalarType::Float8_e4m3fn,
+                "moe_w8a8_fp8_gemm requires Float8_e4m3fn input");
+    TORCH_CHECK(output.scalar_type() == at::ScalarType::BFloat16 ||
+                    output.scalar_type() == at::ScalarType::Half,
+                "moe_w8a8_fp8_gemm only supports bf16/fp16 output");
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const int size_m = input.size(0); 
     const int EXPERTS = b_qweight.size(0);
@@ -641,7 +644,7 @@ static torch::Tensor moe_c_moe_gemm_marlin_w8a8_fp8_impl(torch::Tensor input,
         
        
     } else {
-      // TORCH_CHECK(false, "moe_w8a8_gemm only supports fp8");
+      TORCH_CHECK(false, "moe_w8a8_fp8_gemm requires Float8_e4m3fn input");
     }
     
   }
@@ -686,7 +689,7 @@ static torch::Tensor moe_c_moe_gemm_marlin_w8a8_fp8_impl(torch::Tensor input,
 
       
     } else {
-      // TORCH_CHECK(false, "moe_w8a8_gemm only supports fp8");
+      TORCH_CHECK(false, "moe_w8a8_fp8_gemm requires Float8_e4m3fn input");
     }
     
   }
