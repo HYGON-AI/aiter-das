@@ -6,7 +6,11 @@ Modes:
 
 * ``--mode decode``  -- packed decode (one token per sequence) timed for CK and
   HIPC from identical ``mixed_qkv`` / ``a`` / ``b`` / ``A_log`` / ``dt_bias`` /
-  state-pool inputs, with an optional numerics check;
+  state-pool inputs, with an optional numerics check. ``--hipc-op`` picks the
+  HIPC counterpart (the 1-token packed kernel, or the generic vLLM update op
+  the CK performance doc pairs against); ``--graph`` switches to the doc's
+  GPU-graph timing, which excludes host/JIT/alloc overhead and keeps the
+  initial state fixed;
 * ``--mode update``  -- sigmoid-gating sequence update (``a``/``b``/``A_log`` /
   ``dt_bias``, non-spec) timed for CK and HIPC. ``seq_len == 1`` is the
   operator's primary contract; ``seq_len > 1`` requires per-token state slots;
@@ -17,6 +21,9 @@ Modes:
 Examples
 --------
     PYTHONPATH=. python op_tests/op_benchmarks/bench_ck_gdn_native.py --mode decode
+    PYTHONPATH=. python op_tests/op_benchmarks/bench_ck_gdn_native.py \
+        --mode decode --batch 32 --heads 16 --value-heads 64 \
+        --gate-dtype bf16 --hipc-op vllm-update --graph
     PYTHONPATH=. python op_tests/op_benchmarks/bench_ck_gdn_native.py \
         --mode update --batch 8 --seqlen 8 --heads 4 --value-heads 16
     PYTHONPATH=. python op_tests/op_benchmarks/bench_ck_gdn_native.py \
@@ -61,7 +68,64 @@ def timed(fn: Callable[[], None], warmup: int, rep: int) -> tuple[float, float]:
     return statistics.median(samples) * 1000.0, min(samples) * 1000.0  # microseconds
 
 
-def build_packed_decode(batch: int, heads: int, value_heads: int, dtype: torch.dtype, seed: int):
+def timed_graph(
+    fn: Callable[[], None],
+    calls: int,
+    samples: int,
+    replays: int,
+) -> tuple[float, float]:
+    """GPU-graph timing: JIT/host allocations/Python overhead are excluded.
+
+    ``calls`` back-to-back invocations are captured into one graph, so the graph
+    holds a fixed initial state and never re-feeds an output -- same contract as
+    the CK performance doc. The state reset is deliberately not part of graph
+    timing: including it inside a graph measured ~10x the standalone copy cost
+    on gfx938, which would swamp the kernel time (the default event-based mode
+    covers the reset-inclusive numbers instead). Note that a graph keeps every
+    per-call output alive, so large shapes multiply the capture memory.
+    """
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            fn()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph, stream=stream):
+        for _ in range(calls):
+            fn()
+    out = []
+    for _ in range(samples):
+        # The graph executes on the stream it was captured on, so replay and the
+        # timing events must be issued on that same stream: recording them on the
+        # current stream measures across clock domains and yields bogus deltas
+        # (negative or off by an arbitrary factor).
+        torch.cuda.synchronize()
+        with torch.cuda.stream(stream):
+            start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+            start.record()
+            for _ in range(replays):
+                graph.replay()
+            end.record()
+        torch.cuda.synchronize()
+        out.append(start.elapsed_time(end) * 1e3 / (replays * calls))
+    return statistics.median(out), min(out)
+
+
+def build_decode_fixture(
+    batch: int,
+    heads: int,
+    value_heads: int,
+    dtype: torch.dtype,
+    gate_dtype: torch.dtype,
+    seed: int,
+):
+    """Inputs for both decode pairings.
+
+    The raw gate/beta are kept in fp32 *and* in ``gate_dtype``: the packed HIPC
+    kernel wants fp32 gates, while the CK performance doc's pairing gives both
+    sides input-dtype gates with a raw beta.
+    """
     torch.manual_seed(seed)
     q = torch.randn(batch, heads, HEAD_DIM, dtype=dtype, device="cuda") * 0.2
     k = torch.randn(batch, heads, HEAD_DIM, dtype=dtype, device="cuda") * 0.2
@@ -74,96 +138,163 @@ def build_packed_decode(batch: int, heads: int, value_heads: int, dtype: torch.d
         ),
         dim=-1,
     ).contiguous()
+    a_f32 = torch.randn(batch, value_heads, dtype=torch.float32, device="cuda") * 0.2
+    b_f32 = torch.randn(batch, value_heads, dtype=torch.float32, device="cuda") * 0.2
+    dt_bias_f32 = torch.randn(value_heads, dtype=torch.float32, device="cuda") * 0.1
     return dict(
         q=q,
         k=k,
         v=v,
         mixed_qkv=mixed_qkv,
-        a=torch.randn(batch, value_heads, dtype=torch.float32, device="cuda") * 0.2,
-        b=torch.randn(batch, value_heads, dtype=torch.float32, device="cuda") * 0.2,
+        q4=q.unsqueeze(0),
+        k4=k.unsqueeze(0),
+        v4=v.unsqueeze(0),
+        a_f32=a_f32,
+        b_f32=b_f32,
+        a_gate=a_f32.to(gate_dtype),
+        b_gate=b_f32.to(gate_dtype),
         a_log=-torch.rand(value_heads, dtype=torch.float32, device="cuda") * 2.0,
-        dt_bias=torch.randn(value_heads, dtype=torch.float32, device="cuda") * 0.1,
+        dt_bias_f32=dt_bias_f32,
+        dt_bias_gate=dt_bias_f32.to(gate_dtype),
+        beta_f32=torch.sigmoid(b_f32),
         state_pool=torch.randn(batch, value_heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device="cuda") * 0.02,
         indices=torch.arange(batch, dtype=torch.int32, device="cuda"),
+        cu32=torch.arange(batch + 1, dtype=torch.int32, device="cuda"),
+        cu64=torch.arange(batch + 1, dtype=torch.int64, device="cuda"),
     )
 
 
 def bench_decode(args) -> dict:
+    """CK decode vs one of two HIPC counterparts.
+
+    ``--hipc-op packed-decode`` (default) uses
+    ``aiter_fused_recurrent_gated_delta_rule_packed_decode`` (the 1-token-per-
+    sequence production kernel, fp32 gates). ``--hipc-op vllm-update`` uses
+    ``vllm_fused_sigmoid_gating_delta_rule_update`` with the CK performance
+    doc's contract (VK state, input-dtype raw gate/dt_bias, raw beta).
+
+    ``--graph`` switches to the doc's timing: GPU graph, no host/Python/alloc
+    overhead, fixed initial state.
+    """
     dtype = parse_dtype(args.dtype)
     scale = args.scale if args.scale is not None else HEAD_DIM**-0.5
-    data = build_packed_decode(args.batch, args.heads, args.value_heads, dtype, args.seed)
-
-    # CK's tuned raw-gate path requires the gate and dt_bias tensors to carry the
-    # input dtype while beta/a_log stay fp32. The HIPC kernel keeps fp32 gates,
-    # so its reference row always uses the fp32 ``a``.
-    gate_dtype = parse_dtype(args.gate_dtype)
-    ck_gate = data["a"] if args.gate_dtype == "f32" else data["a"].to(gate_dtype)
-    ck_dt_bias = data["dt_bias"] if args.gate_dtype == "f32" else data["dt_bias"].to(gate_dtype)
+    gate_dtype = {
+        "f32": torch.float32,
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+    }[args.gate_dtype]
+    data = build_decode_fixture(
+        args.batch, args.heads, args.value_heads, dtype, gate_dtype, args.seed
+    )
+    use_update_pair = args.hipc_op == "vllm-update"
 
     base_pool = data["state_pool"].clone()
     pool_hipc = base_pool.clone()
     ck_state0 = base_pool.index_select(0, data["indices"].to(torch.int64)).clone()
     ck_state = ck_state0.clone()
-    cu_seqlens = torch.arange(args.batch + 1, dtype=torch.int64, device="cuda")
-    beta_sigmoid = torch.sigmoid(data["b"])
     out_hipc = torch.empty(args.batch, 1, args.value_heads, HEAD_DIM, dtype=dtype, device="cuda")
+    held: dict[str, tuple] = {}
+    # A graph cannot capture the host-side cu_seqlens check (it copies to the
+    # host and syncs), so graph timing implies validate_varlen=False.
+    validate_varlen = not args.no_validate_varlen and not args.graph
 
-    def run_hipc():
-        pool_hipc.copy_(base_pool)
-        aiter.aiter_fused_recurrent_gated_delta_rule_packed_decode(
-            mixed_qkv=data["mixed_qkv"],
-            a=data["a"],
-            b=data["b"],
-            A_log=data["a_log"],
-            dt_bias=data["dt_bias"],
-            scale=scale,
-            initial_state=pool_hipc,
-            out=out_hipc,
-            ssm_state_indices=data["indices"],
-            use_qk_l2norm_in_kernel=False,
-        )
+    def hipc_call():
+        if use_update_pair:
+            held["hipc"] = aiter.vllm_fused_sigmoid_gating_delta_rule_update(
+                A_log=data["a_log"],
+                a=data["a_gate"],
+                b=data["b_gate"],
+                dt_bias=data["dt_bias_gate"],
+                q=data["q4"],
+                k=data["k4"],
+                v=data["v4"],
+                beta=1.0,
+                threshold=20.0,
+                scale=scale,
+                initial_state=pool_hipc,
+                inplace_final_state=True,
+                cu_seqlens=data["cu32"],
+                ssm_state_indices=data["indices"],
+                num_accepted_tokens=None,
+                use_qk_l2norm_in_kernel=False,
+                is_kda=False,
+            )
+        else:
+            held["hipc"] = aiter.aiter_fused_recurrent_gated_delta_rule_packed_decode(
+                mixed_qkv=data["mixed_qkv"],
+                a=data["a_f32"],
+                b=data["b_f32"],
+                A_log=data["a_log"],
+                dt_bias=data["dt_bias_f32"],
+                scale=scale,
+                initial_state=pool_hipc,
+                out=out_hipc,
+                ssm_state_indices=data["indices"],
+                use_qk_l2norm_in_kernel=False,
+            )
 
     def ck_call():
-        return aiter.ck_gdn_decode(
+        held["ck"] = aiter.ck_gdn_decode(
             data["q"],
             data["k"],
             data["v"],
-            ck_gate,
-            beta_sigmoid,
+            data["a_gate"],
+            data["beta_f32"],
             a_log=data["a_log"],
-            dt_bias=ck_dt_bias,
+            dt_bias=data["dt_bias_gate"],
             initial_state=ck_state,
-            cu_seqlens=cu_seqlens,
+            cu_seqlens=data["cu64"],
             scale=scale,
             use_g=True,
             gate_in_kernel=True,
             has_dt_bias=True,
             transpose_state=True,
             store_final_state=True,
+            validate_varlen=validate_varlen,
         )
+
+    def run_hipc():
+        pool_hipc.copy_(base_pool)
+        hipc_call()
 
     def run_ck():
         ck_state.copy_(ck_state0)
         ck_call()
 
+    timing = "graph" if args.graph else "events"
     results = {}
-    for name, fn in (("hipc", run_hipc), ("ck", run_ck)):
-        median_us, best_us = timed(fn, args.warmup, args.rep)
-        results[name] = {"median_us": median_us, "best_us": best_us}
-        print(f"decode {name:<6} median {median_us:9.2f} us  best {best_us:9.2f} us")
+    if args.graph:
+        if not args.no_validate_varlen:
+            print("  note: --graph forces validate_varlen=False (D2H cannot be captured)")
+        for name, fn in (("hipc", hipc_call), ("ck", ck_call)):
+            median_us, best_us = timed_graph(
+                fn,
+                args.graph_calls,
+                args.graph_samples,
+                args.graph_replays,
+            )
+            results[name] = {"median_us": median_us, "best_us": best_us}
+            print(f"decode {name:<6} median {median_us:9.2f} us  best {best_us:9.2f} us  (graph)")
+    else:
+        for name, fn in (("hipc", run_hipc), ("ck", run_ck)):
+            median_us, best_us = timed(fn, args.warmup, args.rep)
+            results[name] = {"median_us": median_us, "best_us": best_us}
+            print(f"decode {name:<6} median {median_us:9.2f} us  best {best_us:9.2f} us")
 
     if not args.no_verify:
         run_hipc()
         ck_state.copy_(ck_state0)
-        ck_out, _ = ck_call()
+        run_ck()
         torch.cuda.synchronize()
         rtol, atol = (3e-2, 3e-2) if dtype == torch.bfloat16 else (2e-2, 2e-2)
-        diff = (ck_out.reshape_as(out_hipc).float() - out_hipc.float()).abs()
-        tol = atol + rtol * out_hipc.float().abs()
+        ref = held["hipc"][0].reshape(args.batch, args.value_heads, HEAD_DIM).float()
+        got = held["ck"][0].reshape(args.batch, args.value_heads, HEAD_DIM).float()
+        diff = (got - ref).abs()
+        tol = atol + rtol * ref.abs()
         bad = int((diff > tol).sum().item())
         print(f"  CK vs hipc: mismatches={bad} max_abs={diff.max().item():.4e}")
         results["verify_vs_hipc"] = {"mismatches": bad, "max_abs": diff.max().item()}
-        results["speedup_hipc_over_ck"] = results["hipc"]["median_us"] / results["ck"]["median_us"]
+    results["speedup_hipc_over_ck"] = results["hipc"]["median_us"] / results["ck"]["median_us"]
 
     results["shape"] = {
         "batch": args.batch,
@@ -172,6 +303,9 @@ def bench_decode(args) -> dict:
         "dtype": args.dtype,
         "gate_dtype": args.gate_dtype,
     }
+    results["timing"] = timing
+    results["hipc_op"] = args.hipc_op
+    results["varlen_validated"] = validate_varlen
     return results
 
 
@@ -251,6 +385,7 @@ def bench_update(args) -> dict:
             has_dt_bias=True,
             transpose_state=True,
             store_final_state=True,
+            validate_varlen=not args.no_validate_varlen,
         )
 
     def run_ck():
@@ -361,6 +496,26 @@ def main() -> None:
     parser.add_argument("--rep", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-verify", action="store_true")
+    parser.add_argument(
+        "--no-validate-varlen",
+        action="store_true",
+        help="skip CK's host-side cu_seqlens check (removes a per-call D2H sync)",
+    )
+    parser.add_argument(
+        "--hipc-op",
+        choices=("packed-decode", "vllm-update"),
+        default="packed-decode",
+        help="decode: HIPC counterpart; vllm-update follows the CK performance doc",
+    )
+    parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="decode: GPU-graph timing (no host overhead, fixed initial state, no "
+        "per-call state reset); forces --no-validate-varlen",
+    )
+    parser.add_argument("--graph-calls", type=int, default=16, help="calls captured per graph")
+    parser.add_argument("--graph-samples", type=int, default=7, help="timed graph replays")
+    parser.add_argument("--graph-replays", type=int, default=5, help="replays per sample")
     parser.add_argument("--out-json", type=str, default="")
     args = parser.parse_args()
 

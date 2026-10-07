@@ -82,7 +82,8 @@ std::vector<torch::Tensor> decode(const torch::Tensor& q,
                                   bool transpose_state,
                                   bool gate_in_kernel,
                                   bool has_dt_bias,
-                                  bool store_final_state)
+                                  bool store_final_state,
+                                  bool validate_varlen)
 {
     check_packed(q, "q");
     check_packed(k, "k");
@@ -111,14 +112,23 @@ std::vector<torch::Tensor> decode(const torch::Tensor& q,
         TORCH_CHECK(cu.is_cuda() && cu.is_contiguous() && cu.scalar_type() == at::kLong,
                     "cu_seqlens must be a contiguous int64 device tensor");
         TORCH_CHECK(cu.dim() == 1 && cu.numel() >= 2, "cu_seqlens must be [sequences + 1]");
+        // Sequence count comes from tensor metadata, so the launch itself never
+        // needs the values.
         sequences = cu.numel() - 1;
-        const auto host = cu.to(torch::kCPU);
-        const auto* ptr = host.data_ptr<int64_t>();
-        TORCH_CHECK(ptr[0] == 0, "cu_seqlens must start at 0");
-        TORCH_CHECK(ptr[sequences] == total_tokens,
-                    "cu_seqlens must end at the packed token count");
-        for(int64_t i = 0; i < sequences; ++i)
-            TORCH_CHECK(ptr[i + 1] > ptr[i], "sequence lengths must be positive");
+        // Value validation is the only part that needs a device->host copy. That
+        // copy forces a stream sync, which shows up as a fixed per-call cost on
+        // an otherwise kernel-bound op; callers whose cu_seqlens is known valid
+        // (the production case: the framework owns it) can skip it.
+        if(validate_varlen)
+        {
+            const auto host = cu.to(torch::kCPU);
+            const auto* ptr = host.data_ptr<int64_t>();
+            TORCH_CHECK(ptr[0] == 0, "cu_seqlens must start at 0");
+            TORCH_CHECK(ptr[sequences] == total_tokens,
+                        "cu_seqlens must end at the packed token count");
+            for(int64_t i = 0; i < sequences; ++i)
+                TORCH_CHECK(ptr[i + 1] > ptr[i], "sequence lengths must be positive");
+        }
         // The kernel walks [bos, eos) per sequence and ignores `time` here.
         batch = 1;
         time  = total_tokens;

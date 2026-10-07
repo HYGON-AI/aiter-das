@@ -82,6 +82,12 @@ std::vector<torch::Tensor> prefill(
 // Tensors are packed as well: q,k [tokens, h_qk, 128], v [tokens, h_v, 128],
 // g/gk/gv/beta [tokens, h_v], cu_seqlens [sequences+1] int64,
 // initial_state [sequences, h_v, 128, 128] fp32.
+//
+// validate_varlen=false skips the host-side cu_seqlens checks, which are the
+// only reason the entry needs the values on the host (and therefore a stream
+// sync). It is a pure optimization: the kernel reads cu_seqlens on device, so
+// results are unaffected. Keep the default when the values come from a caller
+// that may not have validated them.
 std::vector<torch::Tensor> decode(
     const torch::Tensor& q,
     const torch::Tensor& k,
@@ -104,7 +110,8 @@ std::vector<torch::Tensor> decode(
     bool transpose_state,
     bool gate_in_kernel,
     bool has_dt_bias,
-    bool store_final_state);
+    bool store_final_state,
+    bool validate_varlen = true);
 
 } // namespace ck_gdn
 } // namespace aiter

@@ -110,6 +110,7 @@ def _ck_gdn_decode(
     gate_in_kernel: bool = False,
     has_dt_bias: bool = False,
     store_final_state: bool = True,
+    validate_varlen: bool = True,
 ) -> List[torch.Tensor]:
     ...
 
@@ -273,6 +274,7 @@ def ck_gdn_decode(
     gate_in_kernel: bool = False,
     has_dt_bias: bool = False,
     store_final_state: bool = True,
+    validate_varlen: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """CK GDN fused recurrent decode, mirroring ``tile_example_gdn_decode``.
 
@@ -295,6 +297,13 @@ def ck_gdn_decode(
 
     Note: CK has no state-pool index argument. A state pool must be gathered on
     the Python side before the call and scattered back afterwards.
+
+    ``validate_varlen=False`` skips the host-side ``cu_seqlens`` checks. Those
+    checks are the only reason this entry needs the values on the host, so they
+    cost a device->host copy plus a stream sync on every call; production
+    callers that own ``cu_seqlens`` should turn them off once and keep them off.
+    The kernel reads ``cu_seqlens`` on device either way, so the result is the
+    same.
     """
     output, final_state = _ck_gdn_decode(
         q,
@@ -319,6 +328,7 @@ def ck_gdn_decode(
         gate_in_kernel=gate_in_kernel,
         has_dt_bias=has_dt_bias,
         store_final_state=store_final_state,
+        validate_varlen=validate_varlen,
     )
     if final_state is not None and final_state.numel() == 0:
         final_state = None

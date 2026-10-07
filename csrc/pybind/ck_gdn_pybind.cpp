@@ -86,5 +86,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("transpose_state") = false,
           py::arg("gate_in_kernel") = false,
           py::arg("has_dt_bias")  = false,
-          py::arg("store_final_state") = true);
+          py::arg("store_final_state") = true,
+          py::arg("validate_varlen") = true);
 }

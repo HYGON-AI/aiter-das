@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 #
-# HIP GDN (gated delta rule) benchmark 集合
+# GDN (gated delta rule) benchmark 集合
 #
 # 用法:
 #   bash bench_gdn.sh                  # 等价 all
@@ -14,6 +15,7 @@
 #   bash bench_gdn.sh ck               # CK 原生后端: ck-prefill + ck-decode
 #   bash bench_gdn.sh ck-prefill       # CK prefill 管线 (preprocess+cumsum+kkt+recompute+state+output)
 #   bash bench_gdn.sh ck-decode        # CK decode 与 hipc 对比计时（1 token/请求 + 多 token 更新）
+#   bash bench_gdn.sh ck-decode-doc    # CK decode，文档口径: GPU Graph + vllm_update 对照 + VK/raw-gate
 #   bash bench_gdn.sh all
 #
 # 可用环境变量 (都有默认值):
@@ -71,7 +73,7 @@ PASSED=()
 FAILED=()
 
 usage() {
-    sed -n '5,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '5,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 run_case() {
@@ -152,6 +154,15 @@ case_ck_decode() {
         --out-json "$OUT_DIR/ck_decode.json"
 }
 
+# CK 文档口径: GPU Graph 计时(不含 host 开销) + 文档使用的 HIPC 对照算子
+case_ck_decode_doc() {
+    run_case ck-decode-doc "$BENCH_DIR/bench_ck_gdn_native.py" \
+        --mode decode --dtype "$PREFILL_DTYPE" --gate-dtype bf16 \
+        --hipc-op vllm-update --graph --heads 16 --value-heads 64 --batch 32 \
+        "${TIMING_ARGS[@]}" "${EXTRA_ARR[@]}" \
+        --out-json "$OUT_DIR/ck_decode_doc.json"
+}
+
 TARGET="${1:-all}"
 if (( $# > 0 )); then
     shift
@@ -176,6 +187,7 @@ case "$TARGET" in
     ck)                     case_ck_prefill; case_ck_decode ;;
     ck-prefill)             case_ck_prefill ;;
     ck-decode)              case_ck_decode ;;
+    ck-decode-doc)          case_ck_decode_doc ;;
     all)
         case_prefill_vllm
         case_prefill_sglang
