@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Modified by Hygon Information Technology Co., Ltd.: quality and safety fixes.
+# SPDX-License-Identifier: Apache-2.0
+
 """Validate literal config pairs, including defaults and shadowed legacy files."""
 
 import argparse
