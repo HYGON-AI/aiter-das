@@ -34,35 +34,100 @@ def record_failure(
     )
 
 
-def check_topk_ids_with_ties(ref_ids, actual_ids, routing_scores, msg=""):
-    """Require the same selected score multiset, allowing only exact ties.
+def check_topk_routing_allclose(
+    gating_output,
+    topk_weights,
+    topk_ids,
+    renormalize,
+    scoring_func="softmax",
+    routed_scaling_factor=1.0,
+    num_expert_group=None,
+    topk_group=None,
+    rtol=1e-2,
+    atol=1e-2,
+    msg="",
+):
+    """Check unbiased top-k semantics, allowing exact expert/group cutoff ties.
 
-    Top-K has no unique answer when several BF16/FP16 experts have exactly the
-    same routing score at the selection boundary.  Different IDs are valid
-    only when their selected raw-score multisets are byte-for-byte equal.  This
-    does not relax any numerical tolerance: a different non-tie score remains
-    a test failure.
+    Validate weights against the scores at the returned IDs. Comparing two
+    weight arrays sorted by expert ID is invalid when their legal tie choices
+    differ. Routing checks use exact ranks, with no numerical tolerance.
     """
-    ref_ids = ref_ids.to(torch.int64)
-    actual_ids = actual_ids.to(torch.int64)
-    sorted_ref_ids = ref_ids.sort(dim=-1).values
-    sorted_actual_ids = actual_ids.sort(dim=-1).values
-    if torch.equal(sorted_ref_ids, sorted_actual_ids):
-        aiter.logger.info(f"{msg}[exact IDs \033[32mpassed~\033[0m]")
-        return 0.0
+    from aiter import logger
 
-    ref_scores = routing_scores.gather(1, ref_ids).sort(dim=-1).values
-    actual_scores = routing_scores.gather(1, actual_ids).sort(dim=-1).values
-    non_tie_mismatch = ref_scores.ne(actual_scores)
-    error_ratio = (non_tie_mismatch.sum() / non_tie_mismatch.numel()).item()
-    if error_ratio == 0:
-        aiter.logger.info(f"{msg}[exact-score tie alternative \033[32mpassed~\033[0m]")
+    logits = gating_output.float()
+    if scoring_func == "softmax":
+        scores = logits.softmax(dim=-1)
+    elif scoring_func == "sigmoid":
+        scores = logits.sigmoid()
     else:
-        aiter.logger.info(
-            f"{msg}[non-tie score mismatch \033[31mfailed!\033[0m] "
-            f"error_ratio={error_ratio}"
+        raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
+    num_token, num_expert = logits.shape
+    topk = topk_ids.shape[-1]
+    ids = topk_ids.long()
+    valid_ids = ids.ge(0) & ids.lt(num_expert)
+    safe_ids = ids.clamp(0, num_expert - 1)
+    unique_ids = ids.sort(dim=-1).values.diff(dim=-1).ne(0).all(dim=-1)
+
+    expected_weights = scores.gather(1, safe_ids)
+    if renormalize:
+        expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
+    expected_weights = expected_weights * routed_scaling_factor
+    close_weights = torch.isclose(
+        expected_weights, topk_weights, rtol=rtol, atol=atol
+    ) & valid_ids
+    weight_error_ratio = (~close_weights).float().mean().item()
+
+    if num_expert_group is None:
+        # The fused ordinary kernel selects logits before computing softmax.
+        choice_scores = logits
+        candidates = choice_scores
+        group_ok = torch.ones(num_token, dtype=torch.bool, device=logits.device)
+    else:
+        choice_scores = scores
+        experts_per_group = num_expert // num_expert_group
+        group_scores = choice_scores.view(num_token, num_expert_group, -1).amax(dim=-1)
+        threshold = group_scores.topk(topk_group, dim=-1).values[:, -1:]
+        mandatory = group_scores > threshold
+        selectable = group_scores >= threshold
+        used = torch.zeros_like(selectable)
+        used.scatter_(1, safe_ids // experts_per_group, True)
+        required = mandatory | used
+        required_count = required.sum(dim=-1)
+        selected_min = choice_scores.gather(1, safe_ids).amin(dim=-1)
+        group_ok = (
+            (~used | selectable).all(dim=-1)
+            & (required_count <= topk_group)
+            # Any remaining selected groups must be boundary groups. Since
+            # they contain no returned experts, their maxima cannot exceed
+            # the selected expert cutoff. This proves a legal completion
+            # exists without enumerating every combination of tied groups.
+            & ((required_count == topk_group) | (threshold[:, 0] <= selected_min))
         )
-    return error_ratio
+        expert_mask = required.repeat_interleave(experts_per_group, dim=-1)
+        candidates = choice_scores.masked_fill(~expert_mask, -torch.inf)
+
+    selected = choice_scores.gather(1, safe_ids).sort(dim=-1).values
+    expected = candidates.topk(topk, dim=-1).values.sort(dim=-1).values
+    routing_ok = (
+        valid_ids.all(dim=-1)
+        & unique_ids
+        & group_ok
+        & selected.eq(expected).all(dim=-1)
+    )
+    routing_error_ratio = (~routing_ok).float().mean().item()
+    logger.info(
+        f"{msg}[topk/weight {atol=} {rtol=}] "
+        f"{'passed~' if weight_error_ratio == 0 else 'failed!'} "
+        f"error_ratio={weight_error_ratio}"
+    )
+    logger.info(
+        f"{msg}[topk/routing] "
+        f"{'passed~' if routing_error_ratio == 0 else 'failed!'} "
+        f"error_ratio={routing_error_ratio}"
+    )
+    return weight_error_ratio, routing_error_ratio
 
 
 @perftest(num_iters=2, num_warmup=1)
@@ -149,8 +214,7 @@ def test_fuse(
 def test_topk_softmax(dtype, token, E, topk, renormalize=True):
     gating_output = torch.randn((token, E), dtype=dtype, device="cuda")
 
-    (topk_weights_a, topk_ids_a), avg_a = test_nofuse(gating_output, topk, renormalize)
-
+    _, avg_a = test_nofuse(gating_output, topk, renormalize)
     func_dict = {"hip": test_fuse}
     ret = {}
     for tag, func in func_dict.items():
@@ -161,16 +225,12 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
         ):
             continue
         (topk_weights, topk_ids), us = func(gating_output, topk, renormalize)
-        topk_ids = topk_ids.to(dtypes.i32)
-        expected_weights = torch.softmax(gating_output.float(), dim=-1).gather(
-            1, topk_ids.to(torch.int64)
-        )
-        if renormalize:
-            expected_weights = expected_weights / expected_weights.sum(
-                dim=-1, keepdim=True
-            )
-        weight_err = checkAllclose(
-            expected_weights, topk_weights, msg=f"{tag} topk_weights"
+        weight_err, id_err = check_topk_routing_allclose(
+            gating_output,
+            topk_weights,
+            topk_ids,
+            renormalize,
+            msg=f"{tag} ",
         )
         record_failure(
             "test_topk_softmax",
@@ -183,9 +243,6 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
             dtype=dtype,
             renormalize=renormalize,
             backend=tag,
-        )
-        id_err = check_topk_ids_with_ties(
-            topk_ids_a, topk_ids, gating_output, msg=f"{tag} topk_ids"
         )
         record_failure(
             "test_topk_softmax",
@@ -757,7 +814,7 @@ def test_grouped_topk(
 ):
     gating_output = torch.randn((token, expert), dtype=dtype)
 
-    (w_ref, id_ref), us_ref = run_perftest(
+    _, us_ref = run_perftest(
         aiter.grouped_topk_torch,
         gating_output,
         topk,
@@ -768,7 +825,6 @@ def test_grouped_topk(
         num_iters=2,
         num_warmup=1,
     )
-    w_ref = w_ref * scale_factor
     w_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.fp32)
     id_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.i32)
     is_softmax = True if scoring_func == "softmax" else False
@@ -783,20 +839,16 @@ def test_grouped_topk(
         is_softmax,
         scale_factor,
     )
-    if scoring_func == "softmax":
-        routing_scores = torch.softmax(gating_output.float(), dim=-1)
-    else:
-        routing_scores = gating_output.float().sigmoid()
-    expected_weights = routing_scores.gather(1, id_aiter.to(torch.int64))
-    if need_renorm:
-        expected_weights = expected_weights / expected_weights.sum(
-            dim=-1, keepdim=True
-        )
-    expected_weights = expected_weights * scale_factor
-    err = checkAllclose(
-        expected_weights,
+    err, id_err = check_topk_routing_allclose(
+        gating_output,
         w_aiter,
-        msg="topk_weights [golden vs aiter]",
+        id_aiter,
+        need_renorm,
+        scoring_func=scoring_func,
+        routed_scaling_factor=scale_factor,
+        num_expert_group=group,
+        topk_group=topk_group,
+        msg=f"[golden vs aiter]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us......",
     )
     record_failure(
         "test_grouped_topk",
@@ -813,12 +865,6 @@ def test_grouped_topk(
         scale_factor=scale_factor,
         scoring_func=scoring_func,
         backend="aiter",
-    )
-    id_err = check_topk_ids_with_ties(
-        id_ref,
-        id_aiter,
-        gating_output,
-        msg=f"topk_ids     [golden vs aiter]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us......",
     )
     record_failure(
         "test_grouped_topk",
