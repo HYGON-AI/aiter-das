@@ -581,6 +581,10 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
 
         buf = next_buf;
     }
+#if defined(__gfx938__)
+    // Finish peer reads before a following copy overwrites the staging input.
+    end_sync<ngpus, true>(sg, self_sg, rank);
+#endif
 }
 
 template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>

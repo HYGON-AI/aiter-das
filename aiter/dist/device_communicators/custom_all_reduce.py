@@ -516,6 +516,20 @@ class CustomAllreduce:
                 "forcing AITER_AR_ENABLE_REG_CAPTURE=0 copy-in mode."
             )
             enable_register_for_capturing = False
+        if self.transport == "ipc" and enable_register_for_capturing and torch.version.hip:
+            arch = torch.cuda.get_device_properties(self.device).gcnArchName.split(":")[0]
+            if arch in ("gfx936", "gfx938"):
+                # On gfx936/gfx938, direct IPC reads of cached graph allocations can
+                # observe stale inputs. End barriers and system-scope fences
+                # alone do not fix this (reproduced on DTK 26.04). The existing
+                # uncached staging pool provides the validated copy-in path.
+                logger.warning(
+                    "%s IPC graph input registration can return stale data; "
+                    "using copy-in mode despite enable_register_for_capturing=True. "
+                    "AITER custom allreduce remains enabled.",
+                    arch,
+                )
+                enable_register_for_capturing = False
         # Every graph collective must use copy-in mode when registration is
         # disabled; Fabric cannot register arbitrary graph allocations later.
         self.enable_register_for_capturing = enable_register_for_capturing
