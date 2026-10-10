@@ -248,7 +248,7 @@ class ForcePlatlibDistribution(Distribution):
         return True
 
 
-AITER_FIXED_VERSION = os.environ.get("AITER_FIXED_VERSION", "0.1.6")
+AITER_FIXED_VERSION = os.environ.get("AITER_FIXED_VERSION", "0.1.7")
 AITER_USE_SCM_VERSION = int(os.environ.get("AITER_USE_SCM_VERSION", 0))
 version_kwargs = {"use_scm_version": True} if AITER_USE_SCM_VERSION else {"version": AITER_FIXED_VERSION}
 
