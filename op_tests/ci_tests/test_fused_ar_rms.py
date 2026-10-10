@@ -31,6 +31,7 @@ from aiter.dist.communication_op import (
     tensor_model_parallel_fused_allreduce_rmsnorm_quant,
 )
 from aiter.test_common import (
+    format_test_summary,
     checkAllclose,
     perftest,
     benchmark,
@@ -515,7 +516,7 @@ parser.add_argument(
     "-d",
     "--dtype",
     type=str,
-    choices=l_dtype,
+    choices=["fp16", "bf16"],
     nargs="?",
     const=None,
     default=None,
@@ -675,14 +676,15 @@ if __name__ == "__main__":
     ]
     show_cols = [c for c in show_cols if c in df.columns]
     # separate withGraph=True / False into two groups (no cross in the summary)
-    for graph_on in sorted(df["withGraph"].unique()):
+    graph_modes = sorted(df["withGraph"].unique()) if "withGraph" in df else []
+    for graph_on in graph_modes:
         sub = df[df["withGraph"] == graph_on]
         tag = "graph_on" if graph_on else "graph_off"
         sub[show_cols].to_csv(f"test_fused_ar_rms_{tag}.csv", index=False)
         logger.info(
             "fused vs split allreduce rmsnorm summary (withGraph=%s):\n%s",
             bool(graph_on),
-            sub[show_cols].to_markdown(index=False),
+            format_test_summary(sub[show_cols]),
         )
     if failed_cases:
         details = "\n".join(

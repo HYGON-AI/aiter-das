@@ -55,6 +55,10 @@ d_dtypes = {
 # Map torch dtype → AiterDtype integer id (built from aiter_enum.h at import time)
 _torch_to_aiter_dtype = {d_dtypes[name]: idx for name, idx in aiter_dtypes.items() if name in d_dtypes}
 
+# The tensor ABI describes storage independently of native instruction support.
+# Communication epilogues may produce E4M3FN with software conversion on gfx936.
+_torch_to_aiter_dtype[torch.float8_e4m3fn] = aiter_dtypes["fp8"]
+
 
 def torch_to_aiter_pybind(tensor: torch.Tensor):
     """Convert torch.Tensor to pybind aiter_tensor_t for passing to C++ ops.

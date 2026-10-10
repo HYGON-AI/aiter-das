@@ -82,7 +82,10 @@ def run_case(ca, rank, world_size, dtype, repeats):
         graph.replay()
         torch.cuda.synchronize()
 
-        reduced = torch.stack([x.float() for x in inputs]).sum(dim=0)
+        # AR stores its result in the activation dtype before the split
+        # RMS stage adds the residual in FP32. Match that public tensor
+        # boundary, including BF16 ties at large changing-input values.
+        reduced = torch.stack([x.float() for x in inputs]).sum(dim=0).to(dtype).float()
         summed = reduced + residual.float()
         norm = summed * torch.rsqrt(summed.square().mean(dim=-1, keepdim=True) + eps)
         norm = norm * weight.float()
@@ -102,7 +105,7 @@ def run_case(ca, rank, world_size, dtype, repeats):
             torch.testing.assert_close(
                 actual, reference,
                 rtol=tolerance, atol=tolerance,
-                msg=f"rank={rank} dtype={dtype} repeat={repeat} op={name}",
+                msg=lambda detail: f"rank={rank} dtype={dtype} repeat={repeat} op={name} actual={actual.flatten()[:8].tolist()} ref={reference.flatten()[:8].tolist()} reduced={reduced.flatten()[:8].tolist()} residual={residual.flatten()[:8].tolist()}\n{detail}",
             )
     dist.barrier()
     print(

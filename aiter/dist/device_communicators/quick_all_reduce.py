@@ -22,7 +22,8 @@ class QuickReduceRegime(Enum):
     FP8 = 1
     INT6 = 2
     INT4 = 3
-    NONE = 4
+    INT3 = 4
+    NONE = 5
 
 
 try:
@@ -36,12 +37,12 @@ except Exception:
     quick_ar = False
 
 
-def qr_rocm_arch_available():
+def qr_rocm_arch_available(device=None):
     try:
-        props = torch.cuda.get_device_properties(0)
+        props = torch.cuda.get_device_properties(device)
         gcn_arch = getattr(props, "gcnArchName", "")
-        supported_archs = ["gfx94", "gfx95"]
-        return any(gfx in gcn_arch for gfx in supported_archs)
+        supported_archs = ["gfx94", "gfx95", "gfx936", "gfx938"]
+        return any(gcn_arch.startswith(gfx) for gfx in supported_archs)
     except Exception as e:
         logger.warning("Failed to determine ROCm for quick allreduce: %s", e)
         return False
@@ -93,7 +94,11 @@ class QuickAllReduce:
         are in the same node.
         """
         self.disabled = True
-        if not qr_rocm_arch_available():
+        self._ptr = 0
+        if os.environ.get("AITER_AR_TRANSPORT", "ipc").lower() == "fabric":
+            logger.debug("QR IPC is disabled when Fabric transport is explicitly requested")
+            return
+        if not qr_rocm_arch_available(device):
             logger.debug(
                 "Custom quick allreduce is limited supported."
             )
@@ -136,6 +141,10 @@ class QuickAllReduce:
         elif isinstance(device, str):
             device = torch.device(device)
         assert isinstance(device, torch.device)
+        if device.type != "cuda":
+            raise ValueError("QR requires a CUDA/HIP device")
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         self.device = device
 
         # The helper resolves each rank's visible device through HIP PCI BDF,
@@ -178,35 +187,46 @@ class QuickAllReduce:
             )
             return
         self.qr_quant_level = QuickReduceRegime[regime_str]
+        if self.qr_quant_level == QuickReduceRegime.INT3 and self.world_size != 2:
+            logger.warning("INT3 QR requires TP2")
+            return
 
-        # TODO: If the dtype is not bfloat16 or then float16,
-        # quickallreduce should not be created.
-
-        # AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB is specified in MB
-        qr_max_size = int(os.environ.get("AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB", 0))
-        if qr_max_size > 0:
-            if qr_max_size < 1:
-                logger.info(
-                    "You should not set a max_size smaller than 1MB, which can "
-                    "lead to error or degradation to custom allreduce or rccl."
-                )
-            qr_max_size = qr_max_size * MB
-        # If qr_max_size is None, then 2GB is used by default.
-        self._ptr = ops.init_custom_qr(self.rank, self.world_size, qr_max_size)
-        self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
+        qr_max_size = int(os.environ.get("AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB", 0)) * MB
+        error = None
+        try:
+            with torch.cuda.device(self.device):
+                self._ptr = ops.init_custom_qr(self.rank, self.world_size, qr_max_size)
+            self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
+        except Exception as exc:
+            error = exc
+        self._sync_init_stage("allocation", error)
         self.create_shared_buffer()
         self.disabled = False
 
+    def _sync_init_stage(self, stage, error):
+        errors = [None] * self.world_size
+        message = None if error is None else f"rank {self.rank}: {error}"
+        dist.all_gather_object(errors, message, group=self.group)
+        if any(errors):
+            self.close()
+            raise RuntimeError(f"QR {stage} failed collectively: " + "; ".join(e for e in errors if e))
+
     def create_shared_buffer(self):
-        """
-        Creates a shared buffer for quickreduce.
-        Has to be called after init_custom_qr
-        """
-        handle = ops.qr_get_handle(self._ptr)
-        world_size = dist.get_world_size(group=self.group)
-        handles = [None] * world_size
+        """Exchange IPC handles, propagating each local failure to every rank."""
+        handle, error = None, None
+        try:
+            handle = ops.qr_get_handle(self._ptr)
+        except Exception as exc:
+            error = exc
+        self._sync_init_stage("handle export", error)
+        handles = [None] * self.world_size
         dist.all_gather_object(handles, handle, group=self.group)
-        ops.qr_open_handles(self._ptr, handles)
+        error = None
+        try:
+            ops.qr_open_handles(self._ptr, handles)
+        except Exception as exc:
+            error = exc
+        self._sync_init_stage("peer attach", error)
 
     def should_quick_allreduce(self, inp: torch.Tensor):
         """
@@ -214,14 +234,15 @@ class QuickAllReduce:
         """
         if self.disabled:
             return False
-        if inp.dtype not in self._SUPPORTED_DTYPES:
+        if (inp.dtype not in self._SUPPORTED_DTYPES or not inp.is_cuda
+                or inp.device != self.device or inp.numel() == 0):
             return False
         inp_size = inp.numel() * inp.element_size()
         # custom quick allreduce requires input byte size to be
         # multiples of 16
         if inp_size % 16 != 0:
             return False
-        if not is_weak_contiguous(inp):
+        if not inp.is_contiguous():
             return False
         dtype = inp.dtype
         if self.use_fp16_kernels:
@@ -229,7 +250,7 @@ class QuickAllReduce:
         return (
             inp_size <= self.qr_max_size
             and inp_size
-            >= self._QR_MIN_SIZE[(dtype, self.world_size)][self.qr_quant_level.value]
+            >= self._QR_MIN_SIZE[(dtype, self.world_size)][min(self.qr_quant_level.value, 3)]
         )
 
     def quick_all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):
@@ -243,9 +264,60 @@ class QuickAllReduce:
         )
         return out
 
+    def should_quick_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        hidden_dim: int,
+    ):
+        if not self.should_quick_allreduce(inp):
+            return False
+        if hidden_dim <= 0 or inp.ndim == 0 or inp.shape[-1] != hidden_dim:
+            return False
+        if (residual_inp.shape != inp.shape or residual_inp.device != inp.device
+                or weight.device != inp.device or weight.ndim != 1):
+            return False
+        if inp.dtype != residual_inp.dtype or inp.dtype != weight.dtype:
+            return False
+        if not residual_inp.is_contiguous() or not weight.is_contiguous():
+            return False
+        if weight.numel() != hidden_dim or inp.numel() % hidden_dim != 0:
+            return False
+
+        row_size = hidden_dim * inp.element_size()
+        tile_size = 32 * 1024
+        return row_size > 0 and row_size <= tile_size and tile_size % row_size == 0
+
+    def quick_all_reduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        hidden_dim: int,
+    ):
+        """Performs QR allreduce fused with residual add and RMSNorm."""
+        out = torch.empty_like(inp)
+        residual_out = torch.empty_like(residual_inp)
+        ops.qr_all_reduce_rmsnorm(
+            self._ptr,
+            inp,
+            residual_inp,
+            residual_out,
+            out,
+            weight,
+            eps,
+            hidden_dim,
+            self.qr_quant_level.value,
+            self.use_fp16_kernels,
+        )
+        return out, residual_out
+
     def close(self):
-        if not self.disabled and getattr(self, "_ptr", None):
+        if getattr(self, "_ptr", None):
             if ops is not None:
+                torch.cuda.synchronize(self.device)
                 ops.qr_destroy(self._ptr)
             self._ptr = 0
             self.disabled = True

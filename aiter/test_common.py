@@ -455,6 +455,14 @@ def get_trace_perf(prof, num_iters):
     return df.at[avg_name, "device_time_sum"]
 
 
+def format_test_summary(frame):
+    """Keep test results available when pandas' optional tabulate is absent."""
+    try:
+        return frame.to_markdown(index=False)
+    except ImportError:
+        return frame.to_string(index=False)
+
+
 def checkAllclose(a, b, rtol=1e-2, atol=1e-2, tol_err_ratio=0.05, msg="", printNum=8, printLog=True, perfModel=False):
     if perfModel:
         a = a.to("cpu").to(torch.float32)

@@ -193,170 +193,167 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return out
 
     def fused_allreduce_rmsnorm(
-        self, input_, res_inp_, weight_, eps, prefill_support: bool = False
+        self, input_, res_inp_, weight_, eps, prefill_support: bool = False,
+        x_pad_to_multiple: int = 0, gemma_norm: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        n = input_.shape[-1]
+        valid = weight_.numel()
+        if x_pad_to_multiple < 0:
+            raise ValueError("x_pad_to_multiple must be nonnegative")
+        out_hidden_dim = ((valid + x_pad_to_multiple - 1) // x_pad_to_multiple * x_pad_to_multiple) if x_pad_to_multiple else 0
+        if valid <= 0 or input_.shape[-1] < valid or res_inp_.shape != input_.shape[:-1] + (valid,):
+            raise ValueError("input, weight and residual widths do not match")
+        if out_hidden_dim and out_hidden_dim < valid:
+            raise ValueError("output width must contain the valid columns")
         total_bytes = input_.numel() * input_.element_size()
-        can_use_fuse_ar_rms = (
-            n <= 16384
-            and total_bytes < 8 * 1024 * 8192
-            and self.world_size != 6
-        )
-        ca_comm = self.ca_comm
-        can_use_custom_ar = (
-            ca_comm is not None and not ca_comm.disabled and can_use_fuse_ar_rms
-        )
-        total_bytes_limit = (
-            self._ar_1stage_max_kb
-            if self._ar_1stage_max_kb >= 0
-            else 128 * 7168 * 2 // self.world_size
-        )
-        use_1stage = (
-            self._ar_1stage_override
-            if self._ar_1stage_override is not None
-            else (total_bytes <= total_bytes_limit)
-        )
-        if (
-            can_use_custom_ar
-            and ca_comm.should_custom_ar(input_, prefill_support)
-        ):
-            out, res_out = ca_comm.custom_fused_ar_rms(
-                input_, res_inp_, weight_, eps, use_1stage=use_1stage
-            )
-            assert out is not None
-            assert res_out is not None
-            return out, res_out
-        # call split kernel
-        ar_out = self.all_reduce(input_)
-        out = torch.empty_like(ar_out)
-        residual_out = torch.empty_like(ar_out)
-        from aiter import rmsnorm2d_fwd_with_add
+        ca = self.ca_comm
+        limit = self._ar_1stage_max_kb if self._ar_1stage_max_kb >= 0 else 128 * 7168 * 2 // self.world_size
+        one_stage = self._ar_1stage_override if self._ar_1stage_override is not None else total_bytes <= limit
+        qr = getattr(self, "qr_comm", None)
+        if (not one_stage and not x_pad_to_multiple and not gemma_norm
+                and input_.shape[-1] == valid and qr is not None
+                and qr.should_quick_allreduce_rmsnorm(input_, res_inp_, weight_, valid)):
+            return qr.quick_all_reduce_rmsnorm(input_, res_inp_, weight_, eps, valid)
+        if (ca is not None and not ca.disabled and self.world_size in (2, 4, 8)
+                and valid <= 16384 and total_bytes < 64 * 1024 * 1024
+                and ca.should_custom_ar(input_, prefill_support)):
+            result = ca.custom_fused_ar_rms(input_, res_inp_, weight_, eps,
+                use_1stage=one_stage, out_hidden_dim=out_hidden_dim, gemma_norm=gemma_norm)
+            if result is not None:
+                return result
+        ar_out = self.all_reduce(input_.contiguous())[..., :valid]
+        if not gemma_norm and input_.shape[-1] == valid and not out_hidden_dim:
+            from aiter import rmsnorm2d_fwd_with_add
+            out, residual_out = torch.empty_like(ar_out), torch.empty_like(res_inp_)
+            rmsnorm2d_fwd_with_add(out, ar_out, res_inp_, residual_out, weight_, eps)
+            return out, residual_out
+        # Match the fused path's FP32 residual addition and RMS accumulation.
+        z = ar_out.float() + res_inp_.float()
+        norm = z * torch.rsqrt(z.square().mean(-1, keepdim=True) + eps)
+        norm = norm * (weight_.float() + (1 if gemma_norm else 0))
+        out = norm.to(input_.dtype)
+        out_dim = out_hidden_dim or input_.shape[-1]
+        if out_dim > valid:
+            out = torch.nn.functional.pad(out, (0, out_dim - valid))
+        return out, z.to(input_.dtype)
 
-        rmsnorm2d_fwd_with_add(
-            out,
-            ar_out,
-            input_,
-            residual_out,
-            weight_,
-            eps,
-        )
-        return out, residual_out
+    @staticmethod
+    def _quantize_norm(out, group_size, transpose_scale=False):
+        if group_size <= 0 or out.shape[-1] % group_size:
+            raise ValueError("group_size must divide the hidden width")
+        if transpose_scale and out.ndim != 2:
+            raise ValueError("transpose_scale requires a two-dimensional input")
+        from aiter.utility.dtypes import fp8 as platform_fp8
+        if platform_fp8 != torch.uint8 and group_size in (128, out.shape[-1]):
+            from aiter import get_hip_quant, QuantType
+            kind = QuantType.per_Token if group_size == out.shape[-1] else QuantType.per_1x128
+            quant, scale = get_hip_quant(kind)(out, quant_dtype=platform_fp8)
+            if transpose_scale:
+                transposed = torch.empty((scale.shape[1], scale.shape[0]), dtype=scale.dtype, device=scale.device).t()
+                transposed.copy_(scale)
+                scale = transposed
+            return quant, scale
+        values = out.float().reshape(*out.shape[:-1], out.shape[-1] // group_size, group_size)
+        amax = values.abs().amax(-1)
+        scale = torch.where(amax == 0, torch.ones_like(amax), amax / 448.0)
+        quant = (values / scale.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn).reshape(out.shape)
+        if transpose_scale:
+            transposed = torch.empty((scale.shape[1], scale.shape[0]), dtype=scale.dtype, device=scale.device).t()
+            transposed.copy_(scale)
+            scale = transposed
+        return quant, scale
 
     def fused_allreduce_rmsnorm_quant(
-        self,
-        input_,
-        res_inp_,
-        weight_,
-        eps,
-        prefill_support: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self, input_, res_inp_, weight_, eps, prefill_support: bool = False,
+        quant_type="per_token", group_size: int = 128, emit_bf16: bool = False,
+        transpose_scale: bool = False, gemma_norm: bool = False,
+    ):
+        from ..communication_op import _canonical_fused_ar_rms_quant_type
+        kind = _canonical_fused_ar_rms_quant_type(quant_type)
+        if kind != "per_token" and gemma_norm:
+            raise ValueError("Gemma quantization is supported only for per-token FP8")
+        if kind == "per_group":
+            return self.fused_allreduce_rmsnorm_quant_per_group(input_, res_inp_, weight_, eps,
+                group_size, prefill_support, emit_bf16, transpose_scale)
+        if transpose_scale:
+            raise ValueError("transpose_scale is supported only for per-group FP8")
+        if kind == "mxfp4":
+            ca = self.ca_comm
+            if ca is None or ca.disabled:
+                raise RuntimeError("MXFP4 fusion requires an enabled custom communicator")
+            result = ca.custom_fused_ar_rms_mxfp4_quant(input_, res_inp_, weight_, eps,
+                emit_bf16=emit_bf16)
+            if result is None:
+                raise ValueError("MXFP4 fusion input is outside communicator capacity")
+            return result
         total_bytes = input_.numel() * input_.element_size()
-        K = int(input_.shape[-1])
-        use_1stage = total_bytes <= 128 * 1024
-        # Hygon (gfx938/gfx946) kernel-level bug: the fused
-        # AR+RMSNorm+FP8-quant kernel produces 100% NaN for bf16 at
-        # K=4096 whenever use_1stage=False, regardless of which post-
-        # 1-stage path is dispatched (the 2-stage 128KB-512KB path AND
-        # the split >512KB path both fail). Empirically confirmed on
-        # shapes (17,4096), (32,4096), (128,4096), and (and very likely
-        # (512,4096)+ which we don't proceed to). The 2-stage kernel
-        # works for fp16 at the same K=4096, and for bf16 at K=7168 /
-        # K=8192; the failure is therefore K=4096-and-bf16-specific.
-        # Until the C++ kernel is fixed upstream, fall back to the
-        # Python split path (RMSNorm-only fused kernel + separate
-        # hip_quant) for the entire problematic configuration.
-        problematic_bf16_non_1stage = (
-            input_.dtype == torch.bfloat16
-            and not use_1stage
-            and K == 4096
-        )
-        if (
-            K in [512, 1024, 2048, 4096]
-            and total_bytes <= 4096 * 1024
-            and not problematic_bf16_non_1stage
-        ):
-            out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
-                input_, res_inp_, weight_, eps, use_1stage
-            )
-        else:
-            out_, res_out = self.fused_allreduce_rmsnorm(
-                input_, res_inp_, weight_, eps, prefill_support
-            )
-            from aiter import get_hip_quant, QuantType
-            from aiter.utility.dtypes import fp8
-            hip_quant = get_hip_quant(QuantType.per_Token)
-            out, scale_out = hip_quant(out_, quant_dtype=fp8)
-        assert out is not None
-        assert res_out is not None
-        assert scale_out is not None
-        return out, res_out, scale_out
+        K = input_.shape[-1]
+        one_stage = total_bytes <= 128 * 1024
+        ca = self.ca_comm
+        result = None
+        if (ca is not None and not ca.disabled and self.world_size in (2, 4, 8)
+                and K in (512, 1024, 2048, 4096) and total_bytes <= 4096 * 1024
+                and not (input_.dtype == torch.bfloat16 and not one_stage and K == 4096)):
+            result = ca.custom_fused_ar_rms_quant(input_, res_inp_, weight_, eps,
+                use_1stage=one_stage, gemma_norm=gemma_norm, emit_bf16=emit_bf16)
+        if result is not None:
+            return result
+        norm, residual = self.fused_allreduce_rmsnorm(input_, res_inp_, weight_, eps,
+            prefill_support, gemma_norm=gemma_norm)
+        out, scale = self._quantize_norm(norm, K)
+        return (out, residual, scale, norm) if emit_bf16 else (out, residual, scale)
 
     def fused_allreduce_rmsnorm_quant_per_group(
-        self,
-        input_,
-        res_inp_,
-        weight_,
-        eps,
-        group_size=128,
-        prefill_support: bool = False,
-        emit_bf16: bool = False,
+        self, input_, res_inp_, weight_, eps, group_size=128,
+        prefill_support: bool = False, emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
+        from .custom_all_reduce import _validate_per_group_size
+        K = input_.shape[-1]
+        _validate_per_group_size(group_size, input_.element_size(), K)
+        if transpose_scale and input_.ndim != 2:
+            raise ValueError("transpose_scale requires a two-dimensional input")
         total_bytes = input_.numel() * input_.element_size()
-        K = int(input_.shape[-1])
-        use_1stage = total_bytes <= 128 * 1024
-        out = res_out = scale_out = bf16_out = None
-        fused_ok = False
-        # See ``fused_allreduce_rmsnorm_quant`` for context, with one
-        # important difference: per-token quant's custom-kernel
-        # whitelist is K in {512, 1024, 2048, 4096}, so larger K values
-        # (6144 / 7168 / 8192) always go to the Python fallback there
-        # and never expose the kernel bug for those K. Per-group quant
-        # has a much wider whitelist (any K with K % group_size == 0
-        # and K <= 16384), so it surfaces the same bug at additional K
-        # values (K=4096 and K=6144 both empirically confirmed NaN;
-        # K=7168 / K=8192 untested but likely affected). Widen the
-        # fallback to all bf16 + non-1-stage configurations to be safe;
-        # the perf cost is limited since this only affects bf16 inputs
-        # whose total bytes exceed 128 KB (medium / large prefill).
-        problematic_bf16_non_1stage = (
-            input_.dtype == torch.bfloat16
-            and not use_1stage
+        one_stage = total_bytes <= 128 * 1024
+        ca = self.ca_comm
+        result = None
+        if (ca is not None and not ca.disabled and self.world_size in (2, 4, 8)
+                and K <= 16384 and total_bytes < 64 * 1024 * 1024
+                and not (input_.dtype == torch.bfloat16 and not one_stage)):
+            result = ca.custom_fused_ar_rms_per_group_quant(input_, res_inp_, weight_, eps,
+                group_size, use_1stage=one_stage, emit_bf16=emit_bf16,
+                transpose_scale=transpose_scale)
+        if result is not None:
+            return result
+        norm, residual = self.fused_allreduce_rmsnorm(input_, res_inp_, weight_, eps, prefill_support)
+        out, scale = self._quantize_norm(norm, group_size, transpose_scale)
+        return (out, residual, scale, norm) if emit_bf16 else (out, residual, scale)
+
+    def fused_qknorm_allreduce_rope(
+        self,
+        qkv_in,
+        q_w,
+        k_w,
+        cos_sin_cache,
+        position_ids,
+        head_dim,
+        rotary_dim,
+        eps,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_out, k_out, v_out = self.ca_comm.custom_fused_qknorm_ar_rope(
+            qkv_in,
+            q_w,
+            k_w,
+            cos_sin_cache,
+            position_ids,
+            head_dim,
+            rotary_dim,
+            eps,
         )
-        if (
-            K % group_size == 0
-            and K <= 16384
-            and total_bytes < 8 * 1024 * 8192
-            and not problematic_bf16_non_1stage
-        ):
-            try:
-                result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
-                    input_, res_inp_, weight_, eps, group_size, use_1stage,
-                    emit_bf16=emit_bf16,
-                )
-                if emit_bf16:
-                    out, res_out, scale_out, bf16_out = result
-                else:
-                    out, res_out, scale_out = result
-                fused_ok = True
-            except Exception:
-                pass
-        if not fused_ok:
-            out_, res_out = self.fused_allreduce_rmsnorm(
-                input_, res_inp_, weight_, eps, prefill_support
-            )
-            from aiter import get_hip_quant, QuantType
-            from aiter.utility.dtypes import fp8
-            hip_quant = get_hip_quant(QuantType.per_1x128)
-            out, scale_out = hip_quant(out_, quant_dtype=fp8)
-            if emit_bf16:
-                bf16_out = out_
-        assert out is not None
-        assert res_out is not None
-        assert scale_out is not None
-        if emit_bf16:
-            assert bf16_out is not None
-            return out, res_out, scale_out, bf16_out
-        return out, res_out, scale_out
+        assert q_out is not None
+        assert k_out is not None
+        assert v_out is not None
+        return q_out, k_out, v_out
+
 
     def fused_qknorm_allreduce(
         self,
@@ -375,6 +372,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size
+        if not -input_.ndim <= dim < input_.ndim:
+            raise ValueError("invalid reduce_scatter dimension")
+        dim %= input_.ndim
+        if self.ca_comm is not None and self.ca_comm.should_custom_rs(input_, dim):
+            shape = list(input_.shape)
+            shape[dim] //= world_size
+            output = torch.empty(shape, dtype=input_.dtype, device=input_.device)
+            self.ca_comm.custom_reduce_scatter(input_, output, dim=dim)
+            return output
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None
         if dim < 0:
@@ -383,7 +389,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         # Note: This will produce an incorrect answer if we don't make
         # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
-        input_tensor = input_.movedim(0, dim).contiguous()
+        input_tensor = input_.movedim(dim, 0).contiguous()
 
         assert input_tensor.shape[0] % world_size == 0
         chunk_size = input_tensor.shape[0] // world_size
@@ -410,7 +416,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         # Note: This will produce an incorrect answer if we don't make
         # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
-        input_tensor = input_.movedim(0, dim).contiguous()
+        input_tensor = input_.movedim(dim, 0).contiguous()
 
         if sizes is not None:
             assert len(sizes) == world_size
@@ -465,6 +471,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
         if self.qr_comm is not None:
+            self.qr_comm.close()
             self.qr_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None

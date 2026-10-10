@@ -59,6 +59,7 @@ from .ops.activation import *
 # from .ops.attention import *
 from .ops.custom import *
 from .ops.custom_all_reduce import *
+from .ops.quick_all_reduce import *
 from .ops.moe_op import *
 from .ops.moe_c_op import *
 from .ops.moe_sorting import *
@@ -67,7 +68,7 @@ from .ops.pos_encoding import *
 from .ops.rmsnorm import *
 from .ops.awq_gemm_asm import *
 from .ops.awq_dq_asm import *
-# from .ops.communication import *
+from .ops.communication import init_dist_env, destroy_dist_env
 from .ops.rope import *
 from .ops.topk import *
 from .ops.kpool_topk import *

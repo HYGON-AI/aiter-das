@@ -18,25 +18,45 @@ import logging
 logger = logging.getLogger("aiter")
 
 
-def init_dist_env(world_size, rankID):
+def init_dist_env(
+    world_size: int | None = None,
+    rankID: int | None = None,
+    backend: str = "cpu:gloo,cuda:nccl",
+    distributed_init_method: str | None = "env://",
+    local_rank: int = -1,
+    data_parallel_size: int = 1,
+    data_parallel_rank: int = 0,
+    decode_context_parallel_size: int = 1,
+    prefill_context_model_parallel_size: int = 1,
+    *,
+    tensor_model_parallel_size: int | None = None,
+    pipeline_model_parallel_size: int = 1,
+    custom_group_config=None,
+):
+    """Initialize TP/DP/EP/PP/context groups; ``world_size`` retains its old TP meaning.
+
+    All ranks must use the same rendezvous (env:// or an explicit shared URL).
+    With DP > 1, rankID is the rank within TP*PP*PCP and data_parallel_rank
+    supplies the outer DP coordinate, matching init_distributed_environment.
+    """
+    if tensor_model_parallel_size is not None:
+        if world_size is not None and world_size != tensor_model_parallel_size:
+            raise ValueError("world_size and tensor_model_parallel_size disagree")
+        world_size = tensor_model_parallel_size
+    if world_size is None or world_size <= 0 or rankID is None:
+        raise ValueError("positive TP size and rankID are required")
+    tp = world_size
+    world_size = tp * pipeline_model_parallel_size * prefill_context_model_parallel_size
     set_custom_all_reduce(True)
-    init_distributed_environment(
-        world_size=world_size,
-        rank=rankID,
-        distributed_init_method=get_distributed_init_method(get_ip(), get_open_port()),
-    )
-    ensure_model_parallel_initialized(world_size, 1)
-
-    # hack custom_allreduce
-    tp_grp = get_tp_group()
-    ca_comm = tp_grp.ca_comm
-
-    # signal
-    signal = torch.zeros(world_size * 64, dtype=torch.int64, device=rankID)
-
-    ca_comm.signal = signal
-    ca_comm.register_buffer(signal)
-    logger.debug(f"RANK: {rankID}/{world_size} init_dist_env...")
+    init_distributed_environment(world_size=world_size, rank=rankID,
+        distributed_init_method=distributed_init_method, backend=backend,
+        local_rank=local_rank, data_parallel_size=data_parallel_size,
+        data_parallel_rank=data_parallel_rank)
+    ensure_model_parallel_initialized(tp, pipeline_model_parallel_size,
+        data_parallel_size=data_parallel_size, custom_group_config=custom_group_config,
+        decode_context_model_parallel_size=decode_context_parallel_size,
+        prefill_context_model_parallel_size=prefill_context_model_parallel_size)
+    logger.debug("RANK: %s TP=%s init_dist_env", rankID, tp)
 
 
 def destroy_dist_env():

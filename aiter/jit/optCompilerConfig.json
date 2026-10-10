@@ -39,6 +39,18 @@
         "hipify": "True",
         "blob_gen_cmd": "''"
     },
+    "module_quick_all_reduce": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/quick_all_reduce_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/quick_all_reduce.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_custom_all_reduce": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/custom_all_reduce_pybind.cu'",
@@ -817,6 +829,25 @@
         "extra_include": ["f'{AITER_CSRC_DIR}/opus_mqa_logits/include'"],
         "verbose": "False",
         "hipify": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_fused_ar_mhc": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/fused_ar_mhc_post_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/fused_ar_mhc_post.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mhc_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DAITER_FUSED_AR_MHC_MODULE'",
+            "'-DAITER_ENABLE_SUPERNODE_AR' if os.environ.get('AITER_ENABLE_SUPERNODE_AR', '1').strip().lower() in ('1', 'true', 'yes', 'on') else ''"
+        ],
+        "extra_ldflags": [
+            "'-lhsa-runtime64' if os.environ.get('AITER_ENABLE_SUPERNODE_AR', '1').strip().lower() in ('1', 'true', 'yes', 'on') else ''"
+        ],
+        "extra_include": [],
+        "verbose": "False",
         "blob_gen_cmd": "''"
     }
 }
