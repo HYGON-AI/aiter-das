@@ -47,6 +47,7 @@ echo "Repairing ${wheels[0]} for ${platform}"
 auditwheel show "${wheels[0]}"
 
 excludes=(
+  --exclude "libhsa-runtime64.so.1"
   --exclude "libgalaxyhip.so*"
   --exclude "libMIOpen.so*"
   --exclude "librccl.so*"
