@@ -54,7 +54,10 @@ build and device configuration; use `super_node/` for multi-node testing.
 - `test_custom_allreduce_perf.py`: existing Custom AllReduce benchmark.
 - `test_quick_all_reduce.py`: existing QR benchmark.
 - `test_communication_api_perf.py`: representative TP2 CAR/fusion/MHC/QK-RoPE,
-  HIP QR, Iris and parallel-group API latency. The `hip` suite measures GPU
+  HIP QR, Iris and parallel-group API latency. The `car` suite measures ordinary
+  unquantized FP16/BF16/FP32 CAR and clone + RCCL over 4 KiB–32 MiB, in Graph
+  and eager modes, including a changing-input exact check after timing.
+  The `hip` suite measures GPU
   Graph time; `iris` and `groups_tp/groups_dp/groups_pp` measure synchronized
   eager wall and GPU time. Each case checks correctness before and after timing.
 - `super_node/`: supernode benchmarks and transport/Graph tests.
@@ -92,3 +95,9 @@ Run each suite separately with a different output directory. Results include
 all per-rank samples and collective median/P95/max/CV. Iris needs its optional
 dependency; the group suites initialize AITER groups themselves. Usage and
 published measurements are in [communication docs](../../docs/communication/communication_ops.md).
+
+For ordinary CAR, use `--suite car --samples 30 --graph-ops 32` and a separate
+output directory. Both paths preserve the input and allocate a new output;
+the RCCL reference includes `clone()`. The suite requests capture registration,
+while gfx936/gfx938 use the communicator's copy-in protection. Details and
+current measurements are in [CustomAllreduce](../../docs/communication/custom_allreduce.md).

@@ -39,7 +39,8 @@ class Bench:
         self.path = Path(args.output)
         self.path.mkdir(parents=True, exist_ok=True)
 
-    def measure(self, name, shape, dtype, call, check, *, capture=None, eager=False, **meta):
+    def measure(self, name, shape, dtype, call, check, *, capture=None, eager=False,
+                refresh=None, **meta):
         check(call())
         for _ in range(3):
             call()
@@ -72,6 +73,15 @@ class Bench:
             wall.append((time.perf_counter_ns() - before) / 1000 / ops)
             gpu.append(start.elapsed_time(end) * 1000 / ops)
         check(output)
+        if refresh is not None:
+            # Validate new contents at the same input address, outside timing.
+            refresh()
+            if eager:
+                output = call()
+            else:
+                graph.replay()
+            torch.cuda.synchronize()
+            check(output)
         collected = [None] * self.world
         dist.all_gather_object(collected, dict(gpu_us=gpu, wall_us=wall))
         worst_gpu = [max(r['gpu_us'][i] for r in collected) for i in range(self.args.samples)]
@@ -88,6 +98,64 @@ class Bench:
         del graph, output
         torch.cuda.synchronize()
         dist.barrier()
+
+
+def car_ar_suite(b):
+    """Unquantized, out-of-place SUM versus clone + RCCL, with exact fixtures."""
+    from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
+    ca = CustomAllreduce(dist.group.WORLD, torch.cuda.current_device(),
+                         max_size=128 << 20, enable_register_for_capturing=True)
+    assert not ca.disabled
+    rccl = dist.new_group(backend='nccl')
+    try:
+        sizes = (4 << 10, 16 << 10, 24 << 10, 192 << 10,
+                 512 << 10, 2 << 20, 8 << 20, 32 << 20)
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            for size_index, nbytes in enumerate(sizes):
+                numel = nbytes // torch.empty((), dtype=dtype).element_size()
+                base = (torch.arange(numel, device='cuda') % 8).to(dtype) / 8
+                x = base + b.rank
+                state = [0]
+
+                def refresh():
+                    state[0] += 1
+                    x.copy_(base + b.rank + state[0] / 4)
+
+                def check(y):
+                    assert y is not None and y.data_ptr() != x.data_ptr()
+                    expected = (base + state[0] / 4) * b.world + b.world * (b.world - 1) / 2
+                    torch.testing.assert_close(y, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(x, base + b.rank + state[0] / 4, rtol=0, atol=0)
+
+                assert ca.should_custom_ar(x)
+
+                def car():
+                    return ca.custom_all_reduce(x, use_new=True, open_fp8_quant=False)
+
+                def reference():
+                    y = x.clone()
+                    dist.all_reduce(y, group=rccl)
+                    return y
+
+                cases = [('car_all_reduce', car, ca.capture),
+                         ('rccl_clone_all_reduce', reference, None)]
+                # Alternate ordering without dropping slow samples.
+                if size_index % 2:
+                    cases.reverse()
+                for eager in (False, True):
+                    for name, call, capture in cases:
+                        b.measure(name, x.shape, dtype, call, check,
+                                  capture=capture, eager=eager, refresh=refresh,
+                                  payload_bytes=nbytes, transport='ipc',
+                                  output_allocation='included', input_clone=name.startswith('rccl'),
+                                  register_capture_requested=True,
+                                  register_capture_effective=ca.enable_register_for_capturing,
+                                  use_new=True, open_fp8_quant=False)
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier()
+        ca.close()
+        dist.destroy_process_group(rccl)
 
 
 def car_suite(b):
@@ -347,7 +415,7 @@ def provenance(args):
 
 def main():
     p=argparse.ArgumentParser()
-    p.add_argument('--suite',choices=['hip','iris','groups_tp','groups_dp','groups_pp'],required=True)
+    p.add_argument('--suite',choices=['car','hip','iris','groups_tp','groups_dp','groups_pp'],required=True)
     p.add_argument('--output',required=True)
     p.add_argument('--samples',type=int,default=30)
     p.add_argument('--graph-ops',type=int,default=16)
@@ -369,7 +437,8 @@ def main():
     else:dist.init_process_group('gloo',timeout=timedelta(seconds=180))
     bench=Bench(args)
     try:
-        if args.suite=='hip':car_suite(bench)
+        if args.suite=='car':car_ar_suite(bench)
+        elif args.suite=='hip':car_suite(bench)
         elif args.suite=='iris':iris_suite(bench)
         else:groups_suite(bench,layout)
         provenance(args)

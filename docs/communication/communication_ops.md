@@ -7,6 +7,8 @@ Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 本文介绍 Hygon AITER 的通信接口扩展及调用约定。AR、AG、RS 分别表示 AllReduce、AllGather、ReduceScatter；TP 表示参与张量并行的 rank 数。设备代码在 HCU 上仍使用 PyTorch 的 `cuda` 名称。
 
+普通 CAR 的完整示例、Graph 注意事项及当前 gfx936/gfx938 性能见 [CustomAllreduce 用法与性能](custom_allreduce.md)。
+
 ## 接口总览
 
 | 接口族 | 新增或扩展能力 | 使用入口 |
@@ -274,7 +276,7 @@ gfx936/gfx938 的高层 IPC communicator 即使收到 `enable_register_for_captu
 
 ## 性能结果
 
-下列性能表保留其标注日期的测量结果。2026-10-10 合入的精度修复为 gfx936/gfx938 优化 one-stage 增加了结束同步；其当前延迟需要重新测量，不能直接用修复前的数值作为性能承诺。
+下列性能表保留其标注日期的测量结果。普通 CAR 在 2026-10-10 合入 gfx936/gfx938 优化 one-stage 结束同步后的最新测量，见 [CustomAllreduce 性能](custom_allreduce.md#典型性能)。不同接口及测量条件的结果不能直接互换。
 
 ### AR + RMSNorm，BF16 TP2
 
