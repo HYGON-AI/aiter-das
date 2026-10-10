@@ -1519,7 +1519,7 @@ def moe_align_block_size(
     num_tokens_post_pad = torch.empty((1),
                                       dtype=torch.int32,
                                       device=topk_ids.device)
-    if num_experts >= 224:
+    if num_experts >= 224 and num_experts != 512:
         if num_experts not in (256, 896):
             # Triton fallback only writes valid blocks. Keep padding/tail safe
             # without changing the Triton kernel semantics.
