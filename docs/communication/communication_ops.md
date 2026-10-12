@@ -3,34 +3,71 @@ SPDX-License-Identifier: MIT
 Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 -->
 
-# 通信算子接口说明与性能结果
+# Hygon AITER comm 算子接入与接口说明
 
-本文介绍 Hygon AITER 的通信接口扩展及调用约定。AR、AG、RS 分别表示 AllReduce、AllGather、ReduceScatter；TP 表示参与张量并行的 rank 数。设备代码在 HCU 上仍使用 PyTorch 的 `cuda` 名称。
+本文面向在 vLLM/SGLang 中接入 Hygon AITER 通信算子的开发者，介绍接口用法、HCU 适配约定及验证方式，并提供与 AMD AITER 的接口对照。普通 `CustomAllreduce` 和顶层并行组主接口保持共同的调用方式；中间通信器及 native 绑定的差异见下表。**本轮普通 CAR 性能优化保持已有接口名和参数不变。**
 
-普通 CAR 的完整示例、Graph 注意事项及当前 gfx936/gfx938 性能见 [CustomAllreduce 用法与性能](custom_allreduce.md)。
+接口对照基于 Hygon `186df8da` 与 AMD `06e3bf795e`。AR、AG、RS 分别表示 AllReduce、AllGather、ReduceScatter；TP 表示张量并行 rank 数。HCU 的 PyTorch 设备名仍为 `cuda`。
 
-## 接口总览
+- [Hygon AITER comm 算子接入速查](#hygon-aiter-comm-算子接入速查)
+- [初始化、并行组与 Graph 生命周期](#初始化与运行约定)
+- [AG/RS](#allgather--reducescatter)、[RMSNorm](#ar--residual--rmsnorm--gemma)、[量化](#ar--rmsnorm--量化)、[QK/RoPE](#qk-norm--分布式统计--rope)、[MHC](#ar--mhc-post)
+- [接入验证](#接入验证)与[性能结果](#性能结果)
 
-| 接口族 | 新增或扩展能力 | 使用入口 |
+普通 CAR 的完整 eager/Graph 示例、配置与最新性能统一见 [CustomAllreduce 用法与性能](custom_allreduce.md)；其他后端见 [HIP QuickAR / FlyDSL INT4](quick_all_reduce.md) 和 [Iris 通信](iris_comms.md)。
+
+## Hygon AITER comm 算子接入速查
+
+### 主要接口与兼容性
+
+包名及以下 import 路径不变。表中省略 `self`；“一致”指参数名、顺序、默认值和关键字限制一致，不代表所有输入和架构的运行条件相同。
+
+| 调用入口 | 参数或范围 | 兼容性与使用约定 |
 |---|---|---|
-| Custom AllReduce（CAR） | 保留原有 AR，补充容量、初始化失败和资源释放处理；AG 增加整数位保真，RS 增加任意维度及准入判断 | `CustomAllreduce.should_custom_ag/should_custom_rs`、`custom_all_gather/custom_reduce_scatter` |
-| AR + RMSNorm | Gemma `1+weight`、输出补零、有效 hidden 宽度、末维切片输入 | `custom_fused_ar_rms`、`custom_fused_ar_rms_packed_input` |
-| AR + RMSNorm + FP8 | per-token 增加 Gemma 和未量化输出；per-group 增加转置 scale 存储；保留原有 per-group 三/四输出接口 | `custom_fused_ar_rms_quant`、`custom_fused_ar_rms_per_group_quant` |
-| AR + RMSNorm + MXFP4 | 新增 E2M1 打包及每 32 元素 E8M0 scale | `custom_fused_ar_rms_mxfp4_quant` |
-| QK-Norm + AR + RoPE | 在原有分布式 QK 归一化上融合 NeoX RoPE | `custom_fused_qknorm_ar_rope` |
-| AR + MHC post | 新增自动、一阶段、split 入口及分配输出的 wrapper | `fused_allreduce_mhc_post_{only,one_stage,split}` |
-| HIP Quick AllReduce | 补齐 native QR、IPC 句柄、量化模式及 QR + RMSNorm | [Quick AllReduce](quick_all_reduce.md) |
-| 并行组接口 | DP/EP/PP 通信封装、DCP/PCP 分组、维度 RS、量化统一分派；保留 TP 与自定义组 | `aiter.dist.communication_op`、`init_dist_env` |
-| Iris/Triton 通信 | 新增 AG、RS、RS + RMSNorm + 可选 FP8 + 可选 AG | [Iris 通信](iris_comms.md) |
-| FlyDSL INT4 Quick AllReduce | 新增可选 BF16 INT4 后端及小载荷 FP 策略 | [QuickAllReduceInt4](quick_all_reduce.md#flydsl-int4-接口) |
+| `aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce` | `(group, device, max_size=1024*1024*1024, enable_register_for_capturing=True)` | 构造签名一致；注册行为见下文 |
+| `ca.custom_all_reduce` | `(input, use_new=True, open_fp8_quant=False)` | 一致；不适用时返回 `None`，保留框架回退 |
+| `ca.all_reduce` | `(inp, *, out=None, use_new=True, open_fp8_quant=False, registered_input=False)` | 一致；使用低层方法仍需准入检查 |
+| `ca.custom_all_gather` / `ca.custom_reduce_scatter` | `(inp, dim=0)` / `(input, output, dim=0)` | 一致；AG 返回 Tensor 或不适用时的 `None`，RS 写 output 并返回 `None` |
+| `ca.custom_fused_ar_rms*` | RMS/Gemma、packed input、per-token/per-group FP8、MXFP4 | 主参数兼容；部分 `use_1stage` 在 Hygon 增加默认值，见下文 |
+| `ca.custom_fused_qknorm_ar` / `ca.custom_fused_qknorm_ar_rope` | QK 统计归一化及 RoPE | 参数一致；QK/RoPE 的数据约定见算子章节 |
+| `ca.capture` / `register_input_buffer` / `register_output_buffer` / `register_graph_buffers` / `close` | 捕获、注册、释放 | 签名一致；必须遵循 HCU 注册和生命周期限制 |
+| `aiter.dist.communication_op` | 共同的 TP/DP/EP/PP、自定义组与融合入口 | 参数一致；前提是已初始化 **AITER** 对应组 |
+| `aiter.dist.device_communicators.quick_all_reduce.QuickAllReduce` / `aiter.ops.quick_all_reduce` | HIP QR 及 QR + RMSNorm | 主要调用一致；`qr_get_handle(fa, out_ptr)` 可沿用 |
+| `aiter.ops.custom_all_reduce` 的 MHC 接口、`aiter.ops.triton.comms` 的 Iris 接口 | MHC / Iris 共同入口 | 参数一致；MHC copy-in 与 Iris Graph 限制见对应说明 |
+| `aiter.dist.device_communicators.communicator_pynccl.PyNcclCommunicator` | AR/AG/RS、变长 collective、P2P、窗口注册 | 公共方法签名一致 |
 
-新增 HIP 融合、AG/RS、QR 和 INT4 的已验证范围是 **gfx936 / gfx938、单节点 IPC、TP2/4/8**。普通 CAR 保留已有的 6/16/32/40-rank 和 supernode 路径；不能据此推定新增融合也支持这些 rank 数。Iris 的限制见其独立文档。
+Hygon 为部分共同接口提供可选参数扩展：`custom_fused_ar_rms`、`custom_fused_ar_rms_packed_input`、`custom_fused_ar_rms_quant` 的 `use_1stage` 在 AMD AITER 中为必填，在 Hygon AITER 中提供默认值 `False`；`should_custom_ag(inp)` 增加 `dim=0`，`should_custom_rs(inp, dim)` 增加默认 `dim=0`。接入时可继续显式传入这些参数，保持共同的调用形式。
 
-这里的 EP 扩展指专家并行组的 collective 封装，不包含 FlyDSL/Mori 的专家 token dispatch/combine 或 MegaMoEV2。
+native `init_custom_ar` / `allocate_meta_buffer` 末尾增加可选 `transport=0`；`qr_get_handle` 的 `out_ptr` 在 Hygon 可省略。FlyDSL `QuickAllReduceInt4` 增加 `small_payload_policy="fp"`，`close()` 增加可选 `collective=True`。这些扩展兼容原有调用形式；INT4/FP8 量化后端与普通 CAR 的精度约定需分别评估。
 
-## 初始化与通用约定
+### HCU 接入适配项
 
-框架已有 AITER 并行组时，优先使用 `aiter.dist.communication_op` 的 TP/DP/EP/PP 函数；直接管理通信对象时使用下面的方式。示例保存为脚本后可用 `torchrun --standalone --nproc_per_node=2 example.py` 运行。
+以下差异发生在所列的 **AITER 类/模块** 中，不指 vLLM/SGLang 自己的同名类。只使用上表高层入口的集成通常无需触及这些细节。
+
+| AMD AITER 接口参考 | Hygon AITER 接入约定 | 差异说明 |
+|---|---|---|
+| `GroupCoordinator.all_reduce(x, ca_use_new=True, ca_fp8_quant=False)` | `group.all_reduce(x, use_new=True, open_fp8_quant=False)`；`prefill_support` 不变 | 两个关键字名称不同；顶层 TP 包装没有此差异 |
+| `GroupCoordinator.reduce_scatter(x)` | 明确写 `group.reduce_scatter(x, dim=0)`，保留 AMD 默认语义 | AMD 默认 `dim=0`，Hygon 默认 `dim=-1`；顶层 TP RS 两边均默认 0 |
+| `CudaCommunicator.reduce_scatter(x, out, dim=d)` | `out = comm.reduce_scatter(x, dim=d)` | Hygon 分配并返回输出；AMD 写预分配 out 并返回 `None`。若必须保持 out 地址，在适配层写 `out.copy_(comm.reduce_scatter(x, dim=d))`，并计入额外分配/拷贝成本 |
+| `initialize_model_parallel(...)` / `ensure_model_parallel_initialized(...)` 的位置参数 | TP、PP、`backend`、`decode_context_model_parallel_size` 等均用关键字传入 | AMD 第三个位置参数为 DCP 大小，Hygon 为 backend |
+| `init_model_parallel_group` / `GroupCoordinator` / `CudaCommunicator` 的新增构造参数 | 不直接传入 AMD 的 `reuse_from` / `is_ep`；`init_model_parallel_group` 也没有 AMD 的 `use_device_communicator` 参数 | 需要在框架适配层安排组复用/EP 语义，不能仅删除参数并假定行为等价 |
+| native `reduce_scatter(_fa, inp, out, m, n, k, split_dim, reg_ptr, reg_bytes)` | 同一组参数使用 `aiter.ops.custom_all_reduce.reduce_scatter_dim` | Hygon 保留的同名 `reduce_scatter` 是五参数首维版本；优先使用 `ca.custom_reduce_scatter` |
+| 内部 `parallel_state.all_reduce_` 或中间类直接 MXFP4 方法 | 使用 `aiter.dist.communication_op` 对应的公共 AR / MXFP4 入口 | 内部 custom-op 参数和类级入口存在差异；两边均提供顶层 MXFP4 接口 |
+| `AITER_CUSTOM_AR_MAX_SIZE`（字节） | 使用 `AITER_AR_MAX_SIZE_MB`（正整数 MiB），同时核对 `max_size` | 环境变量名、单位和容量上限不同；AMD 支持以 0 禁用，Hygon 此变量须为正整数，不支持该禁用方式 |
+
+`init_dist_env(tensor_model_parallel_size=..., rankID=...)` 是共同支持的调用形式。Hygon 还保留 `world_size` 这个 TP 大小别名，并增加 PP/custom-group 参数，具体初始化示例见下文。AMD 的 gfx1250/VMM 专用绑定与 HCU 接口应按各自平台使用；Python 包和 native 模块需使用配套的平台版本。
+
+## 初始化与运行约定
+
+### 复用框架通信组
+
+先确认实际加载的是配套的 Hygon AITER Python/native 模块，并且框架选择了 AITER 通信后端。框架自己的 `sgl_kernel` 或 vLLM `_C_custom_ar` 后端由各自的接入流程管理；本表仅说明 AITER 接口，同名 wrapper 不等于调用 AITER。
+
+vLLM/SGLang 已有进程组时，继续由框架管理其生命周期，用已有 CPU/Gloo 组和当前设备构造 `CustomAllreduce`，不要在模型执行中重复调用 `init_dist_env`。仅有框架自己的 TP 组不代表 AITER 的 `get_tp_group()` 已初始化；已有 AITER 并行组时才直接使用 `communication_op` 的 TP/DP/EP/PP 包装。框架的 fallback、Graph 上下文及输出所有权也需要保留。
+
+### 独立 CAR 对象
+
+以下是独立脚本示例，可通过 `torchrun --standalone --nproc_per_node=2 example.py` 运行。后文 `ca`、`x`、`device` 示例放在它的 `try` 内执行。
 
 ```python
 import os
@@ -59,16 +96,64 @@ finally:
     dist.destroy_process_group()
 ```
 
-- 各 rank 使用不同 GPU，按相同顺序调用 collective，输入形状/dtype 和选项保持一致。直接 CAR 对象使用 CPU/Gloo 组交换元数据。
-- `max_size` 为预分配 staging 容量，默认 1 GiB；普通 AR 的默认载荷门限为 256 MiB，可用 `AITER_AR_MAX_SIZE_MB` 调整，但始终受 `max_size/2` 约束。融合和 RS 仍受 `min(64 MiB, max_size/2)` 约束。
-- 直接 `custom_*` 的部分入口以 `None` 表示不适用；调用方应检查准入或处理回退。**RS 成功也返回 `None`，实际结果写入指定 output**，应在调用前使用 `should_custom_rs` 判断。
-- `AITER_AR_TRANSPORT` 默认 `ipc`，也接受 `auto` / `fabric`。`AITER_ENABLE_SUPERNODE_AR=0` 是编译时 IPC-only 开关；未设置时保留 Fabric 构建。Fabric 需要相应 DTK 头文件与运行时支持。
-- 当前新增接口的结果来自 IPC。Fabric 完整释放重建、跨节点新增功能仍未完成验收，已有 supernode 能力不能作为这些新路径的验证结果。
-- 结束使用前等待通信及输出消费完成，销毁关联 Graph，再由所有参与 rank 有序关闭对象。不要在仍使用 IPC buffer 时释放通信对象。
+### AITER 并行组与初始化
+
+下例是另一份独立脚本，不与上面的 Gloo 初始化重复执行。
+
+```python
+import os
+import torch
+from aiter.ops.communication import init_dist_env, destroy_dist_env
+from aiter.dist.communication_op import tensor_model_parallel_reduce_scatter
+
+# 独立脚本中，在初始化任何其他 process group 之前调用。
+# 使用 torchrun 提供的 env://；此例为纯 TP2。
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)
+init_dist_env(tensor_model_parallel_size=2,
+              rankID=int(os.environ["RANK"]), local_rank=local_rank)
+try:
+    value = torch.ones((4, 256), dtype=torch.bfloat16, device="cuda")
+    shard = tensor_model_parallel_reduce_scatter(value, use_custom=True, dim=-1)
+finally:
+    destroy_dist_env()
+```
+
+`init_dist_env` 的 `world_size` 保留 **TP 大小** 含义，可改用 `tensor_model_parallel_size`；两者同时传入时必须相等。可选 `pipeline_model_parallel_size`、`data_parallel_size/data_parallel_rank`、`prefill_context_model_parallel_size`、`decode_context_parallel_size`、`custom_group_config`。DCP 必须整除 TP；启用 DP 时，`rankID` 是 TP×PP×PCP 内部 rank，DP 坐标单独传递。所有进程使用同一 rendezvous。
+
+下列函数从 `aiter.dist.communication_op` 导入；前缀与后缀组合即完整名称。
+
+| 前缀 | 支持的后缀 |
+|---|---|
+| `tensor_model_parallel_` | `all_reduce`、`all_gather`、`reduce_scatter`、`gather`，以及后文融合入口 |
+| `data_parallel_` / `expert_parallel_` | `all_reduce`、`all_gather`、`reduce_scatter`、`gather`、`broadcast`、`broadcast_tensor_dict` |
+| `pipeline_model_parallel_` | `all_reduce`、`all_gather`、`broadcast`、`broadcast_tensor_dict`、`send`、`recv` |
+| `custom_` | `all_reduce`、`all_gather`、`reduce_scatter`，以 `group="name"` 选择组 |
+
+TP/DP/EP/PP 的 AG 常用签名为 `(input_, use_custom=False, dim=-1)`，RS 为 `(input_, use_custom=True, dim=0)`，AR 为 `(input_, use_new=True, open_fp8_quant=False)`，TP AR 另有 `prefill_support=False`。自定义组 AG/RS 默认均为 `use_custom=True, dim=0`，并接受 `group=None`（或组名）；自定义组 AR 也接受 `group=None`。组级 AG 可通过 rank 维移动/reshape 支持中间维；这与直接 CAR 的首/末维限制不同。`use_custom=True` 请求自定义后端，仍可能按设备或输入条件回退，不能单凭此参数认定执行了某个 kernel。
+
+`gather(input_, dst=0, dim=-1)` 只在目标 rank 返回 Tensor，其余返回 `None`；`broadcast(input_, src=0)` 原位修改并返回 input。src/dst 均为组内 rank。PP 的 `send(input_, dst=None)` / `recv(size, dtype, src=None)` 默认选择组内下一/上一 rank，并按组大小环绕。发送与接收必须由对应进程配对。
+
+自定义组配置示例为 `{"pair": [[0,1],[2,3]]}`，由所有 rank 一致传入初始化；`get_tp_group/get_dp_group/get_ep_group/get_pp_group/get_dcp_group/get_pcp_group/get_custom_group` 位于 `aiter.dist.parallel_state`。分组布局为 ExternalDP×DP×PP×PCP×TP，EP 合并 DP/PCP/TP 维，DCP 在 TP 内分组。
+
+### 容量与后端配置
+
+- 各 rank 使用不同 GPU，按相同顺序调用 collective，输入形状/dtype、选项及回退决策保持一致。直接 CAR 对象使用 CPU/Gloo 组交换元数据。
+- `max_size` 为 staging 容量，默认 1 GiB；普通 AR 门限默认 256 MiB，可通过 `AITER_AR_MAX_SIZE_MB` 调整，但始终受 `max_size/2` 约束。融合和 RS 仍受 `min(64 MiB, max_size/2)` 约束。
+- 普通 CAR 不需要 kernelID。不设置新变量即包含已启用的 TP2 优化；小载荷 LL 需要在创建通信器前、各 rank 统一设置 `AITER_AR_SMALL_MESSAGE=auto`。它仅自动准入 gfx936/gfx938 单机 IPC 的 TP2/4、FP16/BF16、每 rank ≤32 KiB 等已支持组合，其余回退传统路径；TP8 auto 仍为传统路径。完整配置见 [默认分派](custom_allreduce.md#默认分派与配置)。
+- `AITER_AR_TRANSPORT` 默认 `ipc`，也接受 `auto` / `fabric`。`AITER_ENABLE_SUPERNODE_AR=0` 是编译时 IPC-only 开关；未设置时保留 Fabric 构建，需配套 DTK 头文件与运行时。
+
+### Graph 与输出生命周期
+
+CAR 直接调用需在所有 rank 完成 JIT/预热后，嵌套 `with ca.capture():` 和 `with torch.cuda.graph(graph):` 捕获；AITER 组封装使用对应 `GroupCoordinator.graph_capture()`。保持输入地址固定，用 `copy_` 更新内容；保留输出和通信对象直到 Graph 使用结束。退出前等待通信及输出消费完成，销毁关联 Graph，再由各 rank 有序关闭通信对象。
+
+gfx936/gfx938 的高层 IPC communicator 会关闭输入直接注册，即使传入 `enable_register_for_capturing=True` 或框架开启 `AITER_AR_ENABLE_REG_CAPTURE`，CAR 和 Graph 仍正常启用。传统路径使用 capture 内 copy-in；已准入的 LL 从本卡输入发布至通信 scratch。注册请求 True/False 最终使用相同的安全分派，不控制 LL 的启用。应保留高层保护及同步，不通过低层 `registered_input` 绕过限制；Fabric 保持原有注册限制。
+
+普通 AR 与部分 RMS/quant wrapper 在 `ca.capture()` 内但尚未开始实际 Graph capture 的预热阶段返回占位零值，不能当作模型输出消费；Hygon AG/RS 和 QK-RoPE 此时执行真实通信。QK-RoPE 在 communicator disabled 时会抛异常，与 AMD 高层的空输出分支不同，应在框架选路时处理。Iris 不支持 Graph；QR/INT4 的捕获和 collective 关闭要求见 [Quick AllReduce](quick_all_reduce.md)。
 
 ## AllGather / ReduceScatter
 
-以下代码在上例的 `try` 内、`ca` 存活期间运行。
+以下算子示例均在“独立 CAR 对象”示例的 `try` 内运行。AR/AG 不适用时应保留框架回退；**RS 成功也返回 `None`**，必须通过调用前的 `should_custom_rs` 判断是否适用，不能按返回值判断失败。
 
 ```python
 world = dist.get_world_size()
@@ -90,8 +175,6 @@ ca.custom_reduce_scatter(rs_input, rs_output, dim=1)
 | `reduce_scatter(inp, out, dim=0, *, registered=False)` | 同上，输入不适用时抛异常 | 总输入字节数整除 16；dim=0 时每 rank 分片也满足 16 字节对齐 |
 
 所有输入输出必须在对象绑定的设备上、dtype 相同、存储互不重叠；输出连续且形状准确。整数 AG 通过等宽位视图传输，不转换数值。AG/RS 的 capture 外 warmup 会产生真实通信结果。
-
-底层 `aiter.ops.custom_all_reduce.reduce_scatter_dim` 接受展平后的 `(m,n,k,split_dim)`；原 `reduce_scatter(_fa, inp, out, reg_ptr, reg_bytes)` 保留首维语义。通常无需直接构造这些 native 参数。
 
 ## AR + residual + RMSNorm / Gemma
 
@@ -132,7 +215,7 @@ TP 组级入口为 `tensor_model_parallel_fused_allreduce_rmsnorm(input_, residu
 ## AR + RMSNorm + 量化
 
 ```python
-# per-token FP8：新增 Gemma 与未量化 mirror
+# per-token FP8：Gemma 与未量化 mirror
 q, residual_out, scale, mirror = ca.custom_fused_ar_rms_quant(
     x, residual, weight, 1e-6, gemma_norm=True, emit_bf16=True,
 )
@@ -173,7 +256,7 @@ outputs = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
 )
 ```
 
-`quant_type` 的推荐值为 `per_token`、`per_group`、`mxfp4`；也接受 `QuantType.per_Token/per_1x128/per_1x32`。原 `tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group` 保留，新增 `tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant` 便捷入口。
+`quant_type` 的推荐值为 `per_token`、`per_group`、`mxfp4`；也接受 `QuantType.per_Token/per_1x128/per_1x32`。接入时优先使用共同的统一入口；Hygon 另保留 `tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group` 便利接口，两边均有 `tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant`。
 
 三种 native 输出入口分别为 `fused_allreduce_rmsnorm_quant`、`fused_allreduce_rmsnorm_quant_per_group`、`fused_allreduce_rmsnorm_mxfp4_quant`，位于 `aiter.ops.custom_all_reduce`；它们使用 native CAR handle 和预分配输出。普通应用优先使用上面的对象方法或组级封装。
 
@@ -232,51 +315,24 @@ next_residual = launch_fused_allreduce_mhc_post_only(
 
 `fused_allreduce_mhc_post_only` 自动选择路径，`fused_allreduce_mhc_post_one_stage` 为一阶段入口，`fused_allreduce_mhc_post_split` 为 split 入口；三者的 native 参数顺序都是 `(_fa, inp, next_residual, residual_in, post_layer_mix, comb_res_mix, use_new=True, open_fp8_quant=False, reg_ptr=0, reg_bytes=0)`，原位写 next_residual、返回 `None`。`launch_fused_allreduce_mhc_post_only` 分配并返回输出；`launch_fused_allreduce_mhc_post_split` 还接受关键字 `next_residual` 以复用存储。
 
-## 并行组与框架调用
+## 接入验证
 
-```python
-from aiter.ops.communication import init_dist_env, destroy_dist_env
-from aiter.dist.communication_op import tensor_model_parallel_reduce_scatter
-
-# 独立脚本中，在初始化任何其他 process group 之前调用。
-# 各进程先根据 LOCAL_RANK 设置 GPU；使用 torchrun 提供的 env://。
-init_dist_env(world_size=2, rankID=int(os.environ["RANK"]),
-              local_rank=int(os.environ["LOCAL_RANK"]))
-try:
-    value = torch.ones((4, 256), dtype=torch.bfloat16, device="cuda")
-    shard = tensor_model_parallel_reduce_scatter(value, use_custom=True, dim=-1)
-finally:
-    destroy_dist_env()
-```
-
-`init_dist_env` 的 `world_size` 保留 **TP 大小** 含义，可改用 `tensor_model_parallel_size`；两者同时传入时必须相等。可选 `pipeline_model_parallel_size`、`data_parallel_size/data_parallel_rank`、`prefill_context_model_parallel_size`、`decode_context_parallel_size`、`custom_group_config`。DCP 必须整除 TP；启用 DP 时，`rankID` 是 TP×PP×PCP 内部 rank，DP 坐标单独传递。所有进程使用同一 rendezvous。
-
-下列函数从 `aiter.dist.communication_op` 导入；前缀与后缀组合即完整名称。
-
-| 前缀 | 支持的后缀 |
+| 验证项 | 检查内容与现有入口 |
 |---|---|
-| `tensor_model_parallel_` | `all_reduce`、`all_gather`、`reduce_scatter`、`gather`，以及上文融合入口 |
-| `data_parallel_` / `expert_parallel_` | `all_reduce`、`all_gather`、`reduce_scatter`、`gather`、`broadcast`、`broadcast_tensor_dict` |
-| `pipeline_model_parallel_` | `all_reduce`、`all_gather`、`broadcast`、`broadcast_tensor_dict`、`send`、`recv` |
-| `custom_` | `all_reduce`、`all_gather`、`reduce_scatter`，以 `group="name"` 选择组 |
+| 接入与回退 | 核对实际 Python/native 来源、TP/rank 映射和所选后端；确认 unsupported 输入回退正常，并遵循 AR/AG/RS 各自的输出约定 |
+| 数值与 Graph | 用变化输入检查 eager/Graph、多次 replay、立即复用输入、输出 dtype/shape/stride、量化 scale/mirror；普通 CAR 使用 `test_custom_allreduce_api.py` 的 `reuse`、`ar-boundaries`、`ar-precision`，AG/RS 和融合使用 `collectives`、`fusions` |
+| 融合与组管理 | 按需运行 QK-RoPE、MHC、QR、Iris、INT4 专项及 `test_parallel_groups.py`；保留 FP8/INT4 对应精度标准，不套用未量化 CAR 的零误差口径 |
+| 框架模型 | 在实际采用的 TP、Graph、dtype 与通信配置上，对照框架原通信后端检查模型输出；算子通过不等于模型所有组合已覆盖 |
 
-AG 的常用签名为 `(input_, use_custom=False, dim=-1)`，RS 为 `(input_, use_custom=True, dim=0)`，AR 为 `(input_, use_new=True, open_fp8_quant=False)`。组级 AG 可通过 rank 维移动/reshape 支持中间维；这与直接 CAR 的首/末维限制不同。`use_custom=True` 请求自定义后端，仍可能按设备或输入条件回退，不能单凭此参数认定执行了某个 kernel。
+测试命令、依赖及各脚本参数见 [多卡通信测试说明](../../op_tests/multigpu_tests/README.md)。新增 HIP 融合、AG/RS、QR 和 INT4 的已验证范围是 **gfx936/gfx938、单节点 IPC、TP2/4/8**；普通 CAR 保留已有的 6/16/32/40-rank 和 supernode 路径，不能据此推定新增融合也覆盖这些 rank 数。Iris 的边界见其独立文档；Fabric 完整释放重建及跨节点新增功能仍未完成验收。
 
-`gather(input_, dst=0, dim=-1)` 只在目标 rank 返回 Tensor，其余返回 `None`；`broadcast(input_, src=0)` 原位修改并返回 input。src/dst 均为组内 rank。PP 的 `send(input_, dst=None)` / `recv(size, dtype, src=None)` 默认选择组内下一/上一 rank，并按组大小环绕。发送与接收必须由对应进程配对。
+EP 接口是专家并行组的 collective 包装，不包含 Mori/DeepEP 的 token dispatch/combine 或完整 MegaMoEV2 接入；MHC post 算子通过也不代表整个框架 MHC 路径已经完成验证。
 
-自定义组配置示例为 `{"pair": [[0,1],[2,3]]}`，由所有 rank 一致传入初始化；`get_tp_group/get_dp_group/get_ep_group/get_pp_group/get_dcp_group/get_pcp_group/get_custom_group` 位于 `aiter.dist.parallel_state`。分组布局为 ExternalDP×DP×PP×PCP×TP，EP 合并 DP/PCP/TP 维，DCP 在 TP 内分组。
-
-## Graph 与输出生命周期
-
-CAR 直接调用需在所有 rank 完成 JIT/预热后，嵌套 `with ca.capture():` 和 `with torch.cuda.graph(graph):` 捕获。使用 TP/DP 等组封装时使用对应 `GroupCoordinator.graph_capture()`。保持输入地址固定，用 `copy_` 更新内容；保留输出和通信对象直到 Graph 使用结束。
-
-gfx936/gfx938 的高层 IPC communicator 即使收到 `enable_register_for_capturing=True`（或框架开启 `AITER_AR_ENABLE_REG_CAPTURE`），也会关闭直接注册；custom allreduce 和 Graph 仍启用。传统路径使用 capture 内 copy-in，避免读取历史输入；已准入的LL/LL128可读取本卡原输入并发布至通信scratch，无需跨卡直接注册输入。注册请求True/False最终使用相同的安全分派，LL策略由独立的`AITER_AR_SMALL_MESSAGE`配置控制。这两种架构的优化 one-stage kernel 保留结束同步，防止后续拷贝过早覆盖其他 rank 正在读取的 staging 输入。直接使用低层 registered-input 接口不会自动经过 Python 保护，调用方应使用高层 communicator。Fabric 的原有注册限制保持不变。
-
-普通 AR 与部分 RMS/quant wrapper 在 `ca.capture()` 内但尚未开始实际 Graph capture 的预热阶段返回占位零值，不能当作模型输出消费；AG/RS 和 QK-RoPE 的该阶段执行真实通信。Iris 不支持 Graph。QR 和 INT4 的 Graph 约定见 [Quick AllReduce](quick_all_reduce.md)。
+接口实现：[CAR 对象](../../aiter/dist/device_communicators/custom_all_reduce.py)、[native 接口](../../aiter/ops/custom_all_reduce.py)、[组级封装](../../aiter/dist/communication_op.py)、[初始化与组管理](../../aiter/dist/parallel_state.py)。
 
 ## 性能结果
 
-下列性能表保留其标注日期的测量结果。普通CAR的当前用法与2026-10-11双架构组合优化结果，统一见[CustomAllreduce最新性能](custom_allreduce.md#最新性能)。不同接口及测量条件的结果不能直接互换。
+下列性能表保留其标注日期的测量结果。普通CAR的当前用法与2026-10-11双架构组合优化结果，统一见[CustomAllreduce最新性能](custom_allreduce.md#最新性能)。HIP FP / FlyDSL INT4 / RCCL 对比见 [Quick AllReduce 性能](quick_all_reduce.md#性能结果)，Iris 见其独立文档。不同输入、精度与计时口径的结果不合并计算加速比；以下算子测量不代表模型吞吐或跨节点性能。
 
 ### AR + RMSNorm，BF16 TP2
 
@@ -292,14 +348,6 @@ gfx936/gfx938 的高层 IPC communicator 即使收到 `enable_register_for_captu
 | gfx938 | `[128,8192]` | 42.612 | 42.805 | 42.931 | 0.21% |
 
 上表报告指定 Graph 提交粒度和逐样本对齐条件下的结果。通信 kernel 时间包含等待其他 rank 的时间，主机提交间隙会产生长尾；不能将这些长尾全部归为 BF16 运算成本，也不能将上表推广为请求级 P95。
-
-### 其他接口
-
-- HIP FP / FlyDSL INT4 / RCCL 对比见 [Quick AllReduce 性能](quick_all_reduce.md#性能结果)。
-- AG/RS、融合接口与并行组的代表性专项结果见下文；Iris见独立文档。不同输入、精度和计时口径的结果不合并计算加速比。
-- 完整模型精度/吞吐、长时间运行与 Fabric/跨节点新路径不在上述性能结论范围内。新增可选后端不会自动替换框架的原有通信选择。
-
-接口实现：[CAR 对象](../../aiter/dist/device_communicators/custom_all_reduce.py)、[native 接口](../../aiter/ops/custom_all_reduce.py)、[组级封装](../../aiter/dist/communication_op.py)。
 
 ### AG/RS 与融合接口专项性能
 
