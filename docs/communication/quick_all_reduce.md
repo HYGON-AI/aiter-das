@@ -135,7 +135,7 @@ INT4 使用两阶段量化，部分内部运算为 FP16，不能保留 BF16 全�
 
 ## 性能结果
 
-日期2026-10-08，gfx936/bmz25 与 gfx938/nmz-2，使用上述 FlyDSL 版本，接口实现版本 `c0fb54e6`。固定 IPC，FP 对照使用 native HIP QR 的 `quant_level=0, cast_bf2half=False`，不应用高层最小载荷门限；RCCL 使用 BF16 并包含 input→output copy，使输出语义一致。INT4 与 FP 对照的精度不同，不能把时间比当作无损替换收益。
+日期2026-10-08，gfx936（80 CU）与 gfx938（72 CU），使用上述 FlyDSL 版本，接口实现版本 `c0fb54e6`。固定 IPC，FP 对照使用 native HIP QR 的 `quant_level=0, cast_bf2half=False`，不应用高层最小载荷门限；RCCL 使用 BF16 并包含 input→output copy，使输出语义一致。INT4 与 FP 对照的精度不同，不能把时间比当作无损替换收益。
 
 每次 Graph 包含16次同一操作，每组20个 GPU event 样本，各样本取所有 rank 中最慢的每次均值。编译、预热和输入构造不计入；输入为 `seed=300+rank` 的 `randn*0.1` 转 BF16。下表为 **每 rank 输入64 MiB**，默认网格，单位 μs。
 
@@ -158,7 +158,7 @@ INT4 使用两阶段量化，部分内部运算为 FP16，不能保留 BF16 全�
 
 ## HIP 多编码模式与 QR+RMSNorm 专项性能
 
-日期2026-10-09，gfx936/bmz25（80 CU）与gfx938/nmz-2（72 CU），均使用物理卡6/7、TP2、PyTorch 2.11.0、HIP 6.3.26113、IPC。每组30个样本全部保留，每个样本取两rank较慢值；†表示CV>10%，不据其中位数承诺稳定收益。HIP测量覆盖FP16/BF16，Iris及组封装覆盖BF16；下表展示代表性结果。这些是代表性输入的接口成本，不是完整模型吞吐；TP4/8性能不由TP2外推。
+日期2026-10-09，gfx936（BW200 / UBB BW1000，80 CU）与gfx938（BW1100，72 CU），均使用2张GPU、TP2、PyTorch 2.11.0、HIP 6.3.26113、IPC。每组30个样本全部保留，每个样本取两rank较慢值；†表示CV>10%，不据其中位数承诺稳定收益。HIP测量覆盖FP16/BF16，Iris及组封装覆盖BF16；下表展示代表性结果。这些是代表性输入的接口成本，不是完整模型吞吐；TP4/8性能不由TP2外推。
 
 下表为BF16，关闭BF16→FP16转换，直接native接口，不应用高层最小载荷门限。每个Graph16次操作，报告GPU event每次耗时。输入为`((arange % 37 - 18)/32 + rank/32)`转BF16，RMS residual=0.125、weight=1、eps=1e-6；所有量化模式在计时前后通过预设误差检查。
 

@@ -619,7 +619,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
 #endif
 }
 
-template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
+template <typename T, int ngpus, bool is_broadcast_reg_outptr = false, bool has_tail = false>
 __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _input_dp,
                                                                      RankData* _output_dp,
                                                                      RankSignals sg,
@@ -655,8 +655,13 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
     }
     auto tmp_out = tmps[0];
     start_sync<ngpus>(sg, self_sg, rank);
-    // stage 1: reduce scatter
-    for(int idx = start + tid; idx < end; idx += stride)
+    // Only full tiles may enter the block-barrier loop. The optimized
+    // dispatch has equal rank partitions; tail packs retain their owner TID.
+    int loop_end = end;
+    if constexpr(has_tail)
+        loop_end -= (end - start) % tnum_gpu;
+    int idx = start + tid;
+    for(; idx < loop_end; idx += stride)
     {
         *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ptrs[warp_id][idx];
         __syncthreads();
@@ -689,6 +694,11 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
             tmp_out[idx - start] = write_reg;
         }
         __syncthreads();
+    }
+    if constexpr(has_tail)
+    {
+        if(warp_id == 0 && idx < end)
+            tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
     }
     end_sync<ngpus>(sg, self_sg, rank);
 
@@ -3576,6 +3586,8 @@ __global__ void __launch_bounds__(1024, 1) allreduce_mhc_post_large_m_kernel(
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+#include "custom_all_reduce_ll.cuh"
+
 using IPC_KEY = std::array<uint8_t, sizeof(hipIpcMemHandle_t)>;
 static_assert(sizeof(IPC_KEY) == sizeof(hipIpcMemHandle_t));
 static_assert(alignof(IPC_KEY) == alignof(hipIpcMemHandle_t));
@@ -3616,14 +3628,56 @@ class CustomAllreduce
     size_t buffer_size_;
 #endif
 
+    // Optional HCU small-message state. Shared Signal/RankData layouts stay
+    // unchanged; the dedicated scratch follows the traditional temporary area.
+    size_t ll_scratch_offset_ = 0;
+    uint64_t* ll_epochs_ = nullptr;
+    int ll_mode_ = 0;
+#ifndef USE_ROCM
+    static constexpr int default_ar_block_limit = 20;
+#else
+    static constexpr int default_ar_block_limit = 16;
+#endif
+
+    void configure_small_ar(size_t max_size, size_t meta_bytes, int mode)
+    {
+        if(mode < 0 || mode > 3 || ll_epochs_)
+            throw std::invalid_argument("invalid or repeated small-message configuration");
+        if(mode == 0) return;
+        hipDeviceProp_t prop;
+        int device;
+        HIP_CALL(hipGetDevice(&device));
+        HIP_CALL(hipGetDeviceProperties(&prop, device));
+        const std::string arch(prop.gcnArchName);
+        if(transport_ != ARTransport::IPC ||
+           (world_size_ != 2 && world_size_ != 4 && world_size_ != 8) ||
+           (arch.find("gfx936") != 0 && arch.find("gfx938") != 0))
+            return;
+        const size_t needed = hcu_ll_scratch_bytes(world_size_);
+        if(max_size < needed) return;
+        if(max_size > (std::numeric_limits<size_t>::max() - sizeof(Signal) - 127) / 2)
+            throw std::invalid_argument("small-message capacity overflow");
+        const size_t offset = (sizeof(Signal) + 2 * max_size + 127) & ~size_t(127);
+        if(meta_bytes < offset || meta_bytes - offset < needed)
+            throw std::invalid_argument("small-message scratch exceeds meta allocation");
+        // This state survives consecutive graph kernels. Keep its visibility
+        // independent of an intervening staging memcpy, like the peer flags.
+        HIP_CALL(hipExtMallocWithFlags(reinterpret_cast<void**>(&ll_epochs_),
+                                      2*kHcuLLBlocks*sizeof(uint64_t),
+                                      hipDeviceMallocUncached));
+        HIP_CALL(hipMemset(ll_epochs_, 0, 2*kHcuLLBlocks*sizeof(uint64_t)));
+        ll_scratch_offset_ = offset;
+        ll_mode_ = mode;
+    }
+
     /**
      * meta is a pointer to device metadata and temporary buffer for allreduce.
      *
      * There's a total of sizeof(Signal) of prefix before the actual data,
      * so meta + 1 points to actual temporary buffer.
      *
-     * note: this class does not own any device memory. Any required buffers
-     * are passed in from the constructor
+     * The caller owns meta and rank_data. The optional small-message path
+     * owns only its rank-local epoch allocation; scratch remains inside meta.
      */
     CustomAllreduce(Signal* meta,
                     void* rank_data,
@@ -4032,6 +4086,44 @@ class CustomAllreduce
      * Not quite sure the underlying reason, but my guess is that too many SMs
      * will cause contention on NVLink bus.
      */
+    // This path reads input only on its owning device. Peers consume the
+    // payload/epoch scratch, never the input allocation itself.
+    template <typename T>
+    bool try_small_allreduce(hipStream_t stream, T* input, T* output, int size,
+                             bool use_new, bool is_broadcast_reg_outptr,
+                             bool allow_small_ar = true)
+    {
+        if constexpr(sizeof(T) == 2)
+        {
+            if(use_new && allow_small_ar && !is_broadcast_reg_outptr && ll_mode_ && size > 0)
+            {
+                const size_t bytes = size * sizeof(T);
+                // Measured HCU IPC policy: one-packet LL is useful on TP2/4.
+                // Larger payloads and TP8 use the traditional path. Explicit
+                // ll/ll128 retain their protocol limits for controlled tuning.
+                const bool automatic = ll_mode_ == 3;
+                const size_t ll_limit = automatic ? 32*1024 : 64*1024;
+                const bool ll = ll_mode_ != 2 && bytes <= ll_limit &&
+                                (!automatic || world_size_ <= 4);
+                const bool ll128 = !automatic && !ll && ll_mode_ != 1 &&
+                    ((world_size_ == 2 && bytes <= 896*1024) || (world_size_ == 4 && bytes <= 64*1024));
+                if(ll || ll128)
+                {
+#define HCU_LL_CASE(N) \
+                    case N: \
+                        if(ll) ar_ll_hcu<T,N><<<kHcuLLBlocks,256,0,stream>>>(sg_,ll_scratch_offset_,ll_epochs_,input,output,rank_,size); \
+                        else if(bytes <= 256*1024) ar_ll128_hcu<T,N,256><<<kHcuLLBlocks,256,0,stream>>>(sg_,ll_scratch_offset_,hcu_ll128_slot(N),ll_epochs_+kHcuLLBlocks,input,output,rank_,size); \
+                        else ar_ll128_hcu<T,N,512><<<kHcuLLBlocks,512,0,stream>>>(sg_,ll_scratch_offset_,hcu_ll128_slot(N),ll_epochs_+kHcuLLBlocks,input,output,rank_,size); \
+                        break;
+                    switch(world_size_) { HCU_LL_CASE(2) HCU_LL_CASE(4) HCU_LL_CASE(8) }
+#undef HCU_LL_CASE
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     template <typename T>
     void allreduce(hipStream_t stream,
                    T* input,
@@ -4039,14 +4131,10 @@ class CustomAllreduce
                    int size,
                    bool use_new                 = true,
                    bool is_broadcast_reg_outptr = false,
-#ifndef USE_ROCM
                    int threads     = 512,
-                   int block_limit = 20){
-#else
-                   int threads     = 512,
-                   int block_limit = 16)
+                   int block_limit = default_ar_block_limit,
+                   bool allow_small_ar = true)
     {
-#endif
         auto d = 16 / sizeof(T);
     if(size % d != 0)
         throw std::runtime_error("custom allreduce currently requires input length to be multiple "
@@ -4055,6 +4143,10 @@ class CustomAllreduce
     if(block_limit > kMaxBlocks)
         throw std::runtime_error("max supported block limit is " + std::to_string(kMaxBlocks) +
                                  ". Got " + std::to_string(block_limit));
+
+    if(try_small_allreduce(stream, input, output, size, use_new,
+                          is_broadcast_reg_outptr, allow_small_ar))
+        return;
 
     RankData* input_ptrs  = get_buffer_RD(stream, input);
     RankData* output_ptrs = nullptr;
@@ -4132,7 +4224,7 @@ class CustomAllreduce
 // Only DTK 26.10+ headers/runtime expose the extended system-scope acquire.
 // Older DTK builds must not reference the flag and retain the standard launch.
 #if AITER_DTK_2610_EXT_SYSTEM_SCOPE_LAUNCH
-#define KL(ngpus, name)                                                            \
+#define KL(ngpus, name, ...)                                                            \
     do                                                                             \
     {                                                                              \
         if(is_gfx92a)                                                              \
@@ -4141,61 +4233,73 @@ class CustomAllreduce
                              &output, &rank_, &size};                              \
             if(is_broadcast_reg_outptr)                                            \
                 HIP_CALL(hipExtLaunchKernel(                                       \
-                    reinterpret_cast<void*>(name<T, ngpus, true>),                 \
+                    reinterpret_cast<void*>(name<T, ngpus, true __VA_OPT__(,) __VA_ARGS__>),                 \
                     dim3(blocks), dim3(threads), _args, 0, stream, nullptr,         \
                     nullptr, hipExtAddAcquireSystemScope));                        \
             else                                                                   \
                 HIP_CALL(hipExtLaunchKernel(                                       \
-                    reinterpret_cast<void*>(name<T, ngpus, false>),                \
+                    reinterpret_cast<void*>(name<T, ngpus, false __VA_OPT__(,) __VA_ARGS__>),                \
                     dim3(blocks), dim3(threads), _args, 0, stream, nullptr,         \
                     nullptr, hipExtAddAcquireSystemScope));                        \
         }                                                                          \
         else                                                                       \
         {                                                                          \
             if(is_broadcast_reg_outptr)                                            \
-                name<T, ngpus, true><<<blocks, threads, 0, stream>>>(              \
+                name<T, ngpus, true __VA_OPT__(,) __VA_ARGS__><<<blocks, threads, 0, stream>>>(              \
                     input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size);  \
             else                                                                   \
-                name<T, ngpus, false><<<blocks, threads, 0, stream>>>(             \
+                name<T, ngpus, false __VA_OPT__(,) __VA_ARGS__><<<blocks, threads, 0, stream>>>(             \
                     input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size);  \
         }                                                                          \
     } while(0)
 #else
-#define KL(ngpus, name)                                                            \
+#define KL(ngpus, name, ...)                                                            \
     do                                                                             \
     {                                                                              \
         if(is_broadcast_reg_outptr)                                                \
-            name<T, ngpus, true><<<blocks, threads, 0, stream>>>(                  \
+            name<T, ngpus, true __VA_OPT__(,) __VA_ARGS__><<<blocks, threads, 0, stream>>>(                  \
                 input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size);      \
         else                                                                       \
-            name<T, ngpus, false><<<blocks, threads, 0, stream>>>(                 \
+            name<T, ngpus, false __VA_OPT__(,) __VA_ARGS__><<<blocks, threads, 0, stream>>>(                 \
                 input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size);      \
     } while(0)
 #endif
 #else
 // Non-DTK ROCm: use hipExtLaunchKernel with hipExtAddAcquireSystemScope
 // for cross-device memory visibility.
-#define KL(ngpus, name)                                                            \
+#define KL(ngpus, name, ...)                                                            \
     do                                                                             \
     {                                                                              \
         void* _args[] = {&input_ptrs, &output_ptrs, &sg_, &self_sg_,              \
                          &output, &rank_, &size};                                  \
         if(is_broadcast_reg_outptr)                                                \
         {                                                                          \
-            hipExtLaunchKernel(reinterpret_cast<void*>(name<T, ngpus, true>),      \
+            hipExtLaunchKernel(reinterpret_cast<void*>(name<T, ngpus, true __VA_OPT__(,) __VA_ARGS__>),      \
                                dim3(blocks), dim3(threads), _args,                 \
                                0, stream, nullptr, nullptr,                        \
                                hipExtAddAcquireSystemScope);                       \
         }                                                                          \
         else                                                                       \
         {                                                                          \
-            hipExtLaunchKernel(reinterpret_cast<void*>(name<T, ngpus, false>),     \
+            hipExtLaunchKernel(reinterpret_cast<void*>(name<T, ngpus, false __VA_OPT__(,) __VA_ARGS__>),     \
                                dim3(blocks), dim3(threads), _args,                 \
                                0, stream, nullptr, nullptr,                        \
                                hipExtAddAcquireSystemScope);                       \
         }                                                                          \
     } while(0)
 #endif
+
+        // HCU IPC TP2 uses the existing ordered FP32 register reduction.
+        // Retain staging, the computed grid, RNE and the version-specific
+        // launch macro (including its system-scope visibility policy).
+        if(world_size_ == 2 && transport_ == ARTransport::IPC &&
+           !is_broadcast_reg_outptr &&
+           (arch.find("gfx936") != std::string::npos || arch.find("gfx938") != std::string::npos))
+        {
+            threads = 256;
+            KL(2, cross_device_reduce_1stage_naive);
+            return;
+        }
 
 #define DISPATCH_REDUCE(ngpus, name)                          \
     do                                                        \
@@ -4207,6 +4311,10 @@ class CustomAllreduce
                 if(use_write_mode)                            \
                 {                                             \
                     KL(ngpus, name##_write_mode);             \
+                }                                             \
+                else if(size % THREAD_NUM != 0)               \
+                {                                             \
+                    KL(ngpus, name, true);                    \
                 }                                             \
                 else                                          \
                 {                                             \
@@ -5274,6 +5382,7 @@ void dispatchAllReduceMhcPostSplit(hipStream_t stream,
 
 ~CustomAllreduce()
 {
+    if(ll_epochs_) HIP_CALL(hipFree(ll_epochs_));
 #ifdef DTK_ENV
     if(buffer_ptr_)
         hipHostFree(buffer_ptr_);

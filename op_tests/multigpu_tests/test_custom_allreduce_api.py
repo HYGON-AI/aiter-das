@@ -6,6 +6,7 @@ import argparse
 from datetime import timedelta
 import json
 import os
+import time
 from unittest.mock import patch
 
 import torch
@@ -500,9 +501,288 @@ def run_reuse(args):
         dist.destroy_process_group()
 
 
+def run_ar_boundaries(args):
+    """Mixed sizes, two live graphs, allocator reuse and rank submission skew."""
+    local = int(os.environ['LOCAL_RANK'])
+    torch.cuda.set_device(local)
+    os.environ['AITER_AR_TRANSPORT'] = 'ipc'
+    dist.init_process_group('gloo', timeout=timedelta(seconds=180))
+    rank, world = dist.get_rank(), dist.get_world_size()
+    ca = None
+    try:
+        ca = CustomAllreduce(dist.group.WORLD, local, max_size=64 << 20,
+                             enable_register_for_capturing=True)
+        assert not ca.disabled and ca.transport == 'ipc'
+        requested = os.environ.get('AITER_AR_SMALL_MESSAGE', 'off')
+        if requested != 'off':
+            assert ca.small_ar_mode == requested, (ca.small_ar_mode, requested)
+        empty = torch.empty(0, device='cuda', dtype=torch.float16)
+        assert not ca.should_custom_ar(empty)
+        expect_value_error(lambda: ca.all_reduce(empty))
+        expect_value_error(lambda: ops.all_reduce(ca._ptr, empty, empty, True, False, 0, 0))
+        invalid = torch.empty(9, device='cuda', dtype=torch.float16)
+        expect_value_error(lambda: ca.all_reduce(invalid))
+        expect_value_error(lambda: ca.all_reduce(invalid[:8], out=invalid))
+        # Fixed rank order matters when an FP32 accumulation loses a small
+        # addend before a large cancellation. Check every rank bit-for-bit.
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            large, small = (2.**15, 2.**-9) if dtype == torch.float16 else (2.**80, 1.)
+            for nbytes in (4096, 61440):
+                inp = torch.empty(nbytes // torch.empty((), dtype=dtype).element_size(),
+                                  device='cuda', dtype=dtype)
+                def fill_ordered(scale):
+                    values = [large, small, -large, small]
+                    inp.fill_(values[rank % 4] * scale)
+                    expected = torch.full_like(inp, values[0] * scale, dtype=torch.float32)
+                    for r in range(1, world):
+                        expected.add_(values[r % 4] * scale)
+                    return expected.to(dtype)
+                expected = fill_ordered(1.)
+                torch.testing.assert_close(ca.custom_all_reduce(inp), expected, rtol=0, atol=0)
+                graph = torch.cuda.CUDAGraph()
+                with ca.capture(), torch.cuda.graph(graph):
+                    out = ca.custom_all_reduce(inp)
+                for repeat in range(8):
+                    expected = fill_ordered(1. if repeat % 2 else -1.)
+                    graph.replay()
+                    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+                del graph, out, inp
+        print('AR_ORDERED_SUM_PASS', rank, world, requested, flush=True)
+        # Local-input LL must keep the staging fallback for sliced or aliased
+        # buffers. Refresh the same allocation before every graph replay.
+        for dtype in (torch.float16, torch.bfloat16):
+            for nbytes in (4096, 65536):
+                n = nbytes // 2
+                for layout in ('aligned', 'unaligned_input', 'same_output', 'overlap_output'):
+                    storage = torch.empty(n + 8, device='cuda', dtype=dtype)
+                    inp = storage[1:n+1] if layout == 'unaligned_input' else storage[:n]
+                    out = (inp if layout == 'same_output' else storage[8:n+8]
+                           if layout == 'overlap_output' else torch.empty_like(inp))
+                    inp.fill_(rank / 8.)
+                    ca.all_reduce(inp, out=out)
+                    torch.testing.assert_close(out, torch.full_like(out, world*(world-1)/16),
+                                               rtol=0, atol=0)
+                    graph = torch.cuda.CUDAGraph()
+                    with ca.capture(), torch.cuda.graph(graph):
+                        ca.all_reduce(inp, out=out)
+                    for repeat in range(8):
+                        inp.fill_(rank / 8. + repeat / 8.)
+                        graph.replay()
+                        torch.testing.assert_close(out, torch.full_like(out,
+                            world*(world-1)/16 + world*repeat/8), rtol=0, atol=0)
+                    del graph, inp, out, storage
+        print('AR_LOCAL_INPUT_LAYOUT_PASS', rank, world, requested, flush=True)
+        sizes = (16, 4096, 32752, 32768, 32784, 57328, 57344, 57360, 65520, 65536, 65552,
+                 262128, 262144, 262160, 917488, 917504, 917520, (2 << 20)+64, (2 << 20)+128)
+        failures = 0
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            elem = torch.empty((), dtype=dtype).element_size()
+            nmax = max(sizes)//elem
+            for cycle in range(2):
+                inp = torch.empty(nmax, device='cuda', dtype=dtype)
+                base = (torch.arange(nmax, device='cuda') % 8).to(dtype)/8
+                seed = base + rank
+                graphs, outputs, orders = [], [], [sizes, tuple(reversed(sizes))]
+
+                def chain(order):
+                    inp.copy_(seed)
+                    result = []
+                    for nbytes in order:
+                        out = ca.custom_all_reduce(inp[:nbytes//elem])
+                        assert out is not None
+                        result.append(out)
+                        inp.add_(.125)
+                    return result
+
+                chain(sizes)
+                torch.cuda.synchronize()
+                dist.barrier()
+                for order in orders:
+                    graph = torch.cuda.CUDAGraph()
+                    with ca.capture(), torch.cuda.graph(graph):
+                        result = chain(order)
+                    graphs.append(graph)
+                    outputs.append(result)
+                for replay in range(args.repeats):
+                    which, shift = replay % 2, replay % 4
+                    seed.copy_(base + rank + shift)
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    if rank == replay % world:
+                        time.sleep(.002)
+                    graphs[which].replay()
+                    torch.cuda.synchronize()
+                    for step, (nbytes, out) in enumerate(zip(orders[which], outputs[which])):
+                        expected = ((base[:nbytes//elem].float()+shift+step*.125)*world
+                                    + world*(world-1)/2).to(dtype)
+                        count = int(torch.count_nonzero(out != expected))
+                        if count:
+                            failures += 1
+                            print('AR_BOUNDARY_FAIL', json.dumps(dict(rank=rank,dtype=str(dtype),
+                                  cycle=cycle,replay=replay,nbytes=nbytes,mismatches=count,
+                                  max_error=float((out.float()-expected.float()).abs().max()))),flush=True)
+                print('AR_BOUNDARY_RESULT', json.dumps(dict(rank=rank,world=world,dtype=str(dtype),
+                      cycle=cycle,graphs=2,replays=args.repeats,cases_per_graph=len(sizes),
+                      input_ptr=inp.data_ptr(),failures=failures)),flush=True)
+                del graphs, outputs, graph, result, inp, seed, base
+                torch.cuda.synchronize()
+                dist.barrier()
+        counts = [None]*world
+        dist.all_gather_object(counts, failures)
+        assert not any(counts), f'AR mixed graph failures: {counts}'
+        if requested != 'off':
+            ca.close()
+            ca = CustomAllreduce(dist.group.WORLD, local, max_size=64 << 10,
+                                 enable_register_for_capturing=True)
+            assert not ca.disabled and ca.small_ar_mode == 'off'
+            tiny = torch.full((8,), rank+1, device='cuda', dtype=torch.float16)
+            result = ca.custom_all_reduce(tiny)
+            torch.testing.assert_close(result, torch.full_like(tiny,world*(world+1)/2),rtol=0,atol=0)
+            # Public admission keeps the historical half-capacity bound;
+            # explicit all_reduce may fill the entire staging allocation.
+            edge = torch.full((ca.max_size // 4,), rank+1, device='cuda', dtype=torch.float16)
+            assert ca.should_custom_ar(edge)
+            torch.testing.assert_close(ca.custom_all_reduce(edge),
+                                       torch.full_like(edge,world*(world+1)/2),rtol=0,atol=0)
+            full = torch.full((ca.max_size // 2,), rank+1, device='cuda', dtype=torch.float16)
+            assert ca.custom_all_reduce(full) is None
+            torch.testing.assert_close(ca.all_reduce(full),
+                                       torch.full_like(full,world*(world+1)/2),rtol=0,atol=0)
+            oversized = torch.empty(ca.max_size // 2 + 8, device='cuda', dtype=torch.float16)
+            try:
+                ca.all_reduce(oversized)
+            except RuntimeError as exc:
+                assert 'registered buffer is too small' in str(exc)
+            else:
+                raise AssertionError('staging capacity overflow was accepted')
+            print('AR_INPUT_CAPACITY_BOUNDARY_PASS',rank,flush=True)
+            expect_value_error(lambda: ops.configure_small_ar(ca._ptr, 64 << 20,
+                               ca._pool['meta'].max_size, 3))
+            print('AR_SMALL_CAPACITY_FALLBACK_PASS',rank,flush=True)
+            ca.close()
+            ca = None
+            # Simulate one unsupported participant in the capability exchange;
+            # all ranks must fall back before allocating or launching LL.
+            gather = dist.all_gather_object
+            def one_unsupported(outputs, value, *args, **kwargs):
+                if isinstance(value, tuple) and len(value) == 3 and value[0] == requested:
+                    value = (value[0], value[1], value[2] and rank != 0)
+                return gather(outputs, value, *args, **kwargs)
+            with patch.object(dist, 'all_gather_object', side_effect=one_unsupported):
+                ca = CustomAllreduce(dist.group.WORLD, local, max_size=64 << 20)
+            assert not ca.disabled and ca.small_ar_mode == 'off'
+            torch.testing.assert_close(ca.custom_all_reduce(tiny),
+                                       torch.full_like(tiny,world*(world+1)/2),rtol=0,atol=0)
+            print('AR_SIMULATED_CAPABILITY_FALLBACK_PASS',rank,flush=True)
+            ca.close()
+            ca = None
+            with patch.dict(os.environ, {'AITER_AR_SMALL_MESSAGE': 'll' if rank == 0 else 'll128'}):
+                expect_value_error(lambda: CustomAllreduce(dist.group.WORLD, local, max_size=64 << 20))
+            print('AR_CONFIG_MISMATCH_REJECT_PASS',rank,flush=True)
+    finally:
+        if ca is not None:
+            ca.close()
+        dist.destroy_process_group()
+
+
+def run_ar_precision(args):
+    """Exact ordered sums, rounding ties and guarded partial partitions."""
+    import hashlib
+    local = int(os.environ['LOCAL_RANK'])
+    torch.cuda.set_device(local)
+    dist.init_process_group('gloo', timeout=timedelta(seconds=180))
+    rank, world = dist.get_rank(), dist.get_world_size()
+    ca = None
+    try:
+        ca = CustomAllreduce(dist.group.WORLD, local, max_size=80 << 20,
+                             enable_register_for_capturing=True)
+        assert not ca.disabled and ca.transport == 'ipc'
+        assert os.environ.get('AITER_AR_SMALL_MESSAGE', 'off') in ('off', 'auto')
+        sizes = (16, 4096, 32752, 32768, 32784, 65536, 81920, 163840, 196608,
+                 (1 << 20)-16, 1 << 20, (1 << 20)+16,
+                 2 << 20, (2 << 20)+16, (2 << 20)+32, (2 << 20)+48,
+                 (2 << 20)+64, (2 << 20)+128, 8 << 20, 32 << 20)
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            elem = torch.empty((), dtype=dtype).element_size()
+            ulp = {torch.float16: 2.**-10, torch.bfloat16: 2.**-7,
+                   torch.float32: 2.**-23}[dtype]
+            large = 2.**15 if dtype == torch.float16 else 2.**80
+            cancel = (large, 1., -large, 1.)
+            values = []
+            for r in range(world):
+                values.append(torch.tensor([
+                    1. if r == 0 else ulp/2 if r == 1 else 0.,
+                    1.+ulp if r == 0 else ulp/2 if r == 1 else 0.,
+                    -1. if r == 0 else -ulp/2 if r == 1 else 0.,
+                    -1.-ulp if r == 0 else -ulp/2 if r == 1 else 0.,
+                    cancel[r % 4], -cancel[r % 4],
+                    torch.finfo(dtype).tiny / 2, (r+1)/8.,
+                    -0., 0., -(r+1)/8., torch.finfo(dtype).max,
+                    ulp/2, -ulp/2, torch.finfo(dtype).tiny,
+                    float('inf') if r == 0 else float('-inf') if r == 1 else 0.,
+                ], dtype=dtype))
+            own = values[rank].cuda()
+            for nbytes in sizes:
+                n = nbytes // elem
+                pattern = torch.arange(n, device='cuda') % 16
+                inp = own[pattern]
+                storage = torch.full((n + 32,), 17., device='cuda', dtype=dtype)
+                out = storage[16:n+16]
+                two_stage = world > 2 and nbytes >= (160 << 10 if world <= 4 else 80 << 10)
+                pack = 16 // elem
+                part = (nbytes // 16) // world
+
+                def flush_fp32(value):
+                    # AITER JIT already builds HIP with
+                    # -fgpu-flush-denormals-to-zero. Model that existing FP32
+                    # arithmetic mode explicitly; do not use a tolerance.
+                    return torch.where(value.abs() < torch.finfo(torch.float32).tiny,
+                                       torch.copysign(torch.zeros_like(value), value), value)
+
+                def expected(sign):
+                    result = torch.empty_like(inp)
+                    for owner in range(world if two_stage else 1):
+                        order = [(owner+r) % world for r in range(world)] if two_stage else list(range(world))
+                        ref = flush_fp32(values[order[0]].float() * sign)
+                        for r in order[1:]:
+                            ref = flush_fp32(ref + flush_fp32(values[r].float() * sign))
+                        begin = owner * part * pack if two_stage else 0
+                        end = ((owner+1)*part*pack if owner < world-1 else n) if two_stage else n
+                        result[begin:end] = ref.to(dtype).cuda()[pattern[begin:end]]
+                    return result
+
+                digest = hashlib.sha256()
+                graph = torch.cuda.CUDAGraph()
+                ca.all_reduce(inp, out=out)
+                torch.testing.assert_close(out, expected(1.), rtol=0, atol=0, equal_nan=True)
+                assert torch.all(storage[:16] == 17.) and torch.all(storage[n+16:] == 17.)
+                with ca.capture(), torch.cuda.graph(graph):
+                    ca.all_reduce(inp, out=out)
+                for replay in range(8):
+                    sign = 1. if replay % 2 else -1.
+                    inp.copy_(own[pattern] * sign)
+                    graph.replay()
+                    torch.testing.assert_close(out, expected(sign), rtol=0, atol=0, equal_nan=True)
+                    assert torch.all(storage[:16] == 17.) and torch.all(storage[n+16:] == 17.)
+                    # Normalize NaN payloads for a stable cross-build digest.
+                    bits = torch.where(torch.isnan(out), torch.zeros_like(out), out).view(torch.uint8).cpu()
+                    digest.update(bits.numpy().tobytes())
+                    digest.update(torch.isnan(out).to(torch.uint8).cpu().numpy().tobytes())
+                print('AR_PRECISION_RESULT', json.dumps(dict(rank=rank, world=world,
+                      dtype=str(dtype), nbytes=nbytes, replays=8, exact=True,
+                      guarded=True, reference='ordered_fp32_ftz_rne', sha256=digest.hexdigest())), flush=True)
+                del graph, inp, out, storage, pattern
+                torch.cuda.synchronize()
+                dist.barrier()
+    finally:
+        if ca is not None:
+            ca.close()
+        dist.destroy_process_group()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--suite', required=True, choices=['collectives', 'fusions', 'transport', 'reuse'])
+    parser.add_argument('--suite', required=True, choices=['collectives', 'fusions', 'transport', 'reuse', 'ar-boundaries', 'ar-precision'])
     parser.add_argument('--repeats', type=int, default=100)
     parser.add_argument('--close-repeats', type=int, default=20)
     parser.add_argument('--transport', choices=['ipc', 'fabric'], default='ipc')
@@ -521,6 +801,10 @@ def main():
         run_fusions(args)
     elif args.suite == 'reuse':
         run_reuse(args)
+    elif args.suite == 'ar-precision':
+        run_ar_precision(args)
+    elif args.suite == 'ar-boundaries':
+        run_ar_boundaries(args)
     else:
         run_transport(args)
 

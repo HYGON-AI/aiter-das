@@ -35,13 +35,31 @@ def close(actual, expected, tol=.03):
 class Bench:
     def __init__(self, args):
         self.args, self.rows = args, []
+        self.control_failures = []
         self.rank, self.world = dist.get_rank(), dist.get_world_size()
         self.path = Path(args.output)
         self.path.mkdir(parents=True, exist_ok=True)
 
     def measure(self, name, shape, dtype, call, check, *, capture=None, eager=False,
                 refresh=None, **meta):
-        check(call())
+        gpu, wall = [], []
+        def checked(output):
+            failure = None
+            try:
+                check(output)
+            except AssertionError as exc:
+                failure = str(exc)
+            failures = [None] * self.world
+            dist.all_gather_object(failures, failure)
+            if any(f is not None for f in failures):
+                record = dict(name=name, shape=list(shape), dtype=str(dtype),
+                              failures=failures, correctness='fail',
+                              local_gpu_us=gpu, local_wall_us=wall, **meta)
+                path = self.path/f'failure_{name}_{str(dtype).split(".")[-1]}_{math.prod(shape)}_rank{self.rank}.json'
+                path.write_text(json.dumps(record, indent=2))
+                raise AssertionError(f'{name}: per-rank accuracy failures: {failures}')
+
+        checked(call())
         for _ in range(3):
             call()
         torch.cuda.synchronize()
@@ -55,7 +73,7 @@ class Bench:
                         output = call()
             graph.replay()
             torch.cuda.synchronize()
-            check(output)
+            checked(output)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         gpu, wall = [], []
@@ -72,7 +90,7 @@ class Bench:
             end.synchronize()
             wall.append((time.perf_counter_ns() - before) / 1000 / ops)
             gpu.append(start.elapsed_time(end) * 1000 / ops)
-        check(output)
+        checked(output)
         if refresh is not None:
             # Validate new contents at the same input address, outside timing.
             refresh()
@@ -81,7 +99,7 @@ class Bench:
             else:
                 graph.replay()
             torch.cuda.synchronize()
-            check(output)
+            checked(output)
         collected = [None] * self.world
         dist.all_gather_object(collected, dict(gpu_us=gpu, wall_us=wall))
         worst_gpu = [max(r['gpu_us'][i] for r in collected) for i in range(self.args.samples)]
@@ -95,6 +113,14 @@ class Bench:
         if self.rank == 0:
             (self.path/'results.json').write_text(json.dumps(self.rows, indent=2))
             print('PERF_PASS', name, shape, str(dtype), json.dumps(row['wall' if eager else 'gpu']), flush=True)
+        if self.args.trace and graph is not None:
+            # Trace separately: profiler overhead must not enter timing samples.
+            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                   torch.profiler.ProfilerActivity.CUDA]) as prof:
+                graph.replay()
+                torch.cuda.synchronize()
+            tag = f'{name}_{str(dtype).split(".")[-1]}_{math.prod(shape)}_rank{self.rank}'
+            prof.export_chrome_trace(str(self.path/f'{tag}.trace.json'))
         del graph, output
         torch.cuda.synchronize()
         dist.barrier()
@@ -106,26 +132,41 @@ def car_ar_suite(b):
     ca = CustomAllreduce(dist.group.WORLD, torch.cuda.current_device(),
                          max_size=128 << 20, enable_register_for_capturing=True)
     assert not ca.disabled
+    small_mode = getattr(ca, 'small_ar_mode', 'off')
+    requested_mode = os.environ.get('AITER_AR_SMALL_MESSAGE', 'off')
+    assert small_mode == requested_mode, (small_mode, requested_mode)
     rccl = dist.new_group(backend='nccl')
+    # Explicit registrations live until communicator teardown. Retain tensors
+    # across shapes so a control does not silently test freed/reused storage.
+    registered_keepalive = []
     try:
-        sizes = (4 << 10, 16 << 10, 24 << 10, 192 << 10,
-                 512 << 10, 2 << 20, 8 << 20, 32 << 20)
-        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+        sizes = b.args.car_bytes or (4 << 10, 16 << 10, 24 << 10, 192 << 10,
+                                    512 << 10, 2 << 20, 8 << 20, 32 << 20)
+        dtypes = [getattr(torch, name) for name in b.args.car_dtypes]
+        # TP8's original rank offsets can make BF16 partial sums exceed 32,
+        # where the 1/8 fixture spacing is no longer exactly representable.
+        # Keep every subset sum exact for all four input refreshes, regardless
+        # of the reduction tree, while retaining the historical TP2/4 inputs.
+        rank_scale = 8 if b.world == 8 else 1
+        rank_offset = b.rank / rank_scale
+        rank_sum = b.world * (b.world - 1) / (2 * rank_scale)
+        fixture = 'dyadic_tp8_v2' if b.world == 8 else 'dyadic_rank_v1'
+        for dtype in dtypes:
             for size_index, nbytes in enumerate(sizes):
                 numel = nbytes // torch.empty((), dtype=dtype).element_size()
                 base = (torch.arange(numel, device='cuda') % 8).to(dtype) / 8
-                x = base + b.rank
+                x = base + rank_offset
                 state = [0]
 
                 def refresh():
                     state[0] += 1
-                    x.copy_(base + b.rank + state[0] / 4)
+                    x.copy_(base + rank_offset + state[0] / 4)
 
                 def check(y):
                     assert y is not None and y.data_ptr() != x.data_ptr()
-                    expected = (base + state[0] / 4) * b.world + b.world * (b.world - 1) / 2
+                    expected = (base + state[0] / 4) * b.world + rank_sum
                     torch.testing.assert_close(y, expected, rtol=0, atol=0)
-                    torch.testing.assert_close(x, base + b.rank + state[0] / 4, rtol=0, atol=0)
+                    torch.testing.assert_close(x, base + rank_offset + state[0] / 4, rtol=0, atol=0)
 
                 assert ca.should_custom_ar(x)
 
@@ -150,7 +191,70 @@ def car_ar_suite(b):
                                   output_allocation='included', input_clone=name.startswith('rccl'),
                                   register_capture_requested=True,
                                   register_capture_effective=ca.enable_register_for_capturing,
+                                  small_ar_mode=small_mode,
+                                  input_fixture=fixture,
                                   use_new=True, open_fp8_quant=False)
+                if b.args.car_controls:
+                    # Fixed inputs only. This bypasses the production copy-in
+                    # protection solely to measure a registered kernel control.
+                    # It does not establish safety for changing-input graphs.
+                    out = torch.empty_like(x)
+                    copied = torch.empty_like(x)
+                    ca.register_input_buffer(x)
+                    ca.register_output_buffer(out)
+                    registered_keepalive.append((x, out))
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    from aiter.ops import custom_all_reduce as native
+
+                    def kernel_control():
+                        native.all_reduce(ca._ptr, x, out, True, False, 0, 0)
+                        return out
+
+                    def copy_control():
+                        copied.copy_(x)
+                        return copied
+
+                    try:
+                        b.measure('car_registered_stable_control', x.shape, dtype,
+                                  kernel_control, check, payload_bytes=nbytes,
+                                  transport='ipc', input_mutation=False,
+                                  output_allocation='preallocated', production_path=False)
+                    except AssertionError as exc:
+                        # Preserve failed controls without treating their timings
+                        # as a baseline or preventing the safe-path measurements.
+                        b.control_failures.append(str(exc))
+                        print('CONTROL_FAIL', str(exc), flush=True)
+                    # The production staging allocation is already registered.
+                    # Fill it once outside timing, then measure a stable native
+                    # view without a D2D node. Keep cached and uncached controls
+                    # distinct: neither authorizes changing-input registration.
+                    ca.all_reduce(x)
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    from aiter.jit.core import get_module
+                    from aiter.utility.dtypes import _torch_to_aiter_dtype
+                    module = get_module('module_custom_all_reduce')
+                    staging = module.aiter_tensor_t(ca._pool['input'].data_ptr,
+                                numel, 1, [numel], [1], _torch_to_aiter_dtype[dtype],
+                                torch.cuda.current_device())
+
+                    from aiter.utility.dtypes import torch_to_aiter_pybind
+                    native_out = torch_to_aiter_pybind(out)
+
+                    def uncached_control():
+                        module._set_current_hip_stream(torch.cuda.current_stream().cuda_stream)
+                        module.all_reduce(ca._ptr, staging, native_out, True, False, 0, 0)
+                        return out
+
+                    b.measure('car_uncached_stable_control', x.shape, dtype,
+                              uncached_control, check, payload_bytes=nbytes,
+                              transport='ipc', input_mutation=False,
+                              output_allocation='preallocated', production_path=False)
+                    b.measure('d2d_copy_control', x.shape, dtype, copy_control,
+                              lambda y: torch.testing.assert_close(y, x, rtol=0, atol=0),
+                              payload_bytes=nbytes, input_mutation=False,
+                              output_allocation='preallocated', production_path=False)
     finally:
         torch.cuda.synchronize()
         dist.barrier()
@@ -405,6 +509,7 @@ def provenance(args):
     report=dict(aiter=aiter.__file__,torch=torch.__version__,hip=torch.version.hip,
                 device=prop.name,arch=prop.gcnArchName,cu=prop.multi_processor_count,
                 visible_devices=os.environ.get('HIP_VISIBLE_DEVICES'),
+                small_ar_requested=os.environ.get('AITER_AR_SMALL_MESSAGE', 'off'),
                 native_modules=modules,arguments=vars(args),runner_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
     for pkg in ('triton','iris'):
         try:report[pkg]=importlib.metadata.version(pkg)
@@ -419,10 +524,20 @@ def main():
     p.add_argument('--output',required=True)
     p.add_argument('--samples',type=int,default=30)
     p.add_argument('--graph-ops',type=int,default=16)
+    p.add_argument('--car-controls',action='store_true',
+                   help='fixed-input registered kernel and D2D controls; not production safety tests')
+    p.add_argument('--car-bytes',type=int,nargs='+',
+                   help='CAR input bytes per rank (positive multiples of 16, below 128 MiB)')
+    p.add_argument('--car-dtypes',nargs='+',choices=['float16','bfloat16','float32'],
+                   default=['float16','bfloat16','float32'])
+    p.add_argument('--trace',action='store_true',help='export untimed per-rank Graph traces')
     args=p.parse_args()
     if args.samples<2 or args.graph_ops<1:p.error('samples>=2 and graph-ops>=1 required')
+    if args.car_bytes and any(n<=0 or n%16 or n>=128<<20 for n in args.car_bytes):
+        p.error('car-bytes must be positive multiples of 16 below 128 MiB')
     local,rank,world=(int(os.environ[k]) for k in ('LOCAL_RANK','RANK','WORLD_SIZE'))
-    if world!=2:p.error('this representative benchmark currently requires TP2')
+    if (args.suite=='car' and world not in (2,4,8)) or (args.suite!='car' and world!=2):
+        p.error('CAR supports TP2/4/8; other representative suites require TP2')
     torch.cuda.set_device(local)
     grouped=args.suite.startswith('groups_')
     if grouped:
@@ -442,7 +557,11 @@ def main():
         elif args.suite=='iris':iris_suite(bench)
         else:groups_suite(bench,layout)
         provenance(args)
-        Path(args.output,f'PASS_rank{rank}').write_text(str(len(bench.rows))+'\n')
+        if bench.control_failures:
+            Path(args.output,f'PARTIAL_rank{rank}.json').write_text(
+                json.dumps(dict(valid_rows=len(bench.rows),control_failures=bench.control_failures),indent=2))
+        else:
+            Path(args.output,f'PASS_rank{rank}').write_text(str(len(bench.rows))+'\n')
     finally:
         if grouped:
             from aiter.ops.communication import destroy_dist_env

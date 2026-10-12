@@ -26,6 +26,8 @@ using fptr_t = int64_t;
 namespace aiter {
 
 bool ag_rs_requires_copy_in();
+int64_t small_ar_scratch_size(int64_t world_size);
+void configure_small_ar(fptr_t ptr, int64_t max_size, int64_t meta_bytes, int64_t mode);
 
 fptr_t init_custom_ar(int64_t meta_ptr,
                       int64_t rank_data_ptr,

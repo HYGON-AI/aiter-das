@@ -15,6 +15,14 @@ def ag_rs_requires_copy_in() -> bool: ...
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def small_ar_scratch_size(world_size: int) -> int: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def configure_small_ar(ptr: int, max_size: int, meta_bytes: int, mode: int) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def init_custom_ar(
     meta_ptr: int,
     rank_data_ptr: int,

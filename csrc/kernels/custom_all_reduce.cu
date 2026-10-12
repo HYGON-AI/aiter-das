@@ -86,6 +86,19 @@ void dispose(fptr_t _fa)
 
 int64_t meta_size() { return sizeof(aiter::Signal); }
 
+int64_t small_ar_scratch_size(int64_t world_size)
+{
+    if(world_size != 2 && world_size != 4 && world_size != 8) return 0;
+    return hcu_ll_scratch_bytes(world_size);
+}
+
+void configure_small_ar(fptr_t ptr, int64_t max_size, int64_t meta_bytes, int64_t mode)
+{
+    if(max_size < 0 || meta_bytes < 0 || mode < 0 || mode > 3)
+        throw std::invalid_argument("invalid small-message configuration");
+    reinterpret_cast<CustomAllreduce*>(ptr)->configure_small_ar(max_size, meta_bytes, mode);
+}
+
 // ---- Internal dispatch helpers ----
 
 static void _all_reduce(fptr_t _fa, void* inp, void* out,
@@ -122,10 +135,14 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
     case AITER_DTYPE_bf16: {
+        // Keep the historical BF16 output-registration contract while refusing
+        // LL for direct registered inputs, just as for the other dtypes.
         fa->allreduce<opus::bf16_t>(stream,
                                       reinterpret_cast<opus::bf16_t*>(inp),
                                       reinterpret_cast<opus::bf16_t*>(out),
-                                      numel, use_new);
+                                      numel, use_new, false, 512,
+                                      aiter::CustomAllreduce::default_ar_block_limit,
+                                      !is_broadcast_reg_outptr);
         break;
     }
 #endif
@@ -515,6 +532,11 @@ void all_reduce(fptr_t _fa,
     int64_t numel  = inp.numel();
     int64_t data_bytes = numel * inp.element_size();
 
+    if(numel <= 0 || data_bytes % 16 != 0)
+        throw std::invalid_argument("all_reduce requires a positive multiple of 16 input bytes");
+    if(out.numel() != numel || out.dtype() != dtype || out.device_id != inp.device_id)
+        throw std::invalid_argument("all_reduce output size, dtype and device must match input");
+
     void* actual_inp = inp.data_ptr();
     void* actual_out = out.data_ptr();
 
@@ -528,6 +550,35 @@ void all_reduce(fptr_t _fa,
     {
         if(data_bytes > reg_inp_bytes)
             throw std::runtime_error("registered buffer is too small to contain the input");
+
+        // LL publishes local input into peer-readable scratch itself. Avoid a
+        // preceding staging copy only for this protocol; do not register an
+        // arbitrary cached allocation for direct peer reads. Preserve the
+        // staging behavior for unaligned slices and overlapping input/output.
+        const auto in_addr = reinterpret_cast<uintptr_t>(actual_inp);
+        const auto out_addr = reinterpret_cast<uintptr_t>(actual_out);
+        const auto distance = in_addr < out_addr ? out_addr - in_addr : in_addr - out_addr;
+        if((in_addr % 16 == 0) && (out_addr % 16 == 0) &&
+           distance >= static_cast<uint64_t>(data_bytes))
+        {
+            auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+            if(dtype == AITER_DTYPE_fp16 && !(open_fp8_quant && numel >= 128 * 2048))
+            {
+                if(fa->try_small_allreduce(stream, reinterpret_cast<opus::fp16_t*>(actual_inp),
+                                          reinterpret_cast<opus::fp16_t*>(actual_out),
+                                          numel, use_new, false))
+                    return;
+            }
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+            else if(dtype == AITER_DTYPE_bf16)
+            {
+                if(fa->try_small_allreduce(stream, reinterpret_cast<opus::bf16_t*>(actual_inp),
+                                          reinterpret_cast<opus::bf16_t*>(actual_out),
+                                          numel, use_new, false))
+                    return;
+            }
+#endif
+        }
         HIP_CALL(hipMemcpyAsync((void*)reg_inp_ptr, actual_inp, data_bytes,
                                 hipMemcpyDeviceToDevice, stream));
         actual_inp = (void*)reg_inp_ptr;

@@ -5,7 +5,43 @@ Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 # CustomAllreduce 用法与性能
 
-`CustomAllreduce`（CAR）对组内各 rank 的张量做逐元素 SUM，返回同形状、同 dtype 的新张量，输入保持不变。本文介绍未量化的普通 AllReduce；AG/RS 和融合 RMSNorm 等接口见[通信接口说明](communication_ops.md)，量化通信见 [Quick AllReduce](quick_all_reduce.md)。HCU 的 PyTorch 设备名仍为 `cuda`。
+本文是普通CustomAllreduce（CAR）的统一入口，提供当前用法、默认配置、最新性能和精度范围。
+CAR对组内各rank的张量逐元素求SUM，返回同形状、同dtype的新张量，输入保持不变。
+本文覆盖未量化AllReduce；其他接口见[通信接口说明](communication_ops.md)，量化通信见[Quick AllReduce](quick_all_reduce.md)。HCU的PyTorch设备名仍为`cuda`。
+
+- [默认配置与自动分派](#默认分派与配置)
+- [接口与输入条件](#接口与输入条件)
+- [可运行的eager与Graph示例](#可直接运行的-eager-与-graph-示例)
+- [最新性能](#最新性能)
+- [精度与覆盖范围](#精度与覆盖范围)
+- [详细结果与参考](#详细结果与参考)
+
+## 默认分派与配置
+
+普通CAR的构造、`custom_all_reduce()`、`all_reduce()`等调用签名不变，无需指定
+kernelID或线程数。升级时需使用匹配的Python与native模块，并确保框架实际选择AITER CAR后端。
+
+| 使用方式 | 自动生效的路径 |
+|---|---|
+| 不设置新变量（默认off） | gfx936/gfx938、单机IPC、TP2、`use_new=True`的普通非注册输出路径使用256线程寄存器规约 |
+| 创建通信器前统一设置`AITER_AR_SMALL_MESSAGE=auto` | gfx936/gfx938单机IPC，TP2/4、FP16/BF16、每rank输入≤32KiB且满足准入条件时选LL，其余使用传统路径 |
+| TP8 auto | 传统路径，不自动启用LL/LL128 |
+
+`auto`是一次性的策略选择，不是逐shape配置；所有rank需使用相同设置。
+默认off已经包含TP2优化，但不会启用LL。自动分派不保证每种载荷都比RCCL更快。
+`use_new=False`、其他架构/transport或CAR准入失败后的框架回退保持原行为。
+LL读取本卡原输入，不需要开启不安全的跨卡输入直接注册。
+
+默认保留off是分阶段推广时保持旧部署行为的选择，不是LL必须由用户指定kernel的技术限制。
+当前受限auto范围已通过双架构算子精度检查及gfx936 TP2模型抽样；它仍会增加每个通信器的scratch和初始化工作，收益也依赖载荷与运行方式。
+共享GPU性能存在批次波动，gfx938模型、模型吞吐和长期运行尚未覆盖，因此本版本保留显式启用与off回退。
+
+不设置`AITER_AR_SMALL_MESSAGE`和`AITER_AR_ENABLE_REG_CAPTURE`时，对应下方的“新off”策略；仅设置`AITER_AR_SMALL_MESSAGE=auto`即可选择已准入的小载荷LL，无需kernelID。
+启用示例（创建通信器前在各rank统一设置）：
+
+```bash
+export AITER_AR_SMALL_MESSAGE=auto
+```
 
 ## 接口与输入条件
 
@@ -23,7 +59,7 @@ y = ca.custom_all_reduce(x, use_new=True, open_fp8_quant=False)
 | `group` | 用于交换元数据的非 NCCL ProcessGroup，例如 Gloo；每个 rank 绑定不同 GPU |
 | `device` | 当前进程的 GPU，可传 `torch.device("cuda", local_rank)` |
 | `max_size` | staging 容量，单位 byte，默认 1 GiB；普通 AR 的单 rank 输入上限还受 `max_size // 2` 限制 |
-| `enable_register_for_capturing` | 请求 Graph 输入注册，默认 `True`；gfx936/gfx938 当前仍走受保护的 copy-in 路径 |
+| `enable_register_for_capturing` | 请求 Graph 输入注册，默认 `True`；gfx936/gfx938 传统路径使用 copy-in，已准入的 LL/LL128 读取本卡输入 |
 | `should_custom_ar(x)` | 检查 CAR 是否启用以及大小、布局、拓扑等准入条件；调用方仍需保证设备和 dtype 合法 |
 | `custom_all_reduce(x)` | 自动分配输出；不满足准入时返回 `None`，调用方负责回退 |
 | `all_reduce(x, out=out)` | 可复用预分配输出；绕过上层准入判断，使用前自行检查输入，输出须同设备、同形状、同 dtype，且不与输入重叠 |
@@ -34,14 +70,18 @@ y = ca.custom_all_reduce(x, use_new=True, open_fp8_quant=False)
 
 `AITER_AR_MAX_SIZE_MB` 控制普通 AR 的大小阈值，默认 256 MiB，须为正整数。实际可接受大小为 `min(max_size // 2, 阈值)`，增大阈值不会自动扩容 staging。`max_size` 也不是对象的总显存占用：初始化另有约 `2 * max_size` 的 meta 区域及其他管理资源，应预留额外显存。
 
-`AITER_AR_TRANSPORT=ipc` 是默认的单机路径；`fabric`/`auto` 需要相应编译能力和运行环境。普通 CAR 保留既有的 supernode 路径，本文的性能只覆盖单机 IPC、TP2。其他 rank 数和拓扑的能力不能从本表外推。
+上述大小准入适用于 `custom_all_reduce` / `should_custom_ar`。显式调用
+`all_reduce` 不执行该框架回退判断，copy-in 输入可以使用完整 `max_size` staging
+容量；超过容量会报错。所有 rank 仍须提交相同 collective，不应各自独立选择回退。
+
+`AITER_AR_TRANSPORT=ipc` 是默认的单机路径；`fabric`/`auto` 需要相应编译能力和运行环境。普通 CAR 保留既有的 supernode 路径，下方最新性能覆盖单机IPC、TP2/4/8。其他 rank 数和拓扑的能力不能从这些结果外推。
 
 ## 可直接运行的 eager 与 Graph 示例
 
 保存为 `example_car.py`，使用两张卡运行：
 
 ```bash
-HIP_VISIBLE_DEVICES=6,7 AITER_AR_TRANSPORT=ipc \
+HIP_VISIBLE_DEVICES=0,1 AITER_AR_TRANSPORT=ipc \
 torchrun --standalone --nproc_per_node=2 example_car.py
 ```
 
@@ -110,90 +150,83 @@ if y is None:
 
 ### Graph 注意事项
 
-- 在 gfx936/gfx938 上，即使请求 `enable_register_for_capturing=True`，当前实现也使用 Graph 内 copy-in，以支持相同输入地址更新内容后的 replay；优化 one-stage kernel 的结束同步保证下一次 staging 写入前，各 rank 已完成读取。
+- 在 gfx936/gfx938 上，请求 `enable_register_for_capturing=True` 不会开启不安全的输入直接注册。传统路径使用 Graph 内 copy-in，one-stage 的结束同步保证下一次 staging 写入前，各 rank 已完成读取。已准入的 LL/LL128 读取本卡原输入并发布到通信 scratch，使用 epoch 和消费确认保护复用；两种路径均支持在原地址更新内容后 replay。
 - `AITER_AR_ENABLE_REG_CAPTURE` 是框架可能使用的开关；直接构造对象应传入上述参数。不要通过低层 native 接口强行绕过 copy-in 保护。
+- 在当前gfx936/gfx938高层实现中，注册请求为True或False，最终均为`enable_register_for_capturing=False`。在其他配置相同时，两者使用相同的稳态kernel与copy-in策略；True不会额外提速。`AITER_AR_SMALL_MESSAGE=auto`仍可独立选择安全的LL本卡输入路径。旧版本或其他架构的注册行为需单独核对。
+- Bash设置应写为`export AITER_AR_ENABLE_REG_CAPTURE=false`，等号两侧不要留空格。AITER自带`CudaCommunicator`接受`1/true/yes/on`（大小写不敏感）为True；外部框架的解析以其实现为准。
 - `ca.capture()` 内、`torch.cuda.graph(...)` 外的调用仅返回用于模拟分配的零张量，不能把它当作实际规约结果。实际数值预热请放在 `ca.capture()` 外。
 - Graph replay 需要各 rank 一致参与；保持输入地址和输出存活，结束使用后先同步 GPU，再释放 Graph 和 CAR，最后销毁进程组。
 
-## 典型性能
+## 最新性能
 
-测量日期：**2026-10-10**；算子源码版本：`9ec274d6`（包含 gfx936/gfx938 的 copy-in 和 one-stage 结束同步保护）。
+测量日期为2026-10-11，生产源码版本`7e3361d8`；模型补充验证日期为2026-10-12。
+gfx936为BW200 / UBB BW1000、80 CU，gfx938为BW1100、72 CU，均使用单机IPC。
+gfx938为共享GPU环境；结果用于相同设备上的版本/策略比较，不能隔离比较架构本身的快慢。
 
-| 项目 | gfx936 | gfx938 |
-|---|---|---|
-| 服务器 / 容器 | bw25 / zxw_sglang_1009 | nmz-2 / zxw_vllm_0928 |
-| GPU / CU | BW200, UBB BW1000 / 80 CU | BW1100 / 72 CU |
-| 软件 | DTK 26.04、HIP 6.3.26113、PyTorch 2.11.0 | DTK 26.04、HIP 6.3.26113、PyTorch 2.11.0 |
-| 并行与模式 | 物理卡 6、7，TP2，IPC，未量化 | 物理卡 6、7，TP2，IPC，未量化 |
+旧off基线为`e525ba10`，按旧off/新off/新auto/新auto/新off/旧off六批交错测量。
+性能测试请求注册True，实际均被保护为False；off/auto分别测试。未设置变量按源码对应新off策略，未另做unset对照。
+每行30个样本，每个样本取各rank较慢值；表中为同配置两批中位数的均值。
+RCCL对照包含`clone`成本，不是裸RCCL kernel延迟。更多载荷、eager统计、慢样本及验证范围见[最终组合结果](custom_allreduce_ref/custom_allreduce_optimized_20261011.md)。
 
-两端均使用 `use_new=True`、`open_fp8_quant=False`、`max_size=128 MiB`。gfx936 加载已验证的系统模块，gfx938 从相同提交独立编译；均保留 Fabric 编译能力，但测量使用 IPC。不同服务器、运行库和 GPU 配置的结果是各环境参考值，不用于隔离比较架构本身的快慢。
+### Graph稳态延迟
 
-每组保留全部 30 个样本，逐样本取两 rank 较慢值再统计。Graph 每次 replay 连续执行 32 次操作，GPU event 时间除以 32；普通调用每样本执行一次并同步完成，报告墙钟耗时。初始化、编译和样本间 Gloo barrier 不计时。输入是精确可表示的八元素周期值，加 rank 和小幅偏移；计时前后检查 SUM、输入不变，以及原地址更新内容后的结果。
+以下为BF16，单位μs；输入大小是每rank字节数。每次Graph replay含32次操作，GPU event时间除以32。
+“新off”是默认算法策略；“新auto”在TP2/4、≤32KiB时选择LL，其余使用传统路径。
 
-CAR 和 RCCL 都返回新输出；RCCL 对照为 `x.clone()` 后 `dist.all_reduce()`，**包含 clone 的 GPU 拷贝成本**，不代表原地 RCCL 的延迟。Graph 捕获阶段的 Python 分配不计时，replay 复用捕获的输出存储；eager 包含 Python 分派、输出分配、提交及完成同步。以下是算子微基准，不是模型吞吐或请求尾延迟。
+| 架构 | TP | 每rank输入 | 旧off | 新off（默认策略） | 新auto | RCCL+clone |
+|---|---:|---:|---:|---:|---:|---:|
+| gfx936 | 2 | 4 KiB | 14.444 | 10.250 | 8.087* | 16.374 |
+| gfx936 | 2 | 2048 KiB | 43.387 | 34.232 | 34.360 | 54.549 |
+| gfx936 | 2 | 32768 KiB | 389.725 | 378.150 | 378.364 | 493.500 |
+| gfx936 | 4 | 16 B | 14.862 | 15.145 | 11.000 | 19.634* |
+| gfx936 | 4 | 4 KiB | 14.975 | 15.147 | 11.884* | 22.320* |
+| gfx936 | 8 | 4 KiB | 16.800 | 17.045 | 16.365* | 33.775* |
+| gfx936 | 8 | 32768 KiB | 647.628 | 647.164 | 645.356 | 733.097 |
+| gfx938 | 2 | 4 KiB | 16.730 | 12.362 | 9.552 | 18.366 |
+| gfx938 | 2 | 2048 KiB | 44.221 | 31.947 | 32.106 | 49.501* |
+| gfx938 | 2 | 32768 KiB | 378.740 | 338.575 | 338.292 | 350.662 |
+| gfx938 | 4 | 16 B | 17.219 | 17.494 | 306.891* | 21.525* |
+| gfx938 | 4 | 4 KiB | 17.435 | 17.446 | 14.399* | 26.085* |
+| gfx938 | 8 | 4 KiB | 19.287 | 19.564 | 19.583* | 36.959* |
+| gfx938 | 8 | 32768 KiB | 634.754 | 636.879 | 636.477* | 531.686* |
 
-### Graph 稳态延迟
+`*`表示六批中至少一批CV>10%，或同版本/同模式两批中位数比值超过1.1；慢样本全部保留。
+gfx938 TP4 16B的两批auto中位数为12.480/601.302μs，表中306.891μs保留该跳变，未用较快批次替代。
+gfx938 TP8也有明显批间漂移，不能按单行数字宣称稳定收益。TP8 auto使用传统路径。
 
-单位 μs，表中为中位数；payload 为**每 rank 输入字节数**。最后一列是同形状 BF16 的 RCCL 对照。
+### eager端到端延迟
 
-| 架构 | payload | CAR FP16 | CAR BF16 | CAR FP32 | RCCL BF16（含 clone） |
-|---|---|---:|---:|---:|---:|
-| gfx936 | 4 KiB | 13.715 | 14.135 | 13.600 | 15.917 |
-| gfx936 | 16 KiB | 14.055 | 14.225 | 13.660 | 16.650 |
-| gfx936 | 24 KiB | 14.282 | 14.495 | 13.870 | 16.792 |
-| gfx936 | 192 KiB | 17.612 | 18.645 | 17.532 | 20.270 |
-| gfx936 | 512 KiB | 24.660 | 25.245 | 24.215 | 28.827 |
-| gfx936 | 2 MiB | 42.747 | 43.280 | 42.947 | 54.370 |
-| gfx936 | 8 MiB | 113.450 | 114.705 | 113.535 | 146.525 |
-| gfx936 | 32 MiB | 386.897 | 389.237 | 386.525 | 493.177 |
-| gfx938 | 4 KiB | 16.650 | 16.635 | 16.335 | 18.140 |
-| gfx938 | 16 KiB | 16.837 | 16.807 | 16.195 | 19.207 |
-| gfx938 | 24 KiB | 16.665 | 16.902 | 16.600 | 19.207 |
-| gfx938 | 192 KiB | 18.332 | 18.812 | 18.705 | 24.002 |
-| gfx938 | 512 KiB | 26.812 | 27.095 | 26.685 | 32.362 |
-| gfx938 | 2 MiB | 43.495 | 44.300 | 43.607 | 49.822 |
-| gfx938 | 8 MiB | 112.697 | 111.757 | 114.435 | 108.110 |
-| gfx938 | 32 MiB | 388.572 | 379.892 | 395.900 | 350.620 |
+以下为BF16、TP2，单位μs，包含Python分派、输出分配、提交和完成同步。不能用Graph百分比替代此口径。
 
-BF16 的 P95、最大值和波动如下，仍以 Graph 内每次操作时间为单位。P95 是 30 个批次均值的 P95，不是单次请求 P95。
+| 架构 | 每rank输入 | 旧off | 新off（默认策略） | 新auto |
+|---|---:|---:|---:|---:|
+| gfx936 | 4 KiB | 161.070 | 158.154 | 147.767 |
+| gfx936 | 2048 KiB | 177.179 | 171.059 | 169.947 |
+| gfx938 | 4 KiB | 159.542 | 163.930 | 151.440 |
+| gfx938 | 2048 KiB | 176.123 | 166.922 | 163.147 |
 
-| 架构 | payload | CAR P95 μs | CAR max μs | CAR CV | RCCL CV |
-|---|---|---:|---:|---:|---:|
-| gfx936 | 4 KiB | 14.760 | 14.845 | 1.95% | 1.94% |
-| gfx936 | 16 KiB | 14.865 | 15.800 | 2.37% | 2.23% |
-| gfx936 | 24 KiB | 14.940 | 15.195 | 1.32% | 1.11% |
-| gfx936 | 192 KiB | 20.110 | 21.130 | 3.59% | 4.16% |
-| gfx936 | 512 KiB | 25.800 | 26.460 | 1.19% | 0.95% |
-| gfx936 | 2 MiB | 44.140 | 46.985 | 1.61% | 4.74% |
-| gfx936 | 8 MiB | 119.290 | 119.410 | 1.11% | 1.57% |
-| gfx936 | 32 MiB | 391.190 | 404.710 | 0.72% | 0.15% |
-| gfx938 | 4 KiB | 17.590 | 17.630 | 1.85% | 1.51% |
-| gfx938 | 16 KiB | 17.600 | 17.855 | 2.17% | 1.78% |
-| gfx938 | 24 KiB | 17.665 | 17.710 | 1.71% | 1.54% |
-| gfx938 | 192 KiB | 19.285 | 19.420 | 1.03% | 0.87% |
-| gfx938 | 512 KiB | 28.040 | 28.615 | 1.54% | 6.20% |
-| gfx938 | 2 MiB | 45.165 | 45.245 | 0.87% | 8.77% |
-| gfx938 | 8 MiB | 112.805 | 112.835 | 0.39% | 0.37% |
-| gfx938 | 32 MiB | 381.950 | 387.130 | 0.38% | 0.10% |
+收益主要集中在TP2及小载荷Graph；TP4/8大载荷通常接近原路径，eager还有较慢观测，详见完整报告。
+这些是算子微基准，不代表模型吞吐或请求尾延迟。
+可复用测试入口为`op_tests/multigpu_tests/test_communication_api_perf.py --suite car`，见[测试说明](../../op_tests/multigpu_tests/README.md)。
 
-### 普通调用延迟（BF16）
+## 精度与覆盖范围
 
-单位 μs，包含主机调用和等待完成；不能与上面的 Graph GPU 时间直接相减推导 kernel 开销。
+- gfx936/gfx938均完成普通CAR 96项、fused/split AR RMS 288路径项及共享API回归；原CI阈值未放宽。独立FP32 FTZ/RNE专项、变化输入、Graph复用与边界检查通过，不能把容差CI通过解释为所有元素逐位一致。
+- 保留FP32累加、BF16 RNE、同步和消费完成确认；LL无需不安全的跨卡输入直接注册。协议与共享ABI约束见[实现说明](custom_allreduce_ref/custom_allreduce_implementation.md)。
+- gfx936 TP2的Qwen3.5-27B + NEXTN抽样中，旧off/新off/新auto/RCCL对应文本、token及返回logprobs一致，数学答案正确；实际通信抽样10,174,464个BF16元素与参考零位差异。35B INT8历史配置的四组输出虽一致但语义异常，保留该失败。启动配置及范围见[模型回归](custom_allreduce_ref/custom_allreduce_model_20261012.md)。
+- 尚未覆盖gfx938模型、TP4/8模型、模型吞吐、完整模型评测、跨节点Fabric、扩展rank硬件运行及长期稳定性；不将这些记为已通过。
 
-| 架构 | payload | CAR median | CAR P95 | CAR CV | RCCL median（含 clone） |
-|---|---|---:|---:|---:|---:|---:|
-| gfx936 | 4 KiB | 159.725 | 171.979 | 3.59% | 165.290 |
-| gfx936 | 2 MiB | 169.035 | 202.339 | 6.03% | 177.644 |
-| gfx936 | 32 MiB | 528.943 | 571.168 | 3.12% | 581.948 |
-| gfx938 | 4 KiB | 161.435 | 176.440 | 14.67% | 168.745 |
-| gfx938 | 2 MiB | 172.800 | 263.370 | 44.46% | 179.365 |
-| gfx938 | 32 MiB | 530.314 | 559.410 | 2.01% | 447.264 |
+## 详细结果与参考
 
-### 结果解读与适用边界
+| 文档 | 内容 |
+|---|---|
+| [最终组合结果](custom_allreduce_ref/custom_allreduce_optimized_20261011.md) | 当前版本双架构TP2/4/8详细性能、精度、波动与范围 |
+| [Qwen3.5模型回归](custom_allreduce_ref/custom_allreduce_model_20261012.md) | 模型启动、精度抽样和已知失败 |
+| [实现与安全边界](custom_allreduce_ref/custom_allreduce_implementation.md) | copy-in、LL/LL128、RNE、共享ABI及扩展路径 |
+| [2026-10-10历史基线](custom_allreduce_ref/custom_allreduce_baseline_20261010.md) | 早期TP2性能，不能代替上方最新结果 |
+| [算法同步阶段结果](custom_allreduce_ref/custom_allreduce_hcu_algorithms_20261010.md) | 历史LL/LL128与two-stage对照 |
+| [本卡输入优化](custom_allreduce_ref/custom_allreduce_local_input_20261011.md) | 省去前置D2D的阶段对照 |
+| [TP2寄存器规约](custom_allreduce_ref/custom_allreduce_tp2_register_20261011.md) | 传统TP2路径的阶段对照 |
+| [gfx938 TP8补测](custom_allreduce_ref/custom_allreduce_tp8_gfx938_20261011.md) | 历史八卡阶段结果 |
 
-- 在这组 BF16 Graph 数据中，gfx936 的 CAR 中位延迟低于包含 clone 的 RCCL 对照。gfx938 在 4 KiB～2 MiB 时 CAR 较低；8 MiB 时 CAR 为 111.757 μs、RCCL 为 108.110 μs，32 MiB 时分别为 379.892 / 350.620 μs，CAR 约慢 3.4% / 8.3%。容量准入只表示可执行，不保证在该容量下更快，应按实际环境和负载决定框架路由。
-- gfx936 FP16 24 KiB 的 CAR Graph CV 为 17.27%，存在长尾，不能据其中位数宣称稳定收益。部分 RCCL 小载荷和 eager 组也有明显波动；原始样本全部保留，未删除异常点或选择性重测。
-- 每架构 96 组（3 dtype × 8 payload × 2 后端 × 2 执行方式）均通过计时前后及输入更新检查。gfx938 另通过 15,360 次连续输入复用输出检查；两架构均实际运行了本文示例。这些合成输入检查不替代完整模型精度评估。
-- 本表仅覆盖 TP2、单机 IPC、未量化 SUM，不能外推 TP4/TP8、跨节点 Fabric、量化路径或融合算子，也没有测量旧版不安全路径的加速比。
-
-可复用的性能入口为 `op_tests/multigpu_tests/test_communication_api_perf.py --suite car`，启动方法见[测试说明](../../op_tests/multigpu_tests/README.md)。
+历史报告按其标注版本解读；当前配置以本文为准。JSON和完整原始测试数据单独归档，不随源码分发。

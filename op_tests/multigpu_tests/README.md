@@ -12,6 +12,8 @@ different GPU. The direct API tests fail if the required backend is unavailable.
 | `test_custom_allreduce_api.py --suite fusions` | RMSNorm/Gemma, padding/strides, FP8 mirrors/scales, MXFP4 packing, QK norm, Graph registration | 2, 4, 8 |
 | `test_custom_allreduce_api.py --suite transport` | IPC selection, collective initialization failures, topology rejection, optional disabled-Fabric check | 2, 4, 8; 6 with `--tp6` |
 | `test_custom_allreduce_api.py --suite reuse` | Immediate input reuse, changing eager/Graph inputs, exact FP16/BF16/FP32 sums and HCU copy-in protection | 2, 4, 8 |
+| `test_custom_allreduce_api.py --suite ar-boundaries` | Mixed packet/LL/tile boundaries, two alternating Graphs, allocation cycles, rank submission skew and staging/admission capacity limits | 2, 4, 8 |
+| `test_custom_allreduce_api.py --suite ar-precision` | Ordered FP32 sums, FP16/BF16 RNE ties, cancellation, Inf/NaN, subnormals, guarded tails and changing Graph inputs | 2, 4, 8 |
 | `test_fused_ar_mhc_post.py` | AR+MHC one-stage/automatic/split entry points and Graph replay | 2, 4, 8 |
 | `test_fused_qknorm_ar_rope.py` | Distributed QK statistics, RoPE, FP32 reference and fullgraph metadata | 2, 4, 8 |
 | `test_parallel_groups.py` | TP/DP/PP/PCP/DCP/custom groups, public collectives, destruction and reinitialization | Exactly 4 |
@@ -24,11 +26,11 @@ different GPU. The direct API tests fail if the required backend is unavailable.
 For example:
 
 ```bash
-HIP_VISIBLE_DEVICES=6,7 torchrun --standalone --nproc_per_node=2 \
+HIP_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
   op_tests/multigpu_tests/test_custom_allreduce_api.py \
   --suite collectives --repeats 100 --close-repeats 20
 
-HIP_VISIBLE_DEVICES=6,7 torchrun --standalone --nproc_per_node=2 \
+HIP_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
   op_tests/multigpu_tests/test_custom_allreduce_api.py \
   --suite reuse --repeats 400
 
@@ -48,6 +50,13 @@ environment settings are isolated. CAR collectives/fusions/reuse and native QR u
 replays. CAR fusions accepts `--register off/on/both`; native QR accepts `--mode`.
 The IPC tests run on one node. Fabric transport tests require a compatible
 build and device configuration; use `super_node/` for multi-node testing.
+
+Run `ar-precision` with `AITER_AR_SMALL_MESSAGE=off` or `auto`. It checks eager and eight
+changing-input Graph replays with zero tolerance and emits per-rank output
+digests. Its reference models the existing AITER JIT FP32 flush-to-zero mode
+and RNE; it does not assume IEEE gradual underflow. NaN payloads are normalized
+only for the digest. Compare digests from baseline and candidate builds using
+the same test script and device configuration.
 
 ## Performance and broader regression
 
@@ -70,7 +79,7 @@ build and device configuration; use `super_node/` for multi-node testing.
 The INT4 test provides three suites:
 
 ```bash
-HIP_VISIBLE_DEVICES=6,7 torchrun --standalone --nproc_per_node=2 \
+HIP_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
   op_tests/multigpu_tests/test_flydsl_quick_allreduce_int4.py \
   --suite smoke --output /tmp/aiter_int4_smoke
 ```
@@ -85,7 +94,7 @@ For the representative API benchmark, use two GPUs and provide an output directo
 
 ```bash
 AITER_ENABLE_SUPERNODE_AR=0 AITER_AR_TRANSPORT=ipc AITER_AR_ENABLE_REG_CAPTURE=0 \
-AITER_QUICK_REDUCE_QUANTIZATION=NONE HIP_VISIBLE_DEVICES=6,7 \
+AITER_QUICK_REDUCE_QUANTIZATION=NONE HIP_VISIBLE_DEVICES=0,1 \
 torchrun --standalone --nproc_per_node=2 \
   op_tests/multigpu_tests/test_communication_api_perf.py \
   --suite hip --samples 30 --graph-ops 16 --output /tmp/comm_api_perf
@@ -98,6 +107,21 @@ published measurements are in [communication docs](../../docs/communication/comm
 
 For ordinary CAR, use `--suite car --samples 30 --graph-ops 32` and a separate
 output directory. Both paths preserve the input and allocate a new output;
-the RCCL reference includes `clone()`. The suite requests capture registration,
-while gfx936/gfx938 use the communicator's copy-in protection. Details and
+CAR supports TP2/4/8; other representative suites still require TP2. Use
+`--car-bytes 4096 65536 65552` and `--car-dtypes bfloat16` to select boundary
+cases. `--trace` writes separate, untimed per-rank Graph traces.
+The CAR fixture keeps every partial sum exactly representable for all four
+input refreshes. TP8 uses rank/8 offsets (`input_fixture=dyadic_tp8_v2`);
+TP2/TP4 retain the historical rank offsets. All CAR/RCCL checks use zero tolerance.
+`--car-controls` adds D2D, fixed cached-input registration, and prefilled
+uncached-staging kernel controls. The uncached control retains its native
+input/output views and sets the capture stream explicitly. These fixed-input
+controls do not authorize changing-input registration. Cached registration
+may fail correctness; its failures are saved per rank and
+produce a `PARTIAL_rank*.json` marker. Only passing rows enter `results.json`;
+all recorded samples, including failed-control samples, are retained.
+The RCCL reference includes `clone()`. The suite requests capture registration,
+while gfx936/gfx938 preserve the communicator's safe input lifetime: traditional
+paths use copy-in, and eligible LL/LL128 read only their local input before
+publishing into peer scratch. Details and
 current measurements are in [CustomAllreduce](../../docs/communication/custom_allreduce.md).

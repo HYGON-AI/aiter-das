@@ -584,6 +584,30 @@ class CustomAllreduce:
         self.rank = rank
         self.world_size = world_size
 
+        # Opt-in until per-architecture thresholds have passed correctness and
+        # performance gates. Agree before allocating/exporting any extra memory.
+        requested_small_ar = os.environ.get("AITER_AR_SMALL_MESSAGE", "off").strip().lower()
+        arch = torch.cuda.get_device_properties(self.device).gcnArchName.split(":")[0] if torch.version.hip else ""
+        small_capable = self.transport == "ipc" and world_size in (2, 4, 8) and arch in ("gfx936", "gfx938")
+        small_configs = [None] * world_size
+        dist.all_gather_object(small_configs, (requested_small_ar, max_size, small_capable), group=self.group)
+        if any(c[:2] != small_configs[0][:2] for c in small_configs):
+            raise ValueError("AITER_AR_SMALL_MESSAGE and max_size must agree across ranks")
+        small_modes = {"off": 0, "ll": 1, "ll128": 2, "auto": 3}
+        if requested_small_ar not in small_modes:
+            raise ValueError("AITER_AR_SMALL_MESSAGE must be off, ll, ll128, or auto")
+        self.small_ar_mode = "off"
+        small_bytes = 0
+        meta_bytes = ops.meta_size() + 2 * max_size
+        # All ranks must choose the same protocol, including heterogeneous groups.
+        if requested_small_ar != "off" and all(c[2] for c in small_configs):
+            small_bytes = ops.small_ar_scratch_size(world_size)
+            if max_size >= small_bytes:
+                self.small_ar_mode = requested_small_ar
+                meta_bytes = ((meta_bytes + 127)//128)*128 + small_bytes
+            else:
+                logger.warning("Small-message CAR scratch needs %d bytes; max_size=%d uses the traditional path", small_bytes, max_size)
+
         # Use a gloo-based barrier to synchronise init status across all ranks.
         # If any rank fails (e.g. allocate_meta_buffer throws on platforms that
         # do not support hipDeviceMallocUncached), the barrier ensures all other
@@ -601,7 +625,7 @@ class CustomAllreduce:
                 self.group,
                 transport=self.transport_id,
             )
-            self._pool.create("meta", ops.meta_size() + max_size * 2, uncached=True)
+            self._pool.create("meta", meta_bytes, uncached=True)
             self._pool.create("input", max_size, uncached=True)
         except Exception as e:
             init_error = e
@@ -641,6 +665,15 @@ class CustomAllreduce:
         if not self._sync_init_stage("peer meta attach", init_error):
             return
         debug_stage("peer_meta_attach_done")
+
+        init_error = None
+        try:
+            if self.small_ar_mode != "off":
+                ops.configure_small_ar(self._ptr, max_size, meta_bytes, small_modes[self.small_ar_mode])
+        except Exception as e:
+            init_error = e
+        if not self._sync_init_stage("small-message scratch configuration", init_error):
+            return
 
         local_meta = None
         init_error = None
@@ -755,7 +788,7 @@ class CustomAllreduce:
             return False
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
-        if inp_size % 16 != 0:
+        if inp_size == 0 or inp_size % 16 != 0:
             return False
         if not is_weak_contiguous(inp):
             return False
@@ -807,8 +840,14 @@ class CustomAllreduce:
         IPC-registered. Otherwise, inp is first copied into a pre-registered
         buffer.
         """
+        if inp.numel() == 0 or inp.numel() * inp.element_size() % 16:
+            raise ValueError("all_reduce requires a positive multiple of 16 input bytes")
+        if not is_weak_contiguous(inp):
+            raise ValueError("all_reduce input must be weak-contiguous")
         if out is None:
             out = torch.empty_like(inp)
+        if out.numel() != inp.numel() or out.dtype != inp.dtype or out.device != inp.device:
+            raise ValueError("all_reduce output size, dtype and device must match input")
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
         # DTK 26.04 also exposes stale peer inputs in ordinary AR when a
         # framework replays a graph with new data. Preserve the registration
@@ -847,9 +886,8 @@ class CustomAllreduce:
                 return torch.zeros_like(input)
         else:
             # note: outside of cuda graph context,
-            # custom allreduce incurs a cost of cudaMemcpy, which should
-            # be small(<=1% of overall latency) compared to the performance
-            # gains of using custom kernels
+            # custom allreduce includes a staging copy. Its latency depends
+            # on payload and platform; measure it separately when profiling.
             return self.all_reduce(
                 input,
                 use_new=use_new,

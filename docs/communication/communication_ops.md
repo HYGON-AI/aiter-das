@@ -270,17 +270,17 @@ AG 的常用签名为 `(input_, use_custom=False, dim=-1)`，RS 为 `(input_, us
 
 CAR 直接调用需在所有 rank 完成 JIT/预热后，嵌套 `with ca.capture():` 和 `with torch.cuda.graph(graph):` 捕获。使用 TP/DP 等组封装时使用对应 `GroupCoordinator.graph_capture()`。保持输入地址固定，用 `copy_` 更新内容；保留输出和通信对象直到 Graph 使用结束。
 
-gfx936/gfx938 的高层 IPC communicator 即使收到 `enable_register_for_capturing=True`（或框架开启 `AITER_AR_ENABLE_REG_CAPTURE`），也会关闭直接注册并使用 capture 内 copy-in，避免读取历史输入；custom allreduce 和 Graph 仍启用。这两种架构的优化 one-stage kernel 还包含结束同步，防止后续拷贝过早覆盖其他 rank 正在读取的 staging 输入。直接使用低层 registered-input 接口不会自动经过 Python 保护，调用方应使用高层 communicator。Fabric 的原有注册限制保持不变。
+gfx936/gfx938 的高层 IPC communicator 即使收到 `enable_register_for_capturing=True`（或框架开启 `AITER_AR_ENABLE_REG_CAPTURE`），也会关闭直接注册；custom allreduce 和 Graph 仍启用。传统路径使用 capture 内 copy-in，避免读取历史输入；已准入的LL/LL128可读取本卡原输入并发布至通信scratch，无需跨卡直接注册输入。注册请求True/False最终使用相同的安全分派，LL策略由独立的`AITER_AR_SMALL_MESSAGE`配置控制。这两种架构的优化 one-stage kernel 保留结束同步，防止后续拷贝过早覆盖其他 rank 正在读取的 staging 输入。直接使用低层 registered-input 接口不会自动经过 Python 保护，调用方应使用高层 communicator。Fabric 的原有注册限制保持不变。
 
 普通 AR 与部分 RMS/quant wrapper 在 `ca.capture()` 内但尚未开始实际 Graph capture 的预热阶段返回占位零值，不能当作模型输出消费；AG/RS 和 QK-RoPE 的该阶段执行真实通信。Iris 不支持 Graph。QR 和 INT4 的 Graph 约定见 [Quick AllReduce](quick_all_reduce.md)。
 
 ## 性能结果
 
-下列性能表保留其标注日期的测量结果。普通 CAR 在 2026-10-10 合入 gfx936/gfx938 优化 one-stage 结束同步后的最新测量，见 [CustomAllreduce 性能](custom_allreduce.md#典型性能)。不同接口及测量条件的结果不能直接互换。
+下列性能表保留其标注日期的测量结果。普通CAR的当前用法与2026-10-11双架构组合优化结果，统一见[CustomAllreduce最新性能](custom_allreduce.md#最新性能)。不同接口及测量条件的结果不能直接互换。
 
 ### AR + RMSNorm，BF16 TP2
 
-测量日期 2026-10-08，DTK 26.04 / HIP 6.3 系列、PyTorch 2.11；gfx936 使用 bmz，gfx938 使用 nmz-2。接口为 `custom_fused_ar_rms`，`eps=1e-6`、默认两阶段、无 Gemma/量化、IPC copy-in。输入是精确可表示的常量：rank r 输入 `(r+1)/8`，residual=0.125，weight=1。
+测量日期 2026-10-08，DTK 26.04 / HIP 6.3 系列、PyTorch 2.11；gfx936（80 CU）与gfx938（72 CU）。接口为 `custom_fused_ar_rms`，`eps=1e-6`、默认两阶段、无 Gemma/量化、IPC copy-in。输入是精确可表示的常量：rank r 输入 `(r+1)/8`，residual=0.125，weight=1。
 
 每个 Graph 包含100次操作；每样本先在计时区间外对齐 rank，记录 GPU event 每次均值，取两 rank 较慢值。200个样本全部保留，初始化、编译和 barrier 不计入。这是合成负载的稳态设备耗时，不是模型吞吐或单请求尾延迟。
 
@@ -303,7 +303,7 @@ gfx936/gfx938 的高层 IPC communicator 即使收到 `enable_register_for_captu
 
 ### AG/RS 与融合接口专项性能
 
-日期2026-10-09，gfx936/bmz25（80 CU）与gfx938/nmz-2（72 CU），均使用物理卡6/7、TP2、PyTorch 2.11.0、HIP 6.3.26113、IPC。每组30个样本全部保留，每个样本取两rank较慢值；†表示CV>10%，不据其中位数承诺稳定收益。HIP测量覆盖FP16/BF16，Iris及组封装覆盖BF16；下表展示代表性结果。这些是代表性输入的接口成本，不是完整模型吞吐；TP4/8性能不由TP2外推。
+日期2026-10-09，gfx936（BW200 / UBB BW1000，80 CU）与gfx938（BW1100，72 CU），均使用2张GPU、TP2、PyTorch 2.11.0、HIP 6.3.26113、IPC。每组30个样本全部保留，每个样本取两rank较慢值；†表示CV>10%，不据其中位数承诺稳定收益。HIP测量覆盖FP16/BF16，Iris及组封装覆盖BF16；下表展示代表性结果。这些是代表性输入的接口成本，不是完整模型吞吐；TP4/8性能不由TP2外推。
 
 下表为BF16、Graph内GPU event时间，每个Graph含16次接口调用。CAR使用copy-in，RMS/FP8保持`use_1stage=False`，由native按形状选择两阶段或split；MXFP4显式一阶段。初始化、编译、预热、参考计算和计时外rank对齐不计入，Python分发/分配不计入Graph重放时间；capture中实际需要的copy和kernel均在计时范围内。
 
