@@ -211,6 +211,12 @@ gfx938 TP8也有明显批间漂移，不能按单行数字宣称稳定收益。T
 
 ## 精度与覆盖范围
 
+日常算子回归入口是 `python op_tests/ci_tests/test_custom_allreduce_api.py`。
+无参数默认依次执行 TP2、TP4，共18个独立任务：输入立即复用、Graph变化输入、边界与RNE精度专项各测off/auto，再测AG/RS、融合与IPC初始化；不自动运行TP8。
+`--tp-size 2/4/8` 可显式选择单个TP，CI仅分配2卡时（`AITER_AR_TP_SIZE=2`）默认只测TP2。
+原 `test_custom_allreduce.py` 保留独立精度/性能测试。参数、日志和覆盖边界见[测试说明](../../op_tests/multigpu_tests/README.md#interface-and-correctness-tests)。
+2026-10-12 在 gfx936/gfx938 上验证该无参数入口，TP2/TP4 各架构均通过18/18个任务；未运行TP8或新增模型回归。
+
 - gfx936/gfx938均完成普通CAR 96项、fused/split AR RMS 288路径项及共享API回归；原CI阈值未放宽。独立FP32 FTZ/RNE专项、变化输入、Graph复用与边界检查通过，不能把容差CI通过解释为所有元素逐位一致。
 - 保留FP32累加、BF16 RNE、同步和消费完成确认；LL无需不安全的跨卡输入直接注册。协议与共享ABI约束见[实现说明](custom_allreduce_ref/custom_allreduce_implementation.md)。
 - gfx936 TP2的Qwen3.5-27B + NEXTN抽样中，旧off/新off/新auto/RCCL对应文本、token及返回logprobs一致，数学答案正确；实际通信抽样10,174,464个BF16元素与参考零位差异。35B INT8历史配置的四组输出虽一致但语义异常，保留该失败。启动配置及范围见[模型回归](custom_allreduce_ref/custom_allreduce_model_20261012.md)。

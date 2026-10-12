@@ -6,6 +6,42 @@ different GPU. The direct API tests fail if the required backend is unavailable.
 
 ## Interface and correctness tests
 
+The CAR API test now lives in `op_tests/ci_tests/test_custom_allreduce_api.py`,
+the copy CI discovers and runs; the `multigpu_tests` copy is kept until that
+move is merged. From the repository root:
+
+```bash
+python op_tests/ci_tests/test_custom_allreduce_api.py
+```
+
+With at least four visible GPUs, this runs **TP2 followed by TP4**. It does not
+run TP8 automatically, even on an eight-GPU machine. Each TP runs `reuse`,
+`ar-boundaries` and `ar-precision` with both `off` and `auto`, then
+`collectives`, `fusions` and `transport` with `off`: 18 independent torchrun
+jobs in total. The launcher sets these algorithm policies itself; no
+`AITER_AR_SMALL_MESSAGE` export is needed for the default matrix. Existing
+registration-request and safe HCU copy-in checks remain enabled.
+
+`AITER_AR_TP_SIZE=2` limits the default matrix to TP2 for a two-GPU CI allocation;
+the usual CI allocation of four GPUs runs both sizes. An explicit
+`--tp-size 2`, `--tp-size 4` or `--tp-size 8` runs only that size.
+Use `--dry-run` to inspect the matrix without importing Torch or using GPUs.
+Insufficient visible GPUs fail the test rather than silently skipping cases.
+
+The default repeat counts are 100 (`--repeats`) and 20 (`--close-repeats`);
+specialized boundary/precision loops retain their own case counts. Each job
+has a 1,800-second timeout (`--timeout`). Raw logs, per-rank Python/native
+provenance and `summary.json` go to a unique subdirectory of
+`test_custom_allreduce_api_results/` in the working directory (`--output`
+overrides the parent). Any failed job, timeout or missing rank completion
+fails the launcher and preserves partial results.
+
+CI registers this script separately from `test_custom_allreduce.py` in the
+`multi_gpu_tests` table of the optest package, which only adds its four-GPU
+allocation and exports `AITER_AR_TP_SIZE=4`. The original performance test and
+its thresholds are unchanged. These operator tests do not replace
+framework/model validation.
+
 | Test | Coverage | Processes |
 |---|---|---|
 | `test_custom_allreduce_api.py --suite collectives` | Dimension-aware AG/RS, integer bit preservation, input validation, changing Graph inputs, close/recreate | 2, 4, 8 |
@@ -27,11 +63,11 @@ For example:
 
 ```bash
 HIP_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
-  op_tests/multigpu_tests/test_custom_allreduce_api.py \
+  op_tests/ci_tests/test_custom_allreduce_api.py \
   --suite collectives --repeats 100 --close-repeats 20
 
 HIP_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
-  op_tests/multigpu_tests/test_custom_allreduce_api.py \
+  op_tests/ci_tests/test_custom_allreduce_api.py \
   --suite reuse --repeats 400
 
 HIP_VISIBLE_DEVICES=4,5,6,7 torchrun --standalone --nproc_per_node=4 \
