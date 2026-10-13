@@ -14,6 +14,7 @@ aiter.ck_grouped_gemm 精度与性能测试。
   fp16  -> fp16
   bf16  -> bf16
   fp8   -> float32（fp8 点积，float32 累加，无 scale）
+  bf8   -> float32（E5M2 点积，无 scale）
   int8  -> int32  （int8 点积，int32  累加，无 scale）
 
 fp8 / int8 说明
@@ -24,16 +25,16 @@ CK 执行原始硬件 MMAC，不做量化 scale。
   - fp8：硬件先 fp8×fp8 再 float32 累加；参考实现先扩到 float32 再乘，
     存在数值差异，容差见 TOLERANCE。
 
-dense / random fp8、int8 正确性仍待跟进：
-  - int8 dense random：应精确；失败则可能是 CK instance bug。
-  - fp8  dense random：允许小误差，rtol/atol ~ 0.2。
+dense/random、packed INT4、纯 C ABI 和选核合同回归见
+op_tests/test_ck_grouped_gemm_contracts.py（性能比较使用本文件 --perf）。
 
 Layout 支持（--layout）
 -----------------------
   NT（默认）：a=[M,K] 行主序，b=[N,K] 行主序（CK 按列主序读）-> C = A @ B^T
   NN：a=[M,K] 行主序，b=[K,N] 行主序 -> C = A @ B
   TN：a=[K,M] 行主序（CK 按列主序读为 A^T），b=[K,N] 行主序 -> C = A^T @ B
-  仅 fp16/bf16 支持 NN/TN；C 始终为 [M,N] 行主序。
+  TT：a=[K,M]、b=[N,K]，C = A^T @ B^T。
+  fp16/bf16 支持四布局；C 始终为 [M,N] 行主序。
   Python 调用：aiter.ck_grouped_gemm(a, b, layout="NN")。
 
 CI smoke 命令（小 shape，快速验正确性）
@@ -62,7 +63,8 @@ import aiter
 DTYPE_MAP = {
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
-    "fp8":  torch.float8_e4m3fn,
+    "fp8": torch.float8_e4m3fn,
+    "bf8": torch.float8_e5m2,
     "int8": torch.int8,
 }
 
@@ -88,13 +90,13 @@ def _fp8_supported():
 
 def _filter_dtypes(dtype_names):
     """在不支持 fp8 的架构上剔除 fp8 用例并打印跳过原因。"""
-    if "fp8" in dtype_names and not _fp8_supported():
+    if any(d in dtype_names for d in ("fp8", "bf8")) and not _fp8_supported():
         arch = _device_arch() or "unknown"
         print(
             f"  [SKIP] fp8: current arch {arch} does not support fp8 "
             f"(requires {'/'.join(FP8_SUPPORTED_ARCHS)})"
         )
-        dtype_names = [d for d in dtype_names if d != "fp8"]
+        dtype_names = [d for d in dtype_names if d not in ("fp8", "bf8")]
     return dtype_names
 
 # 各 dtype 的 assert_close 容差。
@@ -104,6 +106,7 @@ TOLERANCE = {
     torch.float16:       dict(rtol=5e-2, atol=5e-2),
     torch.bfloat16:      dict(rtol=5e-2, atol=5e-2),
     torch.float8_e4m3fn: dict(rtol=2e-1, atol=2e-1),
+    torch.float8_e5m2: dict(rtol=2e-1, atol=2e-1),
     torch.int8:          dict(rtol=0,    atol=0),
 }
 
@@ -113,15 +116,17 @@ TOLERANCE = {
 SHAPE_ALIGN = {
     torch.float16:       dict(m=64,  n=128, k=128),
     torch.bfloat16:      dict(m=64,  n=128, k=128),
-    torch.float8_e4m3fn: dict(m=128, n=128, k=128),
-    torch.int8:          dict(m=32,  n=32,  k=128),
+    torch.float8_e4m3fn: dict(m=128, n=128, k=256),
+    torch.float8_e5m2: dict(m=128, n=128, k=256),
+    torch.int8:          dict(m=32,  n=32,  k=256),
 }
 
 # 各 dtype 预定义变长 shape（来自 Stage 1 验证）。
 VARIABLE_SHAPES = {
     torch.float16:       [(128, 128, 128), (256, 128, 128), (384, 128, 128)],
     torch.bfloat16:      [(128, 128, 128), (256, 128, 128), (384, 128, 128)],
-    torch.float8_e4m3fn: [(128, 128, 128), (256, 128, 256), (128, 256, 128)],
+    torch.float8_e4m3fn: [(128, 128, 256), (256, 128, 256), (128, 256, 256)],
+    torch.float8_e5m2: [(128, 128, 256), (256, 128, 256), (128, 256, 256)],
     torch.int8:          [(64,  64,  128), (128, 128, 256), (192, 64,  128)],
 }
 
@@ -130,7 +135,8 @@ VARIABLE_SHAPES = {
 HETERO_SHAPES = {
     torch.float16:       [(128, 128, 128), (192, 256, 128), (256, 128, 128)],
     torch.bfloat16:      [(128, 128, 128), (192, 256, 128), (256, 128, 128)],
-    torch.float8_e4m3fn: [(128, 128, 128), (256, 128, 128), (128, 256, 128)],
+    torch.float8_e4m3fn: [(128, 128, 256), (256, 128, 256), (128, 256, 256)],
+    torch.float8_e5m2: [(128, 128, 256), (256, 128, 256), (128, 256, 256)],
     torch.int8:          [(32,  32,  128), (64,  64,  128), (96,  32,  128)],
 }
 
@@ -138,8 +144,9 @@ HETERO_SHAPES = {
 MOE_FIXED_NK = {
     torch.float16:       (128, 128),
     torch.bfloat16:      (128, 128),
-    torch.float8_e4m3fn: (128, 128),
-    torch.int8:          (32,  128),
+    torch.float8_e4m3fn: (128, 256),
+    torch.float8_e5m2: (128, 256),
+    torch.int8:          (32,  256),
 }
 MOE_M_VALUES = [1, 17, 33, 63, 65, 100]
 
@@ -163,7 +170,7 @@ def _rand_tensor(shape, dtype):
     if dtype is torch.int8:
         values = (torch.arange(shape[1], device="cuda", dtype=torch.int16) % 5).to(torch.int8)
         return values.view(1, shape[1]).repeat(shape[0], 1).contiguous()
-    if dtype is torch.float8_e4m3fn:
+    if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         values = (torch.arange(shape[1], device="cuda", dtype=torch.float16) % 5).to(dtype)
         return values.view(1, shape[1]).repeat(shape[0], 1).contiguous()
     src = (torch.randn(shape, device="cuda", dtype=torch.float16) / 10).contiguous()
@@ -176,7 +183,7 @@ def _make_b(shape, dtype):
     保持与既有 projection 测试一致。
     """
     n, k = shape
-    if dtype in (torch.int8, torch.float8_e4m3fn):
+    if dtype in (torch.int8, torch.float8_e4m3fn, torch.float8_e5m2):
         b = torch.zeros(shape, device="cuda", dtype=dtype)
         if dtype is torch.int8:
             b[0, :] = 1
@@ -219,7 +226,7 @@ def _reference_rc(a, b):
 #   TN: a=[K,M], b=[K,N] -> C = A^T @ B
 # C 始终为 [M,N] 行主序。
 
-LAYOUTS = ("NT", "NN", "TN")
+LAYOUTS = ("NT", "NN", "TN", "TT")
 
 
 def _make_ab_for_layout(m, n, k, dtype, layout):
@@ -233,6 +240,9 @@ def _make_ab_for_layout(m, n, k, dtype, layout):
     elif layout == "TN":
         a = _rand_tensor((k, m), dtype)
         b = _rand_tensor((k, n), dtype)
+    elif layout == "TT":
+        a = _rand_tensor((k, m), dtype)
+        b = _rand_tensor((n, k), dtype)
     else:
         raise ValueError(f"unknown layout {layout}")
     return a, b
@@ -246,6 +256,8 @@ def _reference_layout(a, b, layout):
         return a.float() @ b.float()
     if layout == "TN":
         return a.float().T @ b.float()
+    if layout == "TT":
+        return a.float().T @ b.float().T
     raise ValueError(f"unknown layout {layout}")
 
 
@@ -257,6 +269,8 @@ def _torch_gemm_layout(a, b, layout):
         return a @ b
     if layout == "TN":
         return a.T @ b
+    if layout == "TT":
+        return a.T @ b.T
     raise ValueError(f"unknown layout {layout}")
 
 
@@ -351,7 +365,7 @@ def _ms_to_tflops(flops, ms):
 def _output_dtype(dtype):
     if dtype is torch.int8:
         return torch.int32
-    if dtype is torch.float8_e4m3fn:
+    if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         return torch.float32
     return dtype
 
@@ -388,7 +402,8 @@ def _format_perf_line(dtype_name, shapes, ck_ms, torch_ms, ck_tag="ck"):
 # ── shape 工厂 ────────────────────────────────────────────────────────────────
 
 def _make_shapes_uniform(args, dtype):
-    return [(args.m, args.n, args.k)] * args.groups
+    k = max(args.k, SHAPE_ALIGN[dtype]["k"]) if args.smoke else args.k
+    return [(args.m, args.n, k)] * args.groups
 
 
 def _make_shapes_variable(args, dtype):
@@ -516,7 +531,7 @@ def run_heterogeneous_cases(args):
     验证内核能正确处理逐组 shape 描述符。
     """
     print("\n=== 异构 shape 测试 ===")
-    dtype_names = ["fp16", "bf16", "fp8", "int8"] if args.dtype == "all" else [args.dtype]
+    dtype_names = ["fp16", "bf16", "fp8", "bf8", "int8"] if args.dtype == "all" else [args.dtype]
     dtype_names = _filter_dtypes(dtype_names)
     for dtype_name in dtype_names:
         dtype = DTYPE_MAP[dtype_name]
@@ -547,10 +562,10 @@ def run_moe_cases(args):
     """
     print("\n=== MOE 动态 M 测试（固定 N/K，kernel kPadM）===")
     # fp16/bf16 → V4Mpad (MPerBlock=64), fp8 → V5Mpad (MPerBlock=128)
-    moe_dtypes = ["fp16", "bf16", "fp8"] if args.dtype == "all" else [args.dtype]
+    moe_dtypes = ["fp16", "bf16", "fp8", "bf8"] if args.dtype == "all" else [args.dtype]
     moe_dtypes = _filter_dtypes(moe_dtypes)
     for dtype_name in moe_dtypes:
-        if dtype_name not in ("fp16", "bf16", "fp8"):
+        if dtype_name not in ("fp16", "bf16", "fp8", "bf8"):
             print(f"  [SKIP] {dtype_name}: MOE kPadM not supported")
             continue
         dtype = DTYPE_MAP[dtype_name]
@@ -605,13 +620,6 @@ def run_perf_compare(args):
     """
     CK grouped_gemm 与 torch GEMM 的性能对比。
 
-    对每个 dtype、每个待测 shape 构造 args.groups 组同 shape 的 GEMM，
-    分别 benchmark CK（alloc / prealloc）与 torch，输出对照表。
-    """
-def run_perf_compare(args):
-    """
-    CK grouped_gemm 与 torch GEMM 的性能对比。
-
     对每个 layout、每个 dtype、每个待测 shape 构造 args.groups 组同 shape 的 GEMM，
     分别 benchmark CK 与 torch，输出对照表。
 
@@ -641,7 +649,7 @@ def run_perf_compare(args):
     )
 
     for layout in layouts:
-        dtype_names = ["fp16", "bf16", "fp8", "int8"] if args.dtype == "all" else [args.dtype]
+        dtype_names = ["fp16", "bf16", "fp8", "bf8", "int8"] if args.dtype == "all" else [args.dtype]
         dtype_names = _filter_dtypes(dtype_names)
         if layout != "NT":
             # NN/TN 仅 fp16/bf16
@@ -705,9 +713,10 @@ def run_bad_input_cases():
     def _expect_error(desc, fn):
         try:
             fn()
-            print(f"  [FAIL] {desc}: 期望报错但未抛出")
         except Exception as e:
             print(f"  [PASS] {desc}: {type(e).__name__}: {e}")
+            return
+        raise AssertionError(f"{desc}: 期望报错但未抛出")
 
     _expect_error("空 a_tensors", lambda: aiter.ck_grouped_gemm([], []))
 
@@ -737,10 +746,10 @@ def run_bad_input_cases():
 
     # M 不对齐现在由 kernel kPadM 支持（V4Mpad），不应报错
     _expect_error(
-        "shape 对齐违规（fp16 N 非 128 倍数）",
+        "K 小于现有双缓冲 kernel 的最小值 128",
         lambda: aiter.ck_grouped_gemm(
-            [torch.zeros((128, 128), device=device, dtype=dtype).contiguous()],
-            [torch.zeros((127, 128), device=device, dtype=dtype).contiguous()],
+            [torch.zeros((128, 64), device=device, dtype=dtype).contiguous()],
+            [torch.zeros((127, 64), device=device, dtype=dtype).contiguous()],
         ),
     )
 
@@ -792,7 +801,7 @@ def main():
     parser.add_argument("--repeat", type=int, default=100, help="基准测试迭代次数")
     parser.add_argument("--smoke", action="store_true",
                         help="CI smoke：groups=2, 128^3, warmup=1, repeat=5")
-    parser.add_argument("--dtype", choices=["fp16", "bf16", "fp8", "int8", "all"], default="all",
+    parser.add_argument("--dtype", choices=["fp16", "bf16", "fp8", "bf8", "int8", "all"], default="all",
                         help="测试的数据类型")
     parser.add_argument("--variable", action="store_true",
                         help="使用预定义变长 shape（见 VARIABLE_SHAPES）")
@@ -801,8 +810,8 @@ def main():
     parser.add_argument("--moe", action="store_true",
                         help="MOE 模式：固定 N/K，M 任意（CK kernel kPadM 自动处理 M 对齐）")
     parser.add_argument("--layout", nargs="?", const="all", default=None,
-                        choices=["NT", "NN", "TN", "all"],
-                        help="layout 选择（NT/NN/TN/all，NN/TN 仅 fp16/bf16）；"
+                        choices=["NT", "NN", "TN", "TT", "all"],
+                        help="layout 选择（NT/NN/TN/TT/all，非 NT 仅 fp16/bf16）；"
                              "单独使用时跑 layout 正确性/性能测试，"
                              "配合 --perf 时对该 layout 做性能对比；不带值时等于 all")
     parser.add_argument("--perf", action="store_true",
@@ -845,7 +854,7 @@ def main():
         run_moe_cases(args)
         return
 
-    dtype_names = ["fp16", "bf16", "fp8", "int8"] if args.dtype == "all" else [args.dtype]
+    dtype_names = ["fp16", "bf16", "fp8", "bf8", "int8"] if args.dtype == "all" else [args.dtype]
     dtype_names = _filter_dtypes(dtype_names)
     for dtype_name in dtype_names:
         run_case(dtype_name, args)

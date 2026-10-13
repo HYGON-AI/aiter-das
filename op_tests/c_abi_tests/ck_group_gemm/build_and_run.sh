@@ -17,6 +17,7 @@ import torch
 from torch.utils.cpp_extension import include_paths, library_paths
 import aiter
 import aiter.jit
+from aiter.jit.core import get_module
 
 # 触发合并后的 module_cpp_api.so JIT/prebuilt 加载。
 a = torch.randn((1, 128), dtype=torch.float16, device="cuda")
@@ -25,26 +26,7 @@ aiter.ck_grouped_gemm([a], [b])
 torch.cuda.synchronize()
 
 so_name = "module_cpp_api.so"
-jit_pkg_dirs = (
-    aiter.jit.__path__
-    if hasattr(aiter.jit, "__path__")
-    else [os.path.dirname(aiter.jit.__file__)]
-)
-so_dir = None
-for directory in jit_pkg_dirs:
-    if os.path.isfile(os.path.join(directory, so_name)):
-        so_dir = directory
-        break
-if so_dir is None:
-    from aiter.jit.core import get_user_jit_dir
-    directory = get_user_jit_dir()
-    if os.path.isfile(os.path.join(directory, so_name)):
-        so_dir = directory
-
-if so_dir is None:
-    raise RuntimeError(
-        f"Cannot find {so_name} — make sure aiter is built or JIT compilation succeeds"
-    )
+so_dir = str(Path(get_module("module_cpp_api").__file__).resolve().parent)
 
 root = Path(aiter.__file__).resolve().parents[1]
 csrc = root / "csrc"

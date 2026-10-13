@@ -14,7 +14,18 @@ def ck_grouped_gemm(
     a_tensors: List[Tensor],
     b_tensors: List[Tensor],
     layout: str = "NT",
-) -> List[Tensor]: ...
+) -> List[Tensor]:
+    """Compute one GEMM per tensor pair; layout gives the mathematical transposes.
+
+    FP16/BF16: NT, NN, TN, TT, positive M/N and K >= 128 (tails supported).
+    E4M3/E5M2: NT, raw dot product to FP32; INT8: NT to INT32.
+    UInt8 means signed INT4, two two's-complement nibbles per byte (low first):
+    NT has A[M,K/2], B[N,K/2]; TT has A[K/2,M], B[N,K/2]; output is INT32.
+    INT4 TT stages A into NT storage internally, including a temporary buffer.
+    Inputs and out tensors may have padded rows, with inner stride one.
+    Scales, dequantization, activation and routing are separate contracts.
+    """
+    ...
 
 
 @compile_ops("module_cpp_api")
@@ -23,7 +34,9 @@ def ck_grouped_gemm_out(
     b_tensors: List[Tensor],
     c_tensors: List[Tensor],
     layout: str = "NT",
-) -> List[Tensor]: ...
+) -> List[Tensor]:
+    """As ck_grouped_gemm, writing into and returning the supplied C tensors."""
+    ...
 
 
 # CK tile alignment for the low-level kernel (see grouped_gemm_kernels.cu).
@@ -31,20 +44,26 @@ _MOE_M_ALIGN = {
     torch.float16: 64,
     torch.bfloat16: 64,
     torch.float8_e4m3fn: 128,
+    torch.float8_e5m2: 128,
     torch.int8: 32,
 }
 _MOE_NK_ALIGN = {
     torch.float16: dict(n=128, k=128),
     torch.bfloat16: dict(n=128, k=128),
     torch.float8_e4m3fn: dict(n=128, k=128),
+    torch.float8_e5m2: dict(n=128, k=128),
     torch.int8: dict(n=32, k=128),
 }
+
+
+def _moe_min_k(dtype: torch.dtype) -> int:
+    return 256 if dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8) else 128
 
 
 def _moe_output_dtype(dtype: torch.dtype) -> torch.dtype:
     if dtype is torch.int8:
         return torch.int32
-    if dtype is torch.float8_e4m3fn:
+    if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         return torch.float32
     return dtype
 
@@ -58,10 +77,10 @@ def _validate_moe_fixed_nk(b_tensors: Sequence[Tensor], dtype: torch.dtype) -> T
         raise ValueError("ck_grouped_gemm_moe: b_tensors must not be empty")
     n0, k0 = b_tensors[0].shape
     nk = _MOE_NK_ALIGN[dtype]
-    if n0 % nk["n"] != 0 or k0 % nk["k"] != 0 or k0 < nk["k"]:
+    if n0 % nk["n"] != 0 or k0 % nk["k"] != 0 or k0 < _moe_min_k(dtype):
         raise ValueError(
             f"ck_grouped_gemm_moe: fixed N/K must satisfy N % {nk['n']} == 0, "
-            f"K % {nk['k']} == 0, K >= {nk['k']} for {dtype}, got N={n0}, K={k0}"
+            f"K % {nk['k']} == 0, K >= {_moe_min_k(dtype)} for {dtype}, got N={n0}, K={k0}"
         )
     for i, b in enumerate(b_tensors):
         if b.shape != (n0, k0):
@@ -192,7 +211,7 @@ class GroupedGemmMoeBuffers:
         if num_groups <= 0:
             raise ValueError("GroupedGemmMoeBuffers: num_groups must be positive")
         nk = _MOE_NK_ALIGN[dtype]
-        if n % nk["n"] != 0 or k % nk["k"] != 0 or k < nk["k"]:
+        if n % nk["n"] != 0 or k % nk["k"] != 0 or k < _moe_min_k(dtype):
             raise ValueError(f"GroupedGemmMoeBuffers: invalid fixed N={n}, K={k} for {dtype}")
 
         self.num_groups = num_groups

@@ -64,7 +64,14 @@ struct ck_tile_hcu_grouped_gemm_desc
 };
 
 // Returns the number of bytes of device workspace required for group_count groups.
-size_t ck_tile_hcu_grouped_gemm_workspace_size(int group_count, int num_d_tensors);
+#if defined(__GNUC__) || defined(__clang__)
+#define AITER_CK_GROUPED_GEMM_C_API __attribute__((visibility("default")))
+#else
+#define AITER_CK_GROUPED_GEMM_C_API
+#endif
+
+AITER_CK_GROUPED_GEMM_C_API size_t
+ck_tile_hcu_grouped_gemm_workspace_size(int group_count, int num_d_tensors);
 
 // Launches the grouped GEMM kernel.
 //
@@ -76,8 +83,17 @@ size_t ck_tile_hcu_grouped_gemm_workspace_size(int group_count, int num_d_tensor
 // workspace   - device buffer of at least ck_tile_hcu_grouped_gemm_workspace_size bytes
 // stream      - HIP stream to submit the kernel on
 //
-// Returns 0 on success, negative on error.
-int ck_tile_hcu_grouped_gemm_run(const struct ck_tile_hcu_grouped_gemm_desc* descs,
+// FP16/BF16 NT/NN/TN contracts use the same CK v1 selector/provider as Primus.
+// Other implemented layouts/contracts use the retained host frontend.
+// FP8 (E4M3) and BF8 (E5M2) return raw FP32 dot products; INT8/packed INT4
+// return INT32, without scale or dequantization. INT4 M/N/K are logical sizes,
+// but stride_A/B count packed bytes; stride_C counts INT32 elements. INT4 packs
+// along K, signed two's-complement low nibble first: NT A[M,K/2], TT A[K/2,M],
+// B[N,K/2]. TT uses a temporary byte transpose followed by the CK NT kernel;
+// that staging buffer is freed only after the queued work completes.
+// AITER_CK_GROUPED_GEMM_BACKEND=legacy selects the old frontend for rollback/A/B.
+// Returns 0 on success, negative on error (including unsupported architecture).
+AITER_CK_GROUPED_GEMM_C_API int ck_tile_hcu_grouped_gemm_run(const struct ck_tile_hcu_grouped_gemm_desc* descs,
                                  int        group_count,
                                  int        dtype,
                                  char       a_layout,
