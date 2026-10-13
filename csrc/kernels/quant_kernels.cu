@@ -150,6 +150,10 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     }
     inverted_scale =
         std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? inverted_scale : 1.0f / inverted_scale;
+    if constexpr(std::is_same_v<DTYPE_O, ck_tile::int8_t>)
+    {
+        inverted_scale = 127.0f / absMax;
+    }
 
     using DTYPE_STORE = typename ck_tile::vector_traits<DTYPE_O>::scalar_type;
     auto* out_ptr     = reinterpret_cast<DTYPE_STORE*>(out);
@@ -182,7 +186,8 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 
 template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16>
 __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __restrict__ input,
-                                                             const int32_t cols)
+                                                             const int32_t cols,
+                                                             float* quant_multiplier = nullptr)
 {
     static constexpr int32_t vec_size_i =
         thread_data_size == 0 ? 16 / sizeof(DTYPE_O) : thread_data_size;
@@ -281,6 +286,15 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
             exponent += 1;
         return ck_tile::bit_cast<float>(exponent << 23);
     };
+    if constexpr(std::is_same_v<DTYPE_O, ck_tile::int8_t>)
+    {
+        if(quant_multiplier != nullptr)
+        {
+            absMax = max(absMax, 1e-10f);
+            // Quantize from absmax directly, without inverting the rounded scale.
+            *quant_multiplier = 127.0f / absMax;
+        }
+    }
     float row_scale = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
                           ? fp4_scale(absMax) * inverted_DTYPE_MAX
                           : absMax * inverted_DTYPE_MAX;
@@ -303,7 +317,7 @@ data_to_scale_kernel(float* __restrict__ scale, const DTYPE_I* __restrict__ inpu
     }
 }
 
-template <typename DTYPE_I, typename DTYPE_O>
+template <typename DTYPE_I, typename DTYPE_O, bool DIRECT_MULTIPLIER = false>
 __device__ void scaled_quant_impl(DTYPE_O* __restrict__ out,
                                   const DTYPE_I* __restrict__ input,
                                   const float* __restrict__ scale,
@@ -311,7 +325,8 @@ __device__ void scaled_quant_impl(DTYPE_O* __restrict__ out,
 {
 
     const float inverted_scale =
-        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? (*scale) : 1.0f / (*scale);
+        (DIRECT_MULTIPLIER || std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
+            ? (*scale) : 1.0f / (*scale);
     static constexpr int32_t vec_size_i = 16 / sizeof(DTYPE_O);
     static constexpr int32_t vec_size_o =
         std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? vec_size_i / 2 : vec_size_i;
@@ -402,7 +417,8 @@ __device__ void scaled_quant_impl(DTYPE_O* __restrict__ out,
     // double load core loop end
 }
 
-template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16>
+template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16,
+          bool DIRECT_MULTIPLIER = false>
 __device__ void scaled_quant_vgpr_impl(DTYPE_O* __restrict__ out,
                                        DTYPE_I* __restrict__ input,
                                        const float* __restrict__ scale,
@@ -410,7 +426,8 @@ __device__ void scaled_quant_vgpr_impl(DTYPE_O* __restrict__ out,
 {
 
     const float inverted_scale =
-        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? (*scale) : 1.0f / (*scale);
+        (DIRECT_MULTIPLIER || std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
+            ? (*scale) : 1.0f / (*scale);
     static constexpr int32_t vec_size_i = thread_data_size;
     static constexpr int32_t vec_size_o =
         std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? vec_size_i / 2 : vec_size_i;
@@ -487,7 +504,10 @@ dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         if(token_idx >= rows)
             return;
     }
-    auto res         = data_to_per_row_scale<DTYPE_I, DTYPE_O, thread_data_size>(input, cols);
+    constexpr bool direct_multiplier = std::is_same_v<DTYPE_O, ck_tile::int8_t>;
+    float quant_multiplier;
+    auto res = data_to_per_row_scale<DTYPE_I, DTYPE_O, thread_data_size>(
+        input, cols, direct_multiplier ? &quant_multiplier : nullptr);
     float row_scale  = std::get<0>(res);
     DTYPE_I* vec_ptr = std::get<1>(res);
 
@@ -507,11 +527,13 @@ dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 
     if constexpr(thread_data_size == 0)
     {
-        scaled_quant_impl<DTYPE_I>(out, input, &row_scale, cols);
+        scaled_quant_impl<DTYPE_I, DTYPE_O, direct_multiplier>(
+            out, input, direct_multiplier ? &quant_multiplier : &row_scale, cols);
     }
     else
     {
-        scaled_quant_vgpr_impl<DTYPE_I, DTYPE_O, thread_data_size>(out, vec_ptr, &row_scale, cols);
+        scaled_quant_vgpr_impl<DTYPE_I, DTYPE_O, thread_data_size, direct_multiplier>(
+            out, vec_ptr, direct_multiplier ? &quant_multiplier : &row_scale, cols);
     }
 }
 
