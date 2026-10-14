@@ -68,7 +68,7 @@ y = ca.custom_all_reduce(x, use_new=True, open_fp8_quant=False)
 
 普通 AR 使用非空 FP16、BF16 或 FP32 张量。推荐 contiguous 布局，总字节数必须为 16 的倍数。所有 rank 必须按相同顺序调用，输入形状、dtype 和准入/回退决策一致；输出是 SUM，不会除以 world size。
 
-`AITER_AR_MAX_SIZE_MB` 控制普通 AR 的大小阈值，默认 256 MiB，须为正整数。实际可接受大小为 `min(max_size // 2, 阈值)`，增大阈值不会自动扩容 staging。`max_size` 也不是对象的总显存占用：初始化另有约 `2 * max_size` 的 meta 区域及其他管理资源，应预留额外显存。
+`AITER_AR_MAX_SIZE_MB` 控制普通 AR 的大小阈值，默认 64 MiB（67,108,864 字节），须为正整数。实际可接受大小为 `min(max_size // 2, 阈值)`；超过门限时 `should_custom_ar()` 返回 `False`、`custom_all_reduce()` 返回 `None`，由调用方选择 RCCL 等回退后端。增大阈值不会自动扩容 staging。`max_size` 也不是对象的总显存占用：初始化另有约 `2 * max_size` 的 meta 区域及其他管理资源，应预留额外显存。
 
 上述大小准入适用于 `custom_all_reduce` / `should_custom_ar`。显式调用
 `all_reduce` 不执行该框架回退判断，copy-in 输入可以使用完整 `max_size` staging

@@ -139,7 +139,7 @@ TP/DP/EP/PP 的 AG 常用签名为 `(input_, use_custom=False, dim=-1)`，RS 为
 ### 容量与后端配置
 
 - 各 rank 使用不同 GPU，按相同顺序调用 collective，输入形状/dtype、选项及回退决策保持一致。直接 CAR 对象使用 CPU/Gloo 组交换元数据。
-- `max_size` 为 staging 容量，默认 1 GiB；普通 AR 门限默认 256 MiB，可通过 `AITER_AR_MAX_SIZE_MB` 调整，但始终受 `max_size/2` 约束。融合和 RS 仍受 `min(64 MiB, max_size/2)` 约束。
+- `max_size` 为 staging 容量，默认 1 GiB；普通 AR 门限默认 64 MiB，可通过 `AITER_AR_MAX_SIZE_MB` 调整，但始终受 `max_size/2` 约束。超过门限时由调用方选择 RCCL 等回退后端。融合和 RS 仍受 `min(64 MiB, max_size/2)` 约束。
 - 普通 CAR 不需要 kernelID。不设置新变量即包含已启用的 TP2 优化；小载荷 LL 需要在创建通信器前、各 rank 统一设置 `AITER_AR_SMALL_MESSAGE=auto`。它仅自动准入 gfx936/gfx938 单机 IPC 的 TP2/4、FP16/BF16、每 rank ≤32 KiB 等已支持组合，其余回退传统路径；TP8 auto 仍为传统路径。完整配置见 [默认分派](custom_allreduce.md#默认分派与配置)。
 - `AITER_AR_TRANSPORT` 默认 `ipc`，也接受 `auto` / `fabric`。`AITER_ENABLE_SUPERNODE_AR=0` 是编译时 IPC-only 开关；未设置时保留 Fabric 构建，需配套 DTK 头文件与运行时。
 

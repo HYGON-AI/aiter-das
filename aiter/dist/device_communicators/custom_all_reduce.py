@@ -45,7 +45,8 @@ except Exception as e:
 
 
 _AR_TRANSPORT_IDS = {"ipc": 0, "fabric": 1}
-_DEFAULT_AR_MAX_SIZE_MB = 256
+# Match AMD's default ordinary custom-AR cutoff (64 MiB).
+_DEFAULT_AR_MAX_SIZE_MB = 64
 _LEGACY_AR_MAX_SIZE = 64 * 1024 * 1024
 
 
