@@ -14,7 +14,7 @@ Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 - [AG/RS](#allgather--reducescatter)、[RMSNorm](#ar--residual--rmsnorm--gemma)、[量化](#ar--rmsnorm--量化)、[QK/RoPE](#qk-norm--分布式统计--rope)、[MHC](#ar--mhc-post)
 - [接入验证](#接入验证)与[性能结果](#性能结果)
 
-普通 CAR 的完整 eager/Graph 示例、配置与最新性能统一见 [CustomAllreduce 用法与性能](custom_allreduce.md)；其他后端见 [HIP QuickAR / FlyDSL INT4](quick_all_reduce.md) 和 [Iris 通信](iris_comms.md)。
+普通 CAR 的完整 eager/Graph 示例、配置与最新性能统一见 [CustomAllreduce 用法与性能](custom_allreduce.md)；INT8/FP8 AllGather、末维直写及 RCCL 对照见 [Custom AllGather](custom_all_gather.md)。其他后端见 [HIP QuickAR / FlyDSL INT4](quick_all_reduce.md) 和 [Iris 通信](iris_comms.md)。
 
 ## Hygon AITER comm 算子接入速查
 
@@ -168,13 +168,19 @@ ca.custom_reduce_scatter(rs_input, rs_output, dim=1)
 
 | 接口 | 形状与返回 | 约束 |
 |---|---|---|
-| `custom_all_gather(inp, dim=0)` | 沿 dim 按组内 rank 顺序拼接；返回新 Tensor | 直接 CAR 支持首维/末维；连续 FP32/FP16/BF16/int16/int32/int64 |
+| `custom_all_gather(inp, dim=0)` | 沿 dim 按组内 rank 顺序拼接；返回新 Tensor | 直接 CAR 支持首维/末维；连续 FP32/FP16/BF16/int16/int32/int64/int8/uint8 及E4M3FN/E5M2 FP8（不支持 FNUZ），按位保真 |
 | `all_gather_unreg(inp, out=None, dim=0)` | 可提供预分配输出，返回 out | 总输入字节数整除 16；末维 AG 的每行字节数也整除 16；输入 ≤ `max_size/(2*TP)` |
 | `all_gather_reg(inp, out=None, dim=0)` | 注册形式，返回 out | HCU 可能根据 native 能力转为 copy-in；Fabric 不支持此注册形式 |
-| `custom_reduce_scatter(input, output, dim=0)` | 跨 rank 求和后按 dim 分片，写 output；返回 `None` | 连续 FP32/FP16/BF16；dim 可为首/中间/末维及负索引；该维整除 TP |
+| `custom_reduce_scatter(input, output, dim=0)` | 跨 rank 求和后按 dim 分片，写 output；返回 `None` | 连续 FP32/FP16/BF16/INT8 及E4M3FN/E5M2 FP8（不支持 FNUZ）；dim 可为首/中间/末维及负索引；该维整除 TP |
 | `reduce_scatter(inp, out, dim=0, *, registered=False)` | 同上，输入不适用时抛异常 | 总输入字节数整除 16；dim=0 时每 rank 分片也满足 16 字节对齐 |
 
-所有输入输出必须在对象绑定的设备上、dtype 相同、存储互不重叠；输出连续且形状准确。整数 AG 通过等宽位视图传输，不转换数值。AG/RS 的 capture 外 warmup 会产生真实通信结果。
+所有输入输出必须在对象绑定的设备上、dtype 相同、存储互不重叠；输出连续且形状准确，AG/RS 输出指针需 16 字节对齐。整数及 FP8 AG 通过等宽位视图传输，不转换数值，也不处理量化 scale。AG/RS 的 capture 外 warmup 会产生真实通信结果。
+
+2026-10-14 的 AG 扩展在公开 `all_gather(..., use_custom=True, dim=...)` 入口直接传递首维/末维，避免末维结果的二次重排。FP8 的 PyNccl/c10d 回退以 UINT8 传输后恢复 dtype，包含 `use_custom=False`；详细合同、验证矩阵与性能见 [Custom AllGather](custom_all_gather.md)。
+
+同日追加的 RS 扩展采用真实数值规约：INT8 使用 INT32 累加后模 256 回绕；FP8 使用 FP32 按源 rank 升序累加、最后一次 RNE 转回原格式，非饱和，不接收量化 scale。详情、边界及验证见 [Custom ReduceScatter](custom_reduce_scatter.md)。普通 AR dtype 范围保持不变；RS 超出 custom 准入后的 FP8 fallback 不因本次扩展自动获得支持。
+
+AG/RS 的 Eager 入口保留相同校验、copy-in 与同步，通过直接分派和逐调用原生 Tensor 描述符构造降低提交开销；`torch.compile` 仍使用已注册算子。两份专用说明提供优化后的完整 size 表及 8192 bytes 两阶段对照。
 
 ## AR + residual + RMSNorm / Gemma
 

@@ -15,6 +15,14 @@ defaultDtypes = {
 
 _8bit_fallback = torch.uint8
 
+# Hygon FP8 formats accepted by collectives. Keep these separate
+# from the architecture-dependent arithmetic dtype and the shared tensor ABI.
+FP8_DTYPES = tuple(
+    getattr(torch, name)
+    for name in ("float8_e4m3fn", "float8_e5m2")
+    if hasattr(torch, name)
+)
+
 
 def get_dtype_fp8():
     return defaultDtypes.get(get_gfx(), {"fp8": _8bit_fallback})["fp8"]

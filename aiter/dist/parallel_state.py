@@ -38,6 +38,7 @@ from torch.distributed import Backend, ProcessGroup
 import os
 from aiter import logger
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.utility.dtypes import FP8_DTYPES
 
 
 def supports_custom_op():
@@ -408,12 +409,12 @@ def fused_qknorm_allreduce_rope_(
 if supports_custom_op():
 
     # @torch.library.custom_op("aiter::outplace_all_gather", mutates_args=[])
-    def outplace_all_gather(input: torch.Tensor, group_name: str) -> torch.Tensor:
+    def outplace_all_gather(input: torch.Tensor, group_name: str, dim: int = 0) -> torch.Tensor:
         assert group_name in _groups, f"Group {group_name} is not found."
         group = _groups[group_name]()
         if group is None:
             raise ValueError(f"Group {group_name} is destroyed.")
-        return group._all_gather_out_place(input)
+        return group._all_gather_out_place(input, dim=dim)
 
 
 class GroupCoordinator:
@@ -864,32 +865,42 @@ class GroupCoordinator:
             emit_bf16=emit_bf16,
         )
 
-    def _all_gather_out_place(self, input_: torch.Tensor) -> torch.Tensor:
+    def _all_gather_out_place(self, input_: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        if not -input_.ndim <= dim < input_.ndim:
+            raise ValueError("invalid all_gather dimension")
+        dim %= input_.ndim
         ca_comm = (
             self.device_communicator.ca_comm
             if self.device_communicator is not None
             else None
         )
         if ca_comm is not None and not ca_comm.disabled:
-            out = ca_comm.custom_all_gather(input_)
+            out = ca_comm.custom_all_gather(input_, dim=dim)
             if out is not None:
                 return out
         # Fallback: ca_comm unavailable (e.g. non-tp custom group).
         # Try pynccl first (graph-safe), then torch.distributed.
-        world_size = self.world_size
-        out_shape = (input_.shape[0] * world_size,) + input_.shape[1:]
-        output_tensor = torch.empty(
-            out_shape, dtype=input_.dtype, device=input_.device
-        )
         if self.device_communicator is not None:
             pynccl_comm = self.device_communicator.pynccl_comm
             if pynccl_comm is not None and not pynccl_comm.disabled:
-                pynccl_comm.all_gather(output_tensor, input_)
-                return output_tensor
-        torch.distributed.all_gather_into_tensor(
-            output_tensor, input_, group=self.device_group
-        )
-        return output_tensor
+                return self._all_gather_fallback(input_, dim, pynccl_comm)
+        return self._all_gather_fallback(input_, dim)
+
+    def _all_gather_fallback(self, input_: torch.Tensor, dim: int, pynccl_comm=None):
+        # RCCL wrappers may not expose FP8 enums. Use the same one-byte storage
+        # for transport and reordering, preserving NaNs and signed zero as bits.
+        transport_input = input_.view(torch.uint8) if input_.dtype in FP8_DTYPES else input_
+        transport_input = transport_input.contiguous()
+        shape = tuple(input_.shape)
+        output = torch.empty((self.world_size,) + shape,
+                             dtype=transport_input.dtype, device=input_.device)
+        if pynccl_comm is not None:
+            pynccl_comm.all_gather(output, transport_input)
+        else:
+            torch.distributed.all_gather_into_tensor(output, transport_input, group=self.device_group)
+        output = output.movedim(0, dim).reshape(
+            shape[:dim] + (self.world_size * shape[dim],) + shape[dim + 1:])
+        return output.view(input_.dtype) if output.dtype != input_.dtype else output
 
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor:
         return outplace_all_gather(input_, group_name=self.unique_name)
@@ -944,25 +955,9 @@ class GroupCoordinator:
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
-        input_size = input_.size()
         if use_custom:
-            output_tensor = outplace_all_gather(input_, group_name=self.unique_name)
-            output_tensor = output_tensor.reshape((world_size,) + input_size)
-        else:
-            # Allocate output tensor.
-            output_tensor = torch.empty(
-                (world_size,) + input_size, dtype=input_.dtype, device=input_.device
-            )
-            # All-gather.
-            torch.distributed.all_gather_into_tensor(
-                output_tensor, input_, group=self.device_group
-            )
-        # Reshape
-        output_tensor = output_tensor.movedim(0, dim)
-        output_tensor = output_tensor.reshape(
-            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
-        )
-        return output_tensor
+            return outplace_all_gather(input_, group_name=self.unique_name, dim=dim)
+        return self._all_gather_fallback(input_, dim)
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1

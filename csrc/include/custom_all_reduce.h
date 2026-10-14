@@ -53,6 +53,10 @@ void reduce_scatter_dim(fptr_t _fa,
                         const aiter_tensor_t& inp, const aiter_tensor_t& out,
                         int64_t m, int64_t n, int64_t k, int64_t split_dim,
                         int64_t reg_ptr, int64_t reg_bytes);
+void reduce_scatter_8bit(fptr_t _fa,
+                         const aiter_tensor_t& inp, const aiter_tensor_t& out,
+                         int64_t m, int64_t n, int64_t k, int64_t split_dim,
+                         int64_t reg_ptr, int64_t reg_bytes, int64_t format);
 void all_gather_reg(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,

@@ -30,7 +30,7 @@ import aiter as ops
 from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.dist.device_communicators.topology import is_fully_connected
 from aiter import logger
-from aiter.utility.dtypes import fp8 as _platform_fp8
+from aiter.utility.dtypes import FP8_DTYPES, fp8 as _platform_fp8
 # gfx936 has no native FP8 conversion. Communication kernels encode E4M3FN
 # in software, so expose a real FP8 tensor rather than interpreting bytes as ints.
 fp8 = torch.float8_e4m3fn if _platform_fp8 == torch.uint8 else _platform_fp8
@@ -804,9 +804,11 @@ class CustomAllreduce:
             return False
         if inp.device != self.device:
             return False
-        if inp.dtype not in (torch.float32, torch.float16, torch.bfloat16, torch.int16, torch.int32, torch.int64):
+        if inp.dtype not in (torch.float32, torch.float16, torch.bfloat16,
+                             torch.int16, torch.int32, torch.int64,
+                             torch.int8, torch.uint8, *FP8_DTYPES):
             return False
-        if inp.numel() == 0 or not inp.is_contiguous():
+        if inp.numel() == 0 or not 1 <= inp.ndim <= 8 or not inp.is_contiguous():
             return False
         if not -inp.ndim <= dim < inp.ndim:
             return False
@@ -916,14 +918,14 @@ class CustomAllreduce:
             return False
         if inp.device != self.device:
             return False
-        if inp.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        if inp.dtype not in (torch.float32, torch.float16, torch.bfloat16, torch.int8, *FP8_DTYPES):
             return False
         if not inp.is_contiguous() or not self._should_custom_ar(
             inp, min(_LEGACY_AR_MAX_SIZE, self.max_size // 2)
         ):
             return False
         ndim = inp.dim()
-        if not -ndim <= dim < ndim or inp.numel() == 0:
+        if not 1 <= ndim <= 8 or not -ndim <= dim < ndim or inp.numel() == 0:
             return False
         dim %= ndim
         if inp.shape[dim] % self.world_size:
@@ -931,6 +933,10 @@ class CustomAllreduce:
         return dim != 0 or inp.numel() % (self.world_size * (16 // inp.element_size())) == 0
 
     def reduce_scatter(self, inp: torch.Tensor, out: torch.Tensor, dim: int = 0, *, registered: bool = False):
+        """SUM into out with matching dtype; INT8 wraps, FP8 rounds once from FP32.
+
+        FP8 uses the tensor's numeric values, without external quantization scales.
+        """
         if not self.should_custom_rs(inp, dim):
             raise ValueError("unsupported reduce_scatter input, dimension or communicator")
         dim %= inp.dim()
@@ -939,15 +945,25 @@ class CustomAllreduce:
         if tuple(out.shape) != tuple(shape) or out.dtype != inp.dtype or out.device != inp.device or not out.is_contiguous():
             raise ValueError("reduce_scatter output must match the contiguous rank shard")
         self._check_disjoint(inp, out)
+        if out.data_ptr() % 16:
+            raise ValueError("reduce_scatter output pointer must be 16-byte aligned")
         if registered and self.transport == "fabric":
             raise ValueError("fabric reduce_scatter requires copy-in mode")
         # DTK graph launches do not guarantee visibility of mutable peer
         # input allocations. Copy-in is graph-safe and preserves the API.
         registered = registered and not ops.ag_rs_requires_copy_in()
+        if registered and inp.data_ptr() % 16:
+            raise ValueError("registered reduce_scatter input pointer must be 16-byte aligned")
         m, n, k, split_dim = self._compute_rs_args(tuple(inp.shape), dim, inp.numel())
         reg = 0 if registered else self._pool["input"].data_ptr
         reg_bytes = 0 if registered else self._pool["input"].max_size
-        ops.reduce_scatter_dim(self._ptr, inp, out, m, n, k, split_dim, reg, reg_bytes)
+        if inp.dtype == torch.int8 or inp.dtype in FP8_DTYPES:
+            formats = {"torch.int8": 0, "torch.float8_e4m3fn": 1,
+                       "torch.float8_e5m2": 3}
+            ops.reduce_scatter_8bit(self._ptr, inp.view(torch.uint8), out.view(torch.uint8),
+                                   m, n, k, split_dim, reg, reg_bytes, formats[str(inp.dtype)])
+        else:
+            ops.reduce_scatter_dim(self._ptr, inp, out, m, n, k, split_dim, reg, reg_bytes)
 
     def custom_reduce_scatter(self, input: torch.Tensor, output: torch.Tensor, dim: int = 0):
         if not self.should_custom_rs(input, dim):
@@ -982,7 +998,8 @@ class CustomAllreduce:
             raise ValueError("unsupported all_gather input or communicator")
         shape = self._allgather_out_shape(inp, dim)
         dim %= inp.dim()
-        view_dtype = self._INT_TO_FP_VIEW.get(inp.dtype, inp.dtype)
+        view_dtype = (torch.uint8 if inp.dtype in (torch.int8, *FP8_DTYPES)
+                      else self._INT_TO_FP_VIEW.get(inp.dtype, inp.dtype))
         native_inp = inp.view(view_dtype) if view_dtype != inp.dtype else inp
         if dim != 0 and native_inp.shape[-1] % (16 // native_inp.element_size()):
             raise ValueError("all_gather last dimension must be 16-byte aligned")
@@ -990,6 +1007,8 @@ class CustomAllreduce:
             out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
         if tuple(out.shape) != shape or out.dtype != inp.dtype or out.device != inp.device or not out.is_contiguous():
             raise ValueError("all_gather output shape, dtype, device or layout mismatch")
+        if out.data_ptr() % 16:
+            raise ValueError("all_gather output pointer must be 16-byte aligned")
         self._check_disjoint(inp, out)
         native_out = out.view(view_dtype) if view_dtype != inp.dtype else out
         return out, native_inp, native_out, dim
@@ -1000,6 +1019,8 @@ class CustomAllreduce:
         if ops.ag_rs_requires_copy_in():
             return self.all_gather_unreg(inp, out=out, dim=dim)
         out, native_inp, native_out, dim = self._all_gather_tensors(inp, out, dim)
+        if native_inp.data_ptr() % 16:
+            raise ValueError("registered all_gather input pointer must be 16-byte aligned")
         ops.all_gather_reg(self._ptr, native_inp, native_out, dim)
         return out
 

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 from typing import List
 
@@ -57,14 +58,22 @@ def reduce_scatter(
 ) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce", develop=True)
+@compile_ops("module_custom_all_reduce", develop=True, tensor_native="reduce_scatter_dim_tensor")
 def reduce_scatter_dim(
     _fa: int, inp: torch.Tensor, out: torch.Tensor,
     m: int, n: int, k: int, split_dim: int, reg_ptr: int, reg_bytes: int,
 ) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce", develop=True)
+@compile_ops("module_custom_all_reduce", develop=True, tensor_native="reduce_scatter_8bit_tensor")
+def reduce_scatter_8bit(
+    _fa: int, inp: torch.Tensor, out: torch.Tensor,
+    m: int, n: int, k: int, split_dim: int, reg_ptr: int, reg_bytes: int,
+    format: int,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True, tensor_native="all_gather_reg_tensor")
 def all_gather_reg(
     _fa: int,
     inp: torch.Tensor,
@@ -73,7 +82,7 @@ def all_gather_reg(
 ) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce", develop=True)
+@compile_ops("module_custom_all_reduce", develop=True, tensor_native="all_gather_unreg_tensor")
 def all_gather_unreg(
     _fa: int,
     inp: torch.Tensor,

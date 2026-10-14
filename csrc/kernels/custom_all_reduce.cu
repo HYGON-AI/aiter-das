@@ -194,6 +194,16 @@ static void _all_gather(fptr_t _fa, void* inp, void* out,
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     switch(dtype)
     {
+    case AITER_DTYPE_i8:
+    case AITER_DTYPE_u8:
+    case AITER_DTYPE_fp8: {
+        // AllGather preserves bits; no FP8 conversion or arithmetic is needed.
+        fa->dispatchAllGather<opus::u8_t>(stream,
+                                        reinterpret_cast<opus::u8_t*>(inp),
+                                        reinterpret_cast<opus::u8_t*>(out),
+                                        size, last_dim_size, gather_dim);
+        break;
+    }
     case AITER_DTYPE_fp32: {
         fa->dispatchAllGather<opus::fp32_t>(stream,
                                      reinterpret_cast<opus::fp32_t*>(inp),
@@ -218,7 +228,7 @@ static void _all_gather(fptr_t _fa, void* inp, void* out,
     }
 #endif
     default:
-        throw std::runtime_error("custom allreduce only supports float32, float16 and bfloat16");
+        throw std::runtime_error("custom allgather supports float32, float16, bfloat16 and 8-bit storage");
     }
 }
 
@@ -588,11 +598,21 @@ void all_reduce(fptr_t _fa,
                 use_new, open_fp8_quant, is_broadcast_reg_outptr);
 }
 
+void reduce_scatter_dim(fptr_t _fa,
+                        const aiter_tensor_t& inp, const aiter_tensor_t& out,
+                        int64_t m, int64_t n, int64_t k, int64_t split_dim,
+                        int64_t reg_ptr, int64_t reg_bytes);
+
 void reduce_scatter(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
                     int64_t reg_ptr, int64_t reg_bytes)
 {
+    if(inp.dtype() == AITER_DTYPE_i8 || inp.dtype() == AITER_DTYPE_fp8)
+    {
+        reduce_scatter_dim(_fa, inp, out, 0, 0, inp.numel(), 0, reg_ptr, reg_bytes);
+        return;
+    }
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto dtype     = inp.dtype();
@@ -614,11 +634,11 @@ void reduce_scatter(fptr_t _fa,
 }
 
 
-// Dimension-aware entry; the legacy reduce_scatter ABI remains unchanged.
-void reduce_scatter_dim(fptr_t _fa,
+// Shared validation/copy-in for the existing and explicit-format entry points.
+static void reduce_scatter_impl(fptr_t _fa,
                         const aiter_tensor_t& inp, const aiter_tensor_t& out,
                         int64_t m, int64_t n, int64_t k, int64_t split_dim,
-                        int64_t reg_ptr, int64_t reg_bytes)
+                        int64_t reg_ptr, int64_t reg_bytes, int format)
 {
     if(!_fa || !inp.is_gpu() || !out.is_gpu())
         throw std::invalid_argument("reduce_scatter requires a live handle and GPU tensors");
@@ -630,6 +650,8 @@ void reduce_scatter_dim(fptr_t _fa,
     if(inp.dtype() != out.dtype() || inp.device_id != out.device_id ||
        !inp.is_contiguous() || !out.is_contiguous())
         throw std::invalid_argument("reduce_scatter requires matching contiguous tensors on one device");
+    if(format >= 0 && ((format != 0 && format != 1 && format != 3) || inp.element_size() != 1))
+        throw std::invalid_argument("invalid 8-bit reduce_scatter format");
     if(inp.numel() == 0 || inp.numel() > INT32_MAX || out.numel() != inp.numel() / world ||
        inp.numel() % world != 0)
         throw std::invalid_argument("reduce_scatter input/output size mismatch");
@@ -649,6 +671,8 @@ void reduce_scatter_dim(fptr_t _fa,
     const int64_t bytes = inp.numel() * inp.element_size();
     const auto input_begin = reinterpret_cast<uintptr_t>(inp.data_ptr());
     const auto output_begin = reinterpret_cast<uintptr_t>(out.data_ptr());
+    if(output_begin % 16 || (!reg_ptr && input_begin % 16) || (reg_ptr && reg_ptr % 16))
+        throw std::invalid_argument("reduce_scatter buffers must be 16-byte aligned");
     if(input_begin < output_begin + out.numel() * out.element_size() &&
        output_begin < input_begin + bytes)
         throw std::invalid_argument("reduce_scatter input and output must not overlap");
@@ -660,6 +684,21 @@ void reduce_scatter_dim(fptr_t _fa,
             throw std::invalid_argument("registered buffer is too small to contain the input");
         HIP_CALL(hipMemcpyAsync(reinterpret_cast<void*>(reg_ptr), input, bytes, hipMemcpyDeviceToDevice, stream));
         input = reinterpret_cast<void*>(reg_ptr);
+    }
+    if(format >= 0)
+    {
+#define RS_FORMAT_CASE(FORMAT) \
+        case FORMAT: fa->dispatchReduceScatter8Bit<FORMAT>(stream, \
+            reinterpret_cast<unsigned char*>(input), reinterpret_cast<unsigned char*>(out.data_ptr()), \
+            inp.numel(), n, k, split_dim); break
+        switch(format)
+        {
+            RS_FORMAT_CASE(0);
+            RS_FORMAT_CASE(1);
+            RS_FORMAT_CASE(3);
+        }
+#undef RS_FORMAT_CASE
+        return;
     }
 #define RS_DIM_CASE(TYPE, ENUM) \
     case ENUM: fa->dispatchReduceScatter<TYPE>(stream, reinterpret_cast<TYPE*>(input), \
@@ -673,6 +712,26 @@ void reduce_scatter_dim(fptr_t _fa,
         default: throw std::invalid_argument("reduce_scatter supports float32, float16 and bfloat16");
     }
 #undef RS_DIM_CASE
+}
+
+void reduce_scatter_dim(fptr_t _fa,
+                        const aiter_tensor_t& inp, const aiter_tensor_t& out,
+                        int64_t m, int64_t n, int64_t k, int64_t split_dim,
+                        int64_t reg_ptr, int64_t reg_bytes)
+{
+    const int format = inp.dtype() == AITER_DTYPE_i8 ? 0 : (inp.dtype() == AITER_DTYPE_fp8 ? 1 : -1);
+    reduce_scatter_impl(_fa, inp, out, m, n, k, split_dim, reg_ptr, reg_bytes, format);
+}
+
+void reduce_scatter_8bit(fptr_t _fa,
+                         const aiter_tensor_t& inp, const aiter_tensor_t& out,
+                         int64_t m, int64_t n, int64_t k, int64_t split_dim,
+                         int64_t reg_ptr, int64_t reg_bytes, int64_t format)
+{
+    if((format != 0 && format != 1 && format != 3) ||
+       inp.dtype() != AITER_DTYPE_u8 || out.dtype() != AITER_DTYPE_u8)
+        throw std::invalid_argument("8-bit reduce_scatter requires uint8 views and format 0, 1 or 3");
+    reduce_scatter_impl(_fa, inp, out, m, n, k, split_dim, reg_ptr, reg_bytes, static_cast<int>(format));
 }
 
 void all_gather_reg(fptr_t _fa,

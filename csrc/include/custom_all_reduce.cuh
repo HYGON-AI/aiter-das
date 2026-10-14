@@ -945,6 +945,120 @@ __global__ void __launch_bounds__(512, 1) allgather_lastdim(RankData* _dp,
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+// 8-bit ReduceScatter uses storage bytes and an explicit arithmetic format.
+// 0: INT8, 1: E4M3FN, 3: E5M2. Other format codes are unsupported.
+// Software conversion deliberately avoids architecture-dependent FP8 aliases.
+template <int Format>
+DINLINE float rs_fp8_decode(unsigned char code)
+{
+    static_assert(Format == 1 || Format == 3, "unsupported Hygon FP8 format");
+    constexpr int mb = Format == 1 ? 3 : 2;
+    constexpr int bias = Format == 1 ? 7 : 15;
+    const int magnitude = code & 127;
+    const int exponent = magnitude >> mb;
+    const int mantissa = magnitude & ((1 << mb) - 1);
+    if constexpr(Format == 1)
+    {
+        if(magnitude == 127) return __builtin_nanf("");
+    }
+    else
+    {
+        if(exponent == 31)
+            return mantissa ? __builtin_nanf("")
+                            : (code & 128 ? -__builtin_inff() : __builtin_inff());
+    }
+    const float value = exponent == 0
+        ? ldexpf(float(mantissa), 1 - bias - mb)
+        : ldexpf(float((1 << mb) + mantissa), exponent - bias - mb);
+    return code & 128 ? -value : value;
+}
+
+template <int Format>
+DINLINE unsigned char rs_fp8_encode(float value)
+{
+    static_assert(Format == 1 || Format == 3, "unsupported Hygon FP8 format");
+    constexpr int mb = Format == 1 ? 3 : 2;
+    constexpr int bias = Format == 1 ? 7 : 15;
+    constexpr int last = Format == 1 ? 126 : 123;
+    const unsigned int bits = __builtin_bit_cast(unsigned int, value);
+    const unsigned char sign = (bits >> 24) & 128;
+    const float magnitude = fabsf(value);
+    if(isnan(value)) return sign | 127;
+    if(isinf(value)) return sign | (Format == 3 ? 124 : 127);
+    // Overflow is non-saturating, independent of framework cast patches. The threshold
+    // is decided after rounding, including ties at the finite range boundary.
+    if(magnitude > ldexpf(1.0f, (last >> mb) - bias + 1))
+        return sign | (Format == 3 ? 124 : 127);
+    int encoded;
+    if(magnitude < ldexpf(1.0f, 1 - bias))
+        encoded = __float2int_rn(ldexpf(magnitude, bias + mb - 1));
+    else
+    {
+        const int exponent = int((bits >> 23) & 255) - 127;
+        encoded = (exponent + bias - 1) * (1 << mb)
+                + __float2int_rn(ldexpf(magnitude, mb - exponent));
+    }
+    if(encoded > last)
+        return sign | (Format == 3 ? 124 : 127);
+    return sign | encoded;
+}
+
+template <int Format, int ngpus, int Pack>
+__global__ void __launch_bounds__(256, 1) reduce_scatter_8bit_kernel(
+    RankData* dp, RankSignals sg, Signal* self_sg, unsigned char* result,
+    int rank, int output_size, int n, int k, int split_dim)
+{
+    using P = opus::vector_t<opus::u8_t, Pack>;
+    using Acc = typename std::conditional<Format == 0, int, float>::type;
+    const P* ptrs[ngpus];
+#pragma unroll
+    for(int source = 0; source < ngpus; ++source)
+        ptrs[source] = reinterpret_cast<const P*>(dp->ptrs[source]);
+    start_sync<ngpus>(sg, self_sg, rank);
+    for(int index = blockIdx.x * blockDim.x + threadIdx.x;
+        index < output_size / Pack; index += blockDim.x * gridDim.x)
+    {
+        const int offset = index * Pack;
+        int load;
+        if(split_dim == 0)
+            load = rank * output_size + offset;
+        else if(split_dim == 1)
+            load = (offset / (k / ngpus)) * k + rank * (k / ngpus) + offset % (k / ngpus);
+        else
+        {
+            const int shard = (n / ngpus) * k;
+            load = (offset / shard) * n * k + rank * shard + offset % shard;
+        }
+        Acc sums[Pack] = {};
+        // Fixed source-rank order keeps the numerical contract independent
+        // of which output shard this device owns.
+#pragma unroll
+        for(int source = 0; source < ngpus; ++source)
+        {
+            const P values = ptrs[source][load / Pack];
+#pragma unroll
+            for(int lane = 0; lane < Pack; ++lane)
+            {
+                if constexpr(Format == 0)
+                    sums[lane] += values[lane] < 128 ? int(values[lane]) : int(values[lane]) - 256;
+                else
+                    sums[lane] += rs_fp8_decode<Format>(values[lane]);
+            }
+        }
+        P output;
+#pragma unroll
+        for(int lane = 0; lane < Pack; ++lane)
+        {
+            if constexpr(Format == 0)
+                output[lane] = static_cast<unsigned char>(sums[lane]);
+            else
+                output[lane] = rs_fp8_encode<Format>(sums[lane]);
+        }
+        reinterpret_cast<P*>(result)[index] = output;
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
 /*
  * reduce_scatter, at first dim
  * range = size / (pack_size * ngpu)
@@ -4406,6 +4520,34 @@ class CustomAllreduce
     }
 #undef REDUCE_CASE
 #undef KL
+}
+
+template <int Format>
+void dispatchReduceScatter8Bit(hipStream_t stream, unsigned char* input,
+                              unsigned char* output, int size, int n, int k, int split_dim)
+{
+    RankData* ptrs = get_buffer_RD(stream, input);
+    const int output_size = size / world_size_;
+    const bool vectorized = split_dim == 0 || (split_dim == 1 ? k % (16 * world_size_) == 0 : k % 16 == 0);
+    const int work = vectorized ? output_size / 16 : output_size;
+    const dim3 block(256), grid(std::min(kMaxBlocks, (work + 255) / 256));
+#define RS_BYTE_LAUNCH(NG) \
+    do { \
+        if(vectorized) \
+            reduce_scatter_8bit_kernel<Format, NG, 16><<<grid, block, 0, stream>>>( \
+                ptrs, sg_, self_sg_, output, rank_, output_size, n, k, split_dim); \
+        else \
+            reduce_scatter_8bit_kernel<Format, NG, 1><<<grid, block, 0, stream>>>( \
+                ptrs, sg_, self_sg_, output, rank_, output_size, n, k, split_dim); \
+    } while(0)
+    switch(world_size_)
+    {
+    case 2: RS_BYTE_LAUNCH(2); break;
+    case 4: RS_BYTE_LAUNCH(4); break;
+    case 8: RS_BYTE_LAUNCH(8); break;
+    default: throw std::invalid_argument("8-bit reduce_scatter supports world sizes 2, 4, 8");
+    }
+#undef RS_BYTE_LAUNCH
 }
 
 template <typename T>

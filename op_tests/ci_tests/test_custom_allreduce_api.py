@@ -45,6 +45,7 @@ def run_collectives(args):
     dist.init_process_group("gloo", timeout=timedelta(seconds=120))
     ca = None
     cases = 0
+    rejected_fp8_checks = 0
     try:
         for register in (False, True):
             ca = CustomAllreduce(dist.group.WORLD, local, max_size=16 * 1024 * 1024,
@@ -81,6 +82,30 @@ def run_collectives(args):
                         torch.testing.assert_close(out, reference.chunk(world, dim=dim)[rank], rtol=0, atol=0, msg=f"RS register={register} dtype={dtype} shape={shape} dim={dim} replay={i} rank={rank}")
                     cases += 1
                     del graph
+            for dtype in (torch.int8, *car.FP8_DTYPES):
+                for shape, dim in [((world * 16, 16), 0), ((16, world * 3), -1),
+                                   ((16, world * 3, 3), 1)]:
+                    base = torch.arange(torch.tensor(shape).prod().item()).reshape(shape) % 7
+                    def rs_value(r, iteration):
+                        return (base + r + iteration + (100 if dtype == torch.int8 else 0)).to(dtype)
+                    def rs_expected(iteration):
+                        acc = sum(rs_value(r, iteration).float() for r in range(world))
+                        return acc.chunk(world, dim)[rank].contiguous().to(dtype).view(torch.uint8)
+                    inp = rs_value(rank, 0).to(local)
+                    out = torch.empty_like(rs_expected(0), device=local).view(dtype)
+                    ca.reduce_scatter(inp, out, dim)
+                    torch.testing.assert_close(out.view(torch.uint8).cpu(), rs_expected(0), rtol=0, atol=0)
+                    with ca.capture():
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            ca.custom_reduce_scatter(inp, out, dim)
+                            inp.view(torch.uint8).fill_(0xA5)
+                    for i in range(args.repeats):
+                        inp.view(torch.uint8).copy_(rs_value(rank, i % 8).view(torch.uint8))
+                        graph.replay()
+                        torch.testing.assert_close(out.view(torch.uint8).cpu(), rs_expected(i % 8), rtol=0, atol=0)
+                    cases += 1
+                    del graph
             for dtype in (torch.float32, torch.float16, torch.bfloat16,
                           torch.int16, torch.int32, torch.int64):
                 for dim in (0, -1):
@@ -107,6 +132,61 @@ def run_collectives(args):
                         torch.testing.assert_close(result, expected, rtol=0, atol=0)
                     cases += 1
                     del graph, result
+            for dtype in (torch.int8, torch.uint8, *car.FP8_DTYPES):
+                for dim in (0, -1):
+                    base = torch.arange(256, device=local).reshape(8, 32)
+                    def rank_bytes(r, i):
+                        return ((base + 37 * r + 19 * i) % 256).to(torch.uint8)
+                    inp = rank_bytes(rank, 0).view(dtype)
+                    expected = torch.cat([rank_bytes(r, 0) for r in range(world)], dim=dim)
+                    out = torch.empty_like(expected).view(dtype)
+                    assert ca.all_gather_unreg(inp, out=out, dim=dim) is out
+                    torch.testing.assert_close(out.view(torch.uint8), expected, rtol=0, atol=0)
+                    with ca.capture():
+                        warm = ca.custom_all_gather(inp, dim)
+                        torch.testing.assert_close(warm.view(torch.uint8), expected, rtol=0, atol=0)
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            result = ca.custom_all_gather(inp, dim)
+                            inp.view(torch.uint8).fill_(0xA5)
+                    for i in range(args.repeats):
+                        inp.view(torch.uint8).copy_(rank_bytes(rank, i))
+                        graph.replay()
+                        expected = torch.cat([rank_bytes(r, i) for r in range(world)], dim=dim)
+                        torch.testing.assert_close(result.view(torch.uint8), expected, rtol=0, atol=0)
+                    cases += 1
+                    del graph, result, warm
+            # Hygon excludes FNUZ, even when Torch exposes these storage dtypes.
+            for name in ("float8_e4m3fnuz", "float8_e5m2fnuz"):
+                dtype = getattr(torch, name, None)
+                if dtype is None:
+                    continue
+                assert dtype not in car.FP8_DTYPES
+                inp = torch.zeros((world * 16, 16), device=local, dtype=torch.uint8).view(dtype)
+                for dim in (0, -1):
+                    rs_shape, ag_shape = list(inp.shape), list(inp.shape)
+                    rs_shape[dim] //= world
+                    ag_shape[dim] *= world
+                    rs_out = torch.full(rs_shape, 0xA5, device=local, dtype=torch.uint8).view(dtype)
+                    ag_out = torch.full(ag_shape, 0xA5, device=local, dtype=torch.uint8).view(dtype)
+                    assert not ca.should_custom_rs(inp, dim)
+                    assert ca.custom_reduce_scatter(inp, rs_out, dim) is None
+                    expect_value_error(lambda: ca.reduce_scatter(inp, rs_out, dim))
+                    assert not ca.should_custom_ag(inp, dim)
+                    assert ca.custom_all_gather(inp, dim) is None
+                    expect_value_error(lambda: ca.all_gather_unreg(inp, out=ag_out, dim=dim))
+                    expect_value_error(lambda: ca.all_gather_reg(inp, out=ag_out, dim=dim))
+                    assert (rs_out.view(torch.uint8) == 0xA5).all().item()
+                    assert (ag_out.view(torch.uint8) == 0xA5).all().item()
+                    rejected_fp8_checks += 1
+            raw_inp = torch.zeros(world * 16, device=local, dtype=torch.uint8)
+            raw_out = torch.full((16,), 0xA5, device=local, dtype=torch.uint8)
+            for removed_format in (2, 4):
+                expect_value_error(lambda: ops.reduce_scatter_8bit(
+                    ca._ptr, raw_inp, raw_out, 0, 0, raw_inp.numel(), 0,
+                    ca._pool['input'].data_ptr, ca._pool['input'].max_size, removed_format))
+                assert (raw_out == 0xA5).all().item()
+                rejected_fp8_checks += 1
             x = torch.ones((world * 2, 64), device=local)
             y = torch.empty((2, 64), device=local)
             assert not ca.should_custom_rs(x, 5)
@@ -143,7 +223,8 @@ def run_collectives(args):
             ca.close()
             ca = None
         print('COMM_SYNC_CONTRACT_PASS ' + json.dumps(dict(rank=rank, world=world,
-              cases=cases, replays=args.repeats, close_repeats=args.close_repeats,
+              cases=cases, rejected_fp8_checks=rejected_fp8_checks,
+              replays=args.repeats, close_repeats=args.close_repeats,
               arch=torch.cuda.get_device_properties(local).gcnArchName,
               transport=args.transport, ag_rs_copy_in=ops.ag_rs_requires_copy_in())), flush=True)
     finally:

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
  
 from packaging import version
 from packaging.version import Version
@@ -84,14 +85,18 @@ NONE_WRAPPED_OP = [
     # "qr_get_handle",
 ]
 
-# These low-level entry points launch short GPU workloads. Keep their torch.library registration for torch.compile, but avoid
-# that dispatcher hop in normal eager execution where it creates an observable
-# inter-launch gap for the one-row case.
+# These low-level entry points launch short GPU workloads. Keep their
+# torch.library registration for torch.compile, but avoid the dispatcher hop
+# (and the dummy tensor for pointer-first APIs) in normal eager execution.
 EAGER_DIRECT_OP = {
     "_paged_mqa_logits_alloc",
     "_paged_mqa_logits_opus",
     "top_k_per_row_prefill",
     "top_k_per_row_decode",
+    "all_gather_unreg",
+    "all_gather_reg",
+    "reduce_scatter_dim",
+    "reduce_scatter_8bit",
 }
 
 

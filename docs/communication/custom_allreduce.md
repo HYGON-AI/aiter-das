@@ -7,7 +7,7 @@ Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 本文是普通CustomAllreduce（CAR）的统一入口，提供当前用法、默认配置、最新性能和精度范围。
 CAR对组内各rank的张量逐元素求SUM，返回同形状、同dtype的新张量，输入保持不变。
-本文覆盖未量化AllReduce；其他接口见[通信接口说明](communication_ops.md)，量化通信见[Quick AllReduce](quick_all_reduce.md)。HCU的PyTorch设备名仍为`cuda`。
+本文覆盖未量化AllReduce；INT8/FP8 的原始位收集见[Custom AllGather](custom_all_gather.md)，数值求和分片见[Custom ReduceScatter](custom_reduce_scatter.md)，其他接口见[通信接口说明](communication_ops.md)，量化通信见[Quick AllReduce](quick_all_reduce.md)。HCU的PyTorch设备名仍为`cuda`。
 
 - [默认配置与自动分派](#默认分派与配置)
 - [接口与输入条件](#接口与输入条件)

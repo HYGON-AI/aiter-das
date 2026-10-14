@@ -674,6 +674,10 @@ namespace py = pybind11;
     m.def("ag_rs_requires_copy_in", &aiter::ag_rs_requires_copy_in); \
     m.def("small_ar_scratch_size", &aiter::small_ar_scratch_size); \
     m.def("configure_small_ar", &aiter::configure_small_ar); \
+    m.def("reduce_scatter_8bit", &aiter::reduce_scatter_8bit, \
+          py::arg("_fa"), py::arg("inp"), py::arg("out"), \
+          py::arg("m"), py::arg("n"), py::arg("k"), py::arg("split_dim"), \
+          py::arg("reg_ptr"), py::arg("reg_bytes"), py::arg("format")); \
     m.def("reduce_scatter_dim", &aiter::reduce_scatter_dim, \
           py::arg("_fa"), py::arg("inp"), py::arg("out"), \
           py::arg("m"), py::arg("n"), py::arg("k"), py::arg("split_dim"), \
