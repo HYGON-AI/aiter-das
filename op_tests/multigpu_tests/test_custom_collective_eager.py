@@ -174,7 +174,14 @@ def main():
         for dtype in (torch.float8_e4m3fnuz, torch.float8_e5m2fnuz):
             bad = torch.empty(16, dtype=dtype, device=device)
             expect_error(lambda: bindings["all_gather_unreg"](0, bad, 0, out, 0, 0, 0))
-        report["bridge_rejections"] = 5
+        bad = torch.empty(256, dtype=torch.float8_e5m2, device=device)
+        bad_out = torch.empty(256 // world, dtype=bad.dtype, device=device)
+        bad_out.view(torch.uint8).fill_(0xA5)
+        for mode in ('baseline', 'final'):
+            select(mode)
+            expect_error(lambda: ops.reduce_scatter_dim(handle, bad, bad_out, 0, 0, bad.numel(), 0, reg, capacity))
+            assert (bad_out.view(torch.uint8) == 0xA5).all().item()
+        report["bridge_rejections"] = 7
     finally:
         guard.EAGER_DIRECT_OP.clear()
         guard.EAGER_DIRECT_OP.update(saved_direct)

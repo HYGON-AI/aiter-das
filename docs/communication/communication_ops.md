@@ -178,7 +178,7 @@ ca.custom_reduce_scatter(rs_input, rs_output, dim=1)
 
 2026-10-14 的 AG 扩展在公开 `all_gather(..., use_custom=True, dim=...)` 入口直接传递首维/末维，避免末维结果的二次重排。FP8 的 PyNccl/c10d 回退以 UINT8 传输后恢复 dtype，包含 `use_custom=False`；详细合同、验证矩阵与性能见 [Custom AllGather](custom_all_gather.md)。
 
-同日追加的 RS 扩展采用真实数值规约：INT8 使用 INT32 累加后模 256 回绕；FP8 使用 FP32 按源 rank 升序累加、最后一次 RNE 转回原格式，非饱和，不接收量化 scale。详情、边界及验证见 [Custom ReduceScatter](custom_reduce_scatter.md)。普通 AR dtype 范围保持不变；RS 超出 custom 准入后的 FP8 fallback 不因本次扩展自动获得支持。
+同日追加的 RS 扩展采用真实数值规约：INT8 使用 INT32 累加后模 256 回绕；FP8 使用 FP32 按源 rank 升序累加、最后一次 RNE 转回原格式，非饱和，不接收量化 scale。详情、边界及验证见 [Custom ReduceScatter](custom_reduce_scatter.md)。普通 AR dtype 范围保持不变；公开 RS 对 custom 拒收的 FP8 明确报错，INT8 保留 RCCL 回退，回退后端缺失或禁用时明确报错。
 
 AG/RS 的 Eager 入口保留相同校验、copy-in 与同步，通过直接分派和逐调用原生 Tensor 描述符构造降低提交开销；`torch.compile` 仍使用已注册算子。两份专用说明提供优化后的完整 size 表及 8192 bytes 两阶段对照。
 

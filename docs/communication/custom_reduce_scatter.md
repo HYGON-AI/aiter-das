@@ -41,13 +41,13 @@ ca.reduce_scatter(x, y, dim)  # writes y, returns None
 
 - 支持 TP2/4/8、首维/中间维/末维和负维度；分片维必须整除 TP，Tensor ABI 最多 8 维。
 - 输入总字节数整除 16；首维分片的每 rank 输出也必须满足 16B 长度对齐。末/中维不能向量化时使用 scalar kernel。
-- 输出连续、shape/dtype/device 匹配、地址 16B 对齐且不与输入重叠。copy-in 可接受连续但地址不对齐的输入。
+- 输出连续、shape/dtype/device 匹配、地址 16B 对齐且不与输入重叠。copy-in 可接受连续但地址不对齐的输入。输出地址检查也适用于既有 FP16/BF16/FP32 和 scalar 路径：不对齐的切片输出现在明确报错，调用者应提供对齐的输出缓冲区。
 - 大小限制沿用 `should_custom_rs`：不超过 `min(_LEGACY_AR_MAX_SIZE, max_size // 2)`，并满足设备、拓扑与通信组准入。
 - `reduce_scatter` 拒绝不支持的输入时抛异常。`custom_reduce_scatter` 拒绝时返回 `None`、不写输出；成功时也返回 `None`，不能用返回值判定是否执行。
 - DTK 下保留 copy-in。`registered=True` 或请求 Graph 注册不表示实际直接注册，必须检查有效注册策略；当前不宣称直接输入注册验证通过。
-- `CudaCommunicator.reduce_scatter` 命中 custom 准入时可使用这些 dtype。超出 custom 准入后的 RCCL fallback 能力需单独核对，当前没有为所有 FP8 fallback 增加数值转换。
+- `CudaCommunicator.reduce_scatter` 命中 custom 准入时可使用这些 dtype。FP8 超出 custom 准入或 custom 通信器不可用时明确抛出 `ValueError`，不执行 RCCL FP8 SUM；FNUZ 始终拒绝。INT8 保留原生 RCCL SUM 回退；回退通信器缺失或已禁用时抛出 `RuntimeError`，不会返回未写入的输出。
 
-底层 `aiter.ops.custom_all_reduce.reduce_scatter` 保持原五参数首维 ABI；`reduce_scatter_dim` 保持维度参数 ABI，增加 INT8/E4M3FN 分派。两种 FP8 的一致支持建议使用类方法；新增内部 `reduce_scatter_8bit` 接收 UINT8 views 和明确格式码（INT8=0、E4M3FN=1、E5M2=3；其他格式码不支持）。UINT8 数值 SUM 不在当前公开支持范围内。
+底层 `aiter.ops.custom_all_reduce.reduce_scatter` 保持原五参数首维 ABI；`reduce_scatter_dim` 保持维度参数 ABI，增加 INT8/E4M3FN 分派。这里的 `AITER_DTYPE_fp8` 仅表示 E4M3FN；直接传入 E5M2 Tensor 会在 launch 前拒绝。E5M2 必须使用类方法，或内部 `reduce_scatter_8bit` 的 UINT8 views 加明确格式码（INT8=0、E4M3FN=1、E5M2=3；其他格式码不支持），不得将 E5M2 存储伪装为 E4M3FN 描述符。UINT8 数值 SUM 不在当前公开支持范围内。
 
 ## 验证与性能复现
 
@@ -61,6 +61,8 @@ torchrun --nnodes=1 --master_addr=127.0.0.1 --master_port=29672 --nproc_per_node
 默认性能 size 为每 rank 的 `256,4096,8192,32768,262144,1048576,4194304` bytes。INT8/FP8 每元素 1 byte，8192 bytes 即 8192 元素，输出为 `8192/TP` 元素。只测该 size 可添加 `--sizes 8192`；正确性包含 `[16,512]` 首维/末维及变化输入 Graph。去掉 `--bench` 可仅检查正确性，无需初始化 RCCL。
 
 专用正确性覆盖支持的 dtype、首/中/末维、向量/标量路径、20 次变化输入 Graph、立即输入复用、全部 65,536 对 INT8/FP8 字节编码、公共 communicator、底层 ABI 与异常准入。
+
+增加 `--check-fallback` 可验证 INT8 溢出和 FP32 的 RCCL 首/中/末维 eager/Graph 回退，以及 FP8 拒收和无可用后端的异常合同；该选项会初始化 RCCL。CI 与专用测试共享独立 FP8 oracle，INT8 参考显式执行 INT32 累加和模 256。
 
 Eager 绑定合同可单独复现（在相同环境运行）：
 

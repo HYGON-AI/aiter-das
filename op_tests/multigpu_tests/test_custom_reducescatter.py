@@ -3,62 +3,19 @@
 
 """8-bit native ReduceScatter: CPU numeric oracle, changing-input Graph, RCCL.
 
-Run via torchrun. Correctness does not initialize RCCL; --bench adds it.
+Run via torchrun. RCCL is initialized by --bench or --check-fallback.
 INT8 uses INT32/modulo-256; FP8 uses ordered FP32 SUM then non-saturating RNE.
 """
 import argparse
 from datetime import timedelta
 import hashlib
-from functools import lru_cache
 import json
 import math
 import os
 from pathlib import Path
 import statistics
 import time
-
-
-@lru_cache(None)
-def fp8_table(dtype):
-    """Independent format oracle, unaffected by patched Torch saturating casts."""
-    name = str(dtype)
-    if name not in ('torch.float8_e4m3fn', 'torch.float8_e5m2'):
-        raise ValueError(f'unsupported Hygon FP8 dtype: {dtype}')
-    mb = 3 if name == 'torch.float8_e4m3fn' else 2
-    bias = 7 if mb == 3 else 15
-    last = 126 if mb == 3 else 123
-    values = []
-    for code in range(256):
-        magnitude = code & 127
-        exponent, mantissa = divmod(magnitude, 1 << mb)
-        if mb == 3 and magnitude == 127:
-            value = float('nan')
-        elif mb == 2 and exponent == 31:
-            value = float('nan') if mantissa else float('inf')
-        else:
-            value = math.ldexp(mantissa if exponent == 0 else (1 << mb) + mantissa,
-                               (1 if exponent == 0 else exponent) - bias - mb)
-        values.append(-value if code & 128 else value)
-    table = torch.tensor(values, dtype=torch.float32)
-    finite = table[:last + 1]
-    # Include the next (overflow) rounding bin, then resolve exact ties to even.
-    next_value = finite[-1] + (finite[-1] - finite[-2])
-    boundaries = (finite + torch.cat((finite[1:], next_value.reshape(1)))) / 2
-    return table, boundaries, last
-
-
-def fp8_encode_oracle(value, dtype):
-    _, boundaries, last = fp8_table(dtype)
-    magnitude = value.abs().contiguous()
-    code = torch.bucketize(magnitude, boundaries)
-    at_tie = magnitude == boundaries[code.clamp(max=last)]
-    code += (at_tie & (code % 2 == 1)).to(code.dtype)
-    sign = torch.signbit(value).to(torch.int64) * 128
-    overflow_code = 124 if dtype == torch.float8_e5m2 else 127
-    encoded = torch.where(code > last, overflow_code, code)
-    encoded |= sign
-    encoded = torch.where(value.isnan(), 127, encoded)
-    return encoded.to(torch.uint8).view(dtype)
+from types import SimpleNamespace
 
 
 def pattern(shape, dtype, rank, iteration=0, pairs=False):
@@ -76,7 +33,7 @@ def reference(shape, dtype, rank, world, dim, iteration=0, pairs=False):
         value = pattern(shape, dtype, source, iteration, pairs)
         acc.add_(value.to(acc.dtype) if dtype == torch.int8 else fp8_table(dtype)[0][value.view(torch.uint8).long()])
     shard = acc.chunk(world, dim=dim)[rank].contiguous()
-    return shard.to(dtype) if dtype == torch.int8 else fp8_encode_oracle(shard, dtype)
+    return int8_wrap(shard) if dtype == torch.int8 else fp8_encode_oracle(shard, dtype)
 
 
 def exact(actual, expected):
@@ -98,10 +55,12 @@ def exact(actual, expected):
     assert not bad.any(), f'byte mismatches={bad.sum().item()} actual={a[bad][:16]} expected={b[bad][:16]}'
 
 
-def expect_error(fn):
+def expect_error(fn, expected=(ValueError, RuntimeError, AssertionError), message=None):
     try:
         fn()
-    except (ValueError, RuntimeError):
+    except expected as exc:
+        if message is not None:
+            assert message in str(exc), str(exc)
         return
     raise AssertionError('expected validation failure')
 
@@ -185,6 +144,30 @@ def correctness(ca, args, rank, world, device):
             cases += 2
         if rank == 0:
             print('RS_DTYPE_PASS', str(dtype), flush=True)
+        # All dtypes share the explicit output alignment contract, including
+        # legacy floats and shapes that would otherwise use scalar kernels.
+        for shape, dim in (((world * 16, 16), 0), ((16, world * 3), -1)):
+            inp = torch.empty(shape, dtype=dtype, device=device)
+            outshape = list(shape)
+            outshape[dim] //= world
+            backing = torch.empty(math.prod(outshape) + 1, dtype=dtype, device=device)
+            bad = backing[1:].reshape(outshape)
+            bad.view(torch.uint8).fill_(0xA5)
+            assert bad.data_ptr() % 16
+            expect_error(lambda: ca.reduce_scatter(inp, bad, dim))
+            expect_error(lambda: ca.custom_reduce_scatter(inp, bad, dim))
+            assert (bad.view(torch.uint8) == 0xA5).all().item()
+            cases += 1
+    # The legacy ABI's fp8 enum denotes E4M3FN only. E5M2 must carry format=3
+    # through the byte-view entry; direct tensors must fail before launch.
+    inp = torch.empty(world * 16, dtype=torch.float8_e5m2, device=device)
+    out = torch.empty(16, dtype=inp.dtype, device=device)
+    out.view(torch.uint8).fill_(0xA5)
+    reg, capacity = ca._pool['input'].data_ptr, ca._pool['input'].max_size
+    expect_error(lambda: ops.reduce_scatter(ca._ptr, inp, out, reg, capacity))
+    expect_error(lambda: ops.reduce_scatter_dim(ca._ptr, inp, out, 0, 0, inp.numel(), 0, reg, capacity))
+    assert (out.view(torch.uint8) == 0xA5).all().item()
+    cases += 2
     for dtype in (torch.uint8, torch.int16, torch.int32, torch.int64):
         inp = torch.zeros(world * 16, dtype=dtype, device=device)
         out = torch.full((16,), 11, dtype=dtype, device=device)
@@ -216,6 +199,73 @@ def correctness(ca, args, rank, world, device):
     assert not ca.should_custom_rs(inp, 1)
     ca.max_size = old
     return cases + 4
+
+
+def fallback_correctness(ca, args, rank, world, device):
+    from aiter.dist.device_communicators.communicator_cuda import CudaCommunicator
+    from aiter.dist.device_communicators.communicator_pynccl import PyNcclCommunicator
+    public = object.__new__(CudaCommunicator)
+    public.world_size, public.ca_comm = world, ca
+    rccl = PyNcclCommunicator(dist.group.WORLD, device)
+    assert not rccl.disabled
+    public.pynccl_comm = rccl
+    checks = 0
+    for dtype in (*FP8_DTYPES, torch.float8_e4m3fnuz, torch.float8_e5m2fnuz):
+        for reason in ('capacity', 'disabled', 'absent', 'alignment', 'ndim'):
+            old_size, old_disabled = ca.max_size, ca.disabled
+            shape = ((world * 3, 5) if reason == 'alignment' else
+                     (world * 16,) + (1,) * 8 if reason == 'ndim' else (world * 16, 16))
+            inp = torch.empty(shape, dtype=dtype, device=device)
+            try:
+                ca.max_size = 16 if reason == 'capacity' else old_size
+                ca.disabled = reason == 'disabled'
+                public.ca_comm = None if reason == 'absent' else ca
+                expect_error(lambda: public.reduce_scatter(inp, 0), ValueError, 'FP8 reduce_scatter')
+                checks += 1
+            finally:
+                ca.max_size, ca.disabled = old_size, old_disabled
+                public.ca_comm = ca
+    public.ca_comm = None
+    for backend in (None, SimpleNamespace(disabled=True)):
+        public.pynccl_comm = backend
+        for dtype in (torch.int8, torch.float16, torch.bfloat16, torch.float32):
+            inp = torch.empty(world * 16, dtype=dtype, device=device)
+            expect_error(lambda: public.reduce_scatter(inp, 0), RuntimeError, 'active RCCL')
+            checks += 1
+    public.pynccl_comm = rccl
+    # Force genuine RCCL fallback on nonaligned byte counts, middle/last dims,
+    # and capacity refusal. Include positive/negative INT8 overflow.
+    for dtype in (torch.int8, torch.float32):
+        for shape, dim in (((world * 3, 5), 0), ((16, world * 3), -1),
+                           ((16, world * 3, 3), 1)):
+            def value(source, iteration):
+                index = torch.arange(math.prod(shape)).reshape(shape)
+                codes = ((index * 37 + source * 19 + iteration * 11) % 256).to(torch.uint8)
+                return codes.view(torch.int8).to(dtype)
+            def wanted(iteration):
+                acc = sum(value(r, iteration).to(torch.int32 if dtype == torch.int8 else dtype)
+                          for r in range(world)).chunk(world, dim)[rank].contiguous()
+                return int8_wrap(acc) if dtype == torch.int8 else acc
+            old_size = ca.max_size
+            ca.max_size = 16
+            public.ca_comm = ca
+            try:
+                inp = value(rank, 0).to(device)
+                assert not ca.should_custom_rs(inp, dim)
+                exact(public.reduce_scatter(inp, dim), wanted(0))
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    out = public.reduce_scatter(inp, dim)
+                    inp.view(torch.uint8).fill_(0xA5)
+                for iteration in range(args.repeats):
+                    inp.copy_(value(rank, iteration))
+                    graph.replay()
+                    exact(out, wanted(iteration))
+                del graph, out
+                checks += 1
+            finally:
+                ca.max_size = old_size
+    return checks
 
 
 def summarize(values):
@@ -307,15 +357,18 @@ def main():
     parser.add_argument('--output', required=True)
     parser.add_argument('--repeats', type=int, default=20)
     parser.add_argument('--bench', action='store_true')
+    parser.add_argument('--check-fallback', action='store_true',
+                        help='also initialize RCCL and check public fallback contracts')
     parser.add_argument('--rounds', type=int, default=9)
     parser.add_argument('--iters', type=int, default=30)
     parser.add_argument('--sizes', default='256,4096,8192,32768,262144,1048576,4194304',
                         help='comma-separated input bytes per rank (INT8/FP8 benchmarks)')
     args = parser.parse_args()
-    global torch, dist, FP8_DTYPES
+    global torch, dist, FP8_DTYPES, fp8_table, fp8_encode_oracle, int8_wrap
     import torch
     import torch.distributed as dist
     from aiter.utility.dtypes import FP8_DTYPES
+    from collective_reference import fp8_table, fp8_encode_oracle, int8_wrap
     from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
     rank, local, world = (int(os.environ[k]) for k in ('RANK', 'LOCAL_RANK', 'WORLD_SIZE'))
     torch.cuda.set_device(local)
@@ -327,6 +380,7 @@ def main():
                   arch=torch.cuda.get_device_properties(local).gcnArchName,
                   effective_registered=ca.enable_register_for_capturing, arguments=vars(args))
     report['cases'] = correctness(ca, args, rank, world, device)
+    report['fallback_checks'] = fallback_correctness(ca, args, rank, world, device) if args.check_fallback else 0
     report['benchmarks'] = benchmark(ca, args, rank, world, device) if args.bench else []
     torch.cuda.synchronize()
     report['native'] = {}

@@ -10,6 +10,7 @@ from torch.distributed import ProcessGroup
 should_nccl_symm_mem_allreduce = False
 from aiter.dist.parallel_state import is_global_first_rank
 from aiter import logger
+from aiter.utility.dtypes import FP8_DTYPES
 from .base_device_communicator import DeviceCommunicatorBase
 
 
@@ -381,8 +382,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
             output = torch.empty(shape, dtype=input_.dtype, device=input_.device)
             self.ca_comm.custom_reduce_scatter(input_, output, dim=dim)
             return output
+        # RCCL FP8 SUM does not implement our ordered FP32 accumulation and
+        # single non-saturating rounding contract. FNUZ is unsupported as well.
+        if input_.dtype in FP8_DTYPES or input_.dtype in (
+            getattr(torch, "float8_e4m3fnuz", None),
+            getattr(torch, "float8_e5m2fnuz", None),
+        ):
+            raise ValueError(
+                "FP8 reduce_scatter requires a supported custom input and an active "
+                "custom communicator; RCCL fallback and FNUZ are unsupported"
+            )
         pynccl_comm = self.pynccl_comm
-        assert pynccl_comm is not None
+        if pynccl_comm is None or pynccl_comm.disabled:
+            raise RuntimeError("reduce_scatter requires an active RCCL fallback communicator")
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()

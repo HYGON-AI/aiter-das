@@ -16,17 +16,21 @@ import sys
 import tempfile
 import time
 from unittest.mock import patch
+from types import SimpleNamespace
 
 
 def load_worker_runtime():
     # Keep --help/--dry-run and launcher checks usable without torch or a GPU.
     global torch, dist, CustomAllreduce, car, ops, native
+    global fp8_table, fp8_encode_oracle, int8_wrap
     import torch
     import torch.distributed as dist
     from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
     from aiter.dist.device_communicators import custom_all_reduce as car
     from aiter.ops import custom_all_reduce as ops
     from aiter.ops import custom_all_reduce as native
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'multigpu_tests'))
+    from collective_reference import fp8_table, fp8_encode_oracle, int8_wrap
 
 
 def expect_value_error(fn):
@@ -38,6 +42,7 @@ def expect_value_error(fn):
 
 
 def run_collectives(args):
+    from aiter.dist.device_communicators.communicator_cuda import CudaCommunicator
     rank = int(os.environ["RANK"])
     local = int(os.environ["LOCAL_RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -46,6 +51,7 @@ def run_collectives(args):
     ca = None
     cases = 0
     rejected_fp8_checks = 0
+    fallback_rejections = 0
     try:
         for register in (False, True):
             ca = CustomAllreduce(dist.group.WORLD, local, max_size=16 * 1024 * 1024,
@@ -89,8 +95,15 @@ def run_collectives(args):
                     def rs_value(r, iteration):
                         return (base + r + iteration + (100 if dtype == torch.int8 else 0)).to(dtype)
                     def rs_expected(iteration):
-                        acc = sum(rs_value(r, iteration).float() for r in range(world))
-                        return acc.chunk(world, dim)[rank].contiguous().to(dtype).view(torch.uint8)
+                        values = [rs_value(r, iteration) for r in range(world)]
+                        if dtype == torch.int8:
+                            acc = sum(v.to(torch.int32) for v in values)
+                            result = int8_wrap(acc.chunk(world, dim)[rank].contiguous())
+                        else:
+                            table = fp8_table(dtype)[0]
+                            acc = sum(table[v.view(torch.uint8).long()] for v in values)
+                            result = fp8_encode_oracle(acc.chunk(world, dim)[rank].contiguous(), dtype)
+                        return result.view(torch.uint8)
                     inp = rs_value(rank, 0).to(local)
                     out = torch.empty_like(rs_expected(0), device=local).view(dtype)
                     ca.reduce_scatter(inp, out, dim)
@@ -187,6 +200,35 @@ def run_collectives(args):
                     ca._pool['input'].data_ptr, ca._pool['input'].max_size, removed_format))
                 assert (raw_out == 0xA5).all().item()
                 rejected_fp8_checks += 1
+            # Unsupported FP8 must fail before RCCL; a disabled fallback must
+            # never cause the public method to return an unwritten output.
+            public = object.__new__(CudaCommunicator)
+            public.world_size, public.ca_comm = world, ca
+            def unexpected_fallback(*unused):
+                raise AssertionError('unsupported fallback reached RCCL')
+            public.pynccl_comm = SimpleNamespace(disabled=False, reduce_scatter=unexpected_fallback)
+            old_size = ca.max_size
+            ca.max_size = 16
+            try:
+                for dtype in (*car.FP8_DTYPES, torch.float8_e4m3fnuz, torch.float8_e5m2fnuz):
+                    inp = torch.empty((world * 16, world * 16), dtype=dtype, device=local)
+                    for dim in (0, -1):
+                        expect_value_error(lambda: public.reduce_scatter(inp, dim))
+                        fallback_rejections += 1
+            finally:
+                ca.max_size = old_size
+            public.ca_comm = None
+            for backend in (None, SimpleNamespace(disabled=True, reduce_scatter=unexpected_fallback)):
+                public.pynccl_comm = backend
+                for dtype in (torch.int8, torch.float16, torch.bfloat16, torch.float32):
+                    inp = torch.empty(world * 16, dtype=dtype, device=local)
+                    try:
+                        public.reduce_scatter(inp, 0)
+                    except RuntimeError as exc:
+                        assert 'active RCCL' in str(exc)
+                    else:
+                        raise AssertionError('inactive fallback must fail')
+                    fallback_rejections += 1
             x = torch.ones((world * 2, 64), device=local)
             y = torch.empty((2, 64), device=local)
             assert not ca.should_custom_rs(x, 5)
@@ -224,6 +266,7 @@ def run_collectives(args):
             ca = None
         print('COMM_SYNC_CONTRACT_PASS ' + json.dumps(dict(rank=rank, world=world,
               cases=cases, rejected_fp8_checks=rejected_fp8_checks,
+              fallback_rejections=fallback_rejections,
               replays=args.repeats, close_repeats=args.close_repeats,
               arch=torch.cuda.get_device_properties(local).gcnArchName,
               transport=args.transport, ag_rs_copy_in=ops.ag_rs_requires_copy_in())), flush=True)
