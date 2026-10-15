@@ -268,6 +268,30 @@ vllm_fused_sigmoid_gating_delta_rule_update(
     bool is_kda);
 
 std::vector<at::Tensor>
+sglang_fused_sigmoid_gating_delta_rule_update(
+    at::Tensor const &A_log,
+    at::Tensor const &a,
+    at::Tensor const &dt_bias,
+    float softplus_beta,
+    float softplus_threshold,
+    at::Tensor const &q,
+    at::Tensor const &k,
+    at::Tensor const &v,
+    at::Tensor const &b,
+    std::optional<at::Tensor> const &initial_state_source,
+    std::optional<at::Tensor> const &initial_state_indices,
+    std::optional<float> const &scale,
+    bool use_qk_l2norm_in_kernel,
+    std::optional<at::Tensor> const &cu_seqlens,
+    bool is_kda,
+    std::optional<float> const &lower_bound,
+    bool disable_state_update,
+    std::optional<at::Tensor> const &intermediate_states_buffer,
+    std::optional<at::Tensor> const &intermediate_state_indices,
+    int64_t cache_steps,
+    std::optional<at::Tensor> const &retrieve_parent_token);
+
+std::vector<at::Tensor>
 aiter_fused_recurrent_gated_delta_rule_packed_decode(
     at::Tensor const &mixed_qkv,
     at::Tensor const &a,

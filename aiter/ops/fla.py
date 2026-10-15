@@ -143,6 +143,32 @@ def _vllm_fused_sigmoid_gating_delta_rule_update(
 ) -> List[torch.Tensor]:
     ...
 
+@compile_ops("module_cpp_api", fc_name="sglang_fused_sigmoid_gating_delta_rule_update")
+def _sglang_fused_sigmoid_gating_delta_rule_update(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    softplus_beta: float,
+    softplus_threshold: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b: torch.Tensor,
+    initial_state_source: Optional[torch.Tensor] = None,
+    initial_state_indices: Optional[torch.Tensor] = None,
+    scale: Optional[float] = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    is_kda: bool = False,
+    lower_bound: Optional[float] = None,
+    disable_state_update: bool = False,
+    intermediate_states_buffer: Optional[torch.Tensor] = None,
+    intermediate_state_indices: Optional[torch.Tensor] = None,
+    cache_steps: int = 0,
+    retrieve_parent_token: Optional[torch.Tensor] = None,
+) -> List[torch.Tensor]:
+    ...
+
 @compile_ops("module_cpp_api", fc_name="aiter_fused_recurrent_gated_delta_rule_packed_decode")
 def _aiter_fused_recurrent_gated_delta_rule_packed_decode(
     mixed_qkv: torch.Tensor,
@@ -326,6 +352,58 @@ def vllm_fused_sigmoid_gating_delta_rule_update(
         is_kda,
     )
     return out, final_state
+
+def sglang_fused_sigmoid_gating_delta_rule_update(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    softplus_beta: float,
+    softplus_threshold: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: Optional[float] = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    is_kda: bool = False,
+    lower_bound: Optional[float] = None,
+    disable_state_update: bool = False,
+    intermediate_states_buffer: Optional[torch.Tensor] = None,
+    intermediate_state_indices: Optional[torch.Tensor] = None,
+    cache_steps: Optional[int] = None,
+    retrieve_parent_token: Optional[torch.Tensor] = None,
+    kernel_cfg: Optional[dict[str, Any]] = None,
+) -> torch.Tensor:
+    """SGLang recurrent fused sigmoid-gating delta-rule update HIP path."""
+    del(kernel_cfg)
+
+    (out,) = _sglang_fused_sigmoid_gating_delta_rule_update(
+        A_log,
+        a,
+        dt_bias,
+        softplus_beta,
+        softplus_threshold,
+        q,
+        k,
+        v,
+        b,
+        initial_state_source,
+        initial_state_indices,
+        scale,
+        use_qk_l2norm_in_kernel,
+        cu_seqlens,
+        is_kda,
+        lower_bound,
+        disable_state_update,
+        intermediate_states_buffer,
+        intermediate_state_indices,
+        0 if cache_steps is None else int(cache_steps),
+        retrieve_parent_token,
+    )
+    return out
 
 def aiter_fused_recurrent_gated_delta_rule_packed_decode(
     mixed_qkv: torch.Tensor,
