@@ -147,6 +147,12 @@ namespace py = pybind11;
       m.def("relu2", &aiter::relu2, "out = relu(x)^2.",                                   \
             py::arg("out"), py::arg("input"));
 
+#define REDUCE_SUM_PYBIND                                                              \
+      m.def("reduce_sum", &aiter::reduce_sum,                                            \
+            "Row-wise reduce-sum along the last dimension.",                             \
+            py::arg("out"), py::arg("input"),                                            \
+            py::arg("waves_per_block") = -1);
+
 #define MOE_C_ACTIVATION_PYBIND                                                        \
       m.def("moe_c_silu_and_mul",                                                      \
             &moe_c_activation_silu_and_mul,                                             \
