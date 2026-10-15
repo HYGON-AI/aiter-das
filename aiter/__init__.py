@@ -73,6 +73,7 @@ from .ops.rope import *
 from .ops.topk import *
 from .ops.kpool_topk import *
 # from .ops.mha import *
+from .ops.triton.mha import flash_attn_func, flash_attn_varlen_func
 from .ops.gradlib import *
 from .ops.mhc import *
 from .ops.grouped_gemm import *

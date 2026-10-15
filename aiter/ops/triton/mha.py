@@ -873,22 +873,44 @@ def _attn_fwd(
 
 
 @functools.lru_cache(maxsize=1024)
-def _get_config(
-    enable_dropout: bool,
-    dtype: torch.dtype,
-):
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_device()
-        _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json"
+def _load_default_config(config_dir: str, device: str):
+    fpath = f"{config_dir}/{device}-MHA-DEFAULT.json"
+    try:
         with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict["default"] = config
+            return json.load(file)
+    except FileNotFoundError:
+        # Tuned files are optional. These are the original baseline launch
+        # parameters; keep a smaller tile for dropout / FP32 register usage.
+        return {
+            "fwd": {
+                "default": {
+                    "BLOCK_M": 128,
+                    "BLOCK_N": 64,
+                    "waves_per_eu": 2,
+                    "num_warps": 4,
+                    "num_ctas": 1,
+                    "num_stages": 1,
+                },
+                "dropout_or_fp32": {
+                    "BLOCK_M": 32,
+                    "BLOCK_N": 32,
+                    "waves_per_eu": 1,
+                    "num_warps": 2,
+                    "num_ctas": 1,
+                    "num_stages": 1,
+                },
+            }
+        }
 
+
+def _get_config(enable_dropout: bool, dtype: torch.dtype):
+    # Include the current device and config directory in the cache key rather
+    # than reusing the first device's config for the lifetime of the process.
+    config = _load_default_config(AITER_TRITON_CONFIGS_PATH, arch_info.get_device())
     if enable_dropout or dtype == torch.float32:
-        return _get_config._config_dict["default"]["fwd"]["dropout_or_fp32"]
+        return config["fwd"]["dropout_or_fp32"]
     else:
-        return _get_config._config_dict["default"]["fwd"]["default"]
+        return config["fwd"]["default"]
 
 
 def _flash_attn_forward(
@@ -1000,27 +1022,6 @@ def _flash_attn_forward(
 
     if config is None:
         config = _get_config(enable_dropout, q.dtype)
-
-    """
-    config = {
-        "BLOCK_M": 128,
-        "BLOCK_N": 64,
-        "waves_per_eu": 2,
-        "num_warps": 4,
-        "num_ctas": 1,
-        "num_stages": 1,
-    }
-    # Dropout significantly increases VGPR usage so use small tiles
-    if enable_dropout or q.dtype == torch.float32:
-        config = {
-            "BLOCK_M": 32,
-            "BLOCK_N": 32,
-            "waves_per_eu": 1,
-            "num_warps": 2,
-            "num_ctas": 1,
-            "num_stages": 1,
-        }
-    """
 
     grid = lambda META: (  # noqa: E731
         batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
