@@ -147,6 +147,7 @@
             "f'{AITER_CSRC_DIR}/fla/fla_api.cpp'",
             "f'{AITER_CSRC_DIR}/fla/chunk_gated_delta_rule_fwd.cu'",
             "f'{AITER_CSRC_DIR}/fla/fused_sigmoid_gating_delta_rule.cu'",
+            "f'{AITER_CSRC_DIR}/fla/sglang_fused_sigmoid_gating_delta_rule.cu'",
             "f'{AITER_CSRC_DIR}/fla/fused_recurrent_gated_delta_rule_packed_decode.cu'",
             "f'{AITER_CSRC_DIR}/fla/chunk_fwd_o.cu'",
             "f'{AITER_CSRC_DIR}/fla/chunk_gated_delta_rule_fwd_kkt_solve.cu'",

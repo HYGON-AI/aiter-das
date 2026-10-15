@@ -621,6 +621,25 @@ namespace py = pybind11;
           py::arg("num_accepted_tokens") = std::nullopt,                                        \
           py::arg("use_qk_l2norm_in_kernel") = false, py::arg("is_kda") = false);               \
                                                                                                 \
+                                                                                                \
+    m.def("sglang_fused_sigmoid_gating_delta_rule_update",                                      \
+          &aiter::native::sglang_fused_sigmoid_gating_delta_rule_update,                        \
+          py::arg("A_log"), py::arg("a"), py::arg("dt_bias"),                                   \
+          py::arg("softplus_beta"), py::arg("softplus_threshold"),                              \
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("b"),                               \
+          py::arg("initial_state_source") = std::nullopt,                                       \
+          py::arg("initial_state_indices") = std::nullopt,                                      \
+          py::arg("scale") = std::nullopt,                                                      \
+          py::arg("use_qk_l2norm_in_kernel") = false,                                           \
+          py::arg("cu_seqlens") = std::nullopt,                                                 \
+          py::arg("is_kda") = false,                                                            \
+          py::arg("lower_bound") = std::nullopt,                                                \
+          py::arg("disable_state_update") = false,                                              \
+          py::arg("intermediate_states_buffer") = std::nullopt,                                 \
+          py::arg("intermediate_state_indices") = std::nullopt,                                 \
+          py::arg("cache_steps") = 0,                                                           \
+          py::arg("retrieve_parent_token") = std::nullopt);                                     \                                                           
+                                                                                                \
     m.def("aiter_fused_recurrent_gated_delta_rule_packed_decode",                               \
           &aiter::native::aiter_fused_recurrent_gated_delta_rule_packed_decode,                 \
           py::arg("mixed_qkv"), py::arg("a"), py::arg("b"), py::arg("A_log"),                   \
