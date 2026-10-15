@@ -150,12 +150,19 @@ class TuneSpec:
             raise ValueError(self.backend_error('asm'))
         return QUANTS[self.quant_type][2] + ("_shuffle" if self.shuffle else "") + ".csv"
 
+    def triton_lookup_kwargs(self, is_bottom=False):
+        """完整运行时查询键；INT4 的 K 仍是逻辑 model_dim，不是打包后的维度。"""
+        return dict(E=self.experts, N=self.inter_dim, K=self.model_dim, top_k=self.topk,
+                    dtype=QUANTS[self.quant_type][1], block_n=self.q_size_n,
+                    block_k=self.q_size_k, is_bottom=is_bottom)
+
     def triton_filenames(self, arch):
-        dtype = QUANTS[self.quant_type][1]
-        name = f"E={self.experts},N={self.inter_dim},arch={arch}"
+        query = self.triton_lookup_kwargs()
+        dtype = query["dtype"]
+        name = f"E={query['E']},N={query['N']},K={query['K']},topk={query['top_k']},arch={arch}"
         if dtype:
             name += f",dtype={dtype}"
-        block = f',block_shape=[{self.q_size_n},{self.q_size_k}]' if self.q_size_n and self.q_size_k else ''
+        block = f",block_shape=[{query['block_n']},{query['block_k']}]" if query['block_n'] and query['block_k'] else ''
         return name + block + ".json", name + ",is_bottom=True" + block + ".json"
 
 

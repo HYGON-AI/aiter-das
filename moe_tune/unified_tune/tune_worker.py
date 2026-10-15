@@ -7,6 +7,7 @@
 import argparse
 import hashlib
 import importlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -56,6 +57,7 @@ def runtime_info(device):
         bolt_root = Path(boltops.__file__).resolve().parent
         bolt_info.update(boltops=str(Path(boltops.__file__).resolve()), capability=cap.version,
             compiler_options=sorted(cap.compiler_options), backend=cap.backend,
+            triton_k_topk_lookup={"K", "top_k"}.issubset(inspect.signature(configs.get_moe_configs).parameters),
             triton_config_dir=str(get_triton_config_dir(configs._TRITON_CONFIGS_DIR, cap)))
     except Exception as exc:
         # Keep the environment report available even when a dependency is missing.
@@ -77,6 +79,39 @@ def runtime_info(device):
         sources=sources)
 
 
+def check_triton_configs(spec, workdir, runtime, *, installed=False):
+    """用同一完整查询键检查产物或实际安装配置；安装文件允许合并额外 token。"""
+    import boltops.fused_moe.triton.moe_config_utils as cu
+    from boltops.utility.triton_capability import get_triton_capabilities, get_triton_config_dir
+
+    directory = get_triton_config_dir(workdir, get_triton_capabilities())
+    cu.get_moe_configs.cache_clear()
+    hits, expected_pair = [], []
+    for bottom, filename in enumerate(spec.triton_filenames(runtime["arch"])):
+        source = directory / filename
+        expected = {int(k): v for k, v in json.loads(source.read_text()).items()}
+        if set(expected) != set(spec.tokens):
+            raise RuntimeError(f"config artifact tokens do not match request: {source}")
+        query = spec.triton_lookup_kwargs(is_bottom=bool(bottom))
+        actual = cu.get_moe_configs(**query)
+        if actual is None or any(actual.get(m) != expected[m] for m in spec.tokens):
+            raise RuntimeError(f"config lookup does not match generated artifact: {source}; query={query}")
+        if not installed and set(actual) != set(spec.tokens):
+            raise RuntimeError(f"config lookup contains unexpected tokens: {source}")
+        target = Path(runtime["triton_config_dir"]) / filename if installed else source
+        hits.append(dict(path=str(target), sha256=sha256(target), query=query))
+        expected_pair.append(expected)
+    return hits, expected_pair
+
+
+def verify_install(spec, backend, workdir, runtime):
+    """在新进程中使用系统 BoltOPs 默认配置根检查安装结果，不重定向到调优目录。"""
+    if backend != "triton":
+        raise ValueError("installed config lookup check is for Triton")
+    hits, _ = check_triton_configs(spec, workdir, runtime, installed=True)
+    return dict(status="passed", hits=hits)
+
+
 def replay(spec, backend, workdir, options, runtime):
     import torch
     from unified_tune.backends.common import make_data, reference, check, get_config, public_call, benchmark
@@ -92,18 +127,8 @@ def replay(spec, backend, workdir, options, runtime):
             hits.append(dict(path=str(path), sha256=sha256(path)))
         else:
             import boltops.fused_moe.triton.moe_config_utils as cu
-            from boltops.utility.triton_capability import get_triton_capabilities, get_triton_config_dir
             stack.enter_context(patch.object(cu, "_TRITON_CONFIGS_DIR", workdir))
-            cu.get_moe_configs.cache_clear()
-            directory = get_triton_config_dir(workdir, get_triton_capabilities())
-            for bottom, filename in enumerate(spec.triton_filenames(runtime["arch"])):
-                path = directory / filename
-                expected = {int(k): v for k, v in json.loads(path.read_text()).items()}
-                expected_pair.append(expected)
-                actual = cu.get_moe_configs(spec.experts, spec.inter_dim, QUANTS[spec.quant_type][1], spec.q_size_n, spec.q_size_k, bool(bottom))
-                if actual != expected or set(actual) != set(spec.tokens):
-                    raise RuntimeError(f"config lookup does not match generated artifact: {path}")
-                hits.append(dict(path=str(path), sha256=sha256(path)))
+            hits, expected_pair = check_triton_configs(spec, workdir, runtime)
         for m in spec.tokens:
             log_shape_progress(spec, m, backend, options.get("progress"), stage="VALIDATE")
             data = make_data(spec, m); ref = reference(spec, data)
@@ -180,6 +205,9 @@ def main():
             if info.get('boltops_error'):
                 raise RuntimeError("The current AITER MoE runtime requires BoltOPs, including ASM's imported helpers: "
                                    + info['boltops_error'])
+            if request["backend"] == "triton" and not info["triton_k_topk_lookup"]:
+                raise RuntimeError("Installed BoltOPs get_moe_configs does not support K/top_k; "
+                                   "install a BoltOPs version with K/topk config selectors before tuning")
             if action == "tune":
                 module = importlib.import_module(f"unified_tune.backends.{request['backend']}_backend")
                 result = module.tune(spec, workdir, dict(request["options"], progress=request.get("progress")), info)
@@ -187,6 +215,8 @@ def main():
             elif action == "validate":
                 result = replay(spec, request["backend"], workdir,
                                 dict(request["options"], progress=request.get("progress")), info)
+            elif action == "verify_install":
+                result = verify_install(spec, request["backend"], workdir, info)
             else:
                 raise ValueError(f"unknown action {action}")
             result["runtime"] = info
