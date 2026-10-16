@@ -25,6 +25,17 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_activation_eager": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/gelu_and_mul_eager.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": ["'-fno-gpu-flush-denormals-to-zero'"],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_custom": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/custom_pybind.cu'",
