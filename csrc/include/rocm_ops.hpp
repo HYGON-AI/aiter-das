@@ -152,7 +152,8 @@ namespace py = pybind11;
             &moe_c_activation_silu_and_mul,                                             \
             py::arg("out"), py::arg("input"),                                          \
             py::arg("rows_per_block") = 1,                                             \
-            py::arg("vec_size") = 2);                                                   \
+            py::arg("vec_size") = 2,                                                   \
+            py::arg("limit") = py::none());                                            \
       m.def("moe_c_gelu_and_mul",                                                      \
             &moe_c_activation_gelu_and_mul,                                             \
             py::arg("out"), py::arg("input"),                                          \

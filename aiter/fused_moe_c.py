@@ -4312,8 +4312,9 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                                 block_shape=block_shape,
                                 real_size_k=fp8_original_k if use_fp8_w8a8 else None)
 
-        if activation == "silu" :
-                moe_c_silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+        if activation == "silu" and is_gated and gemm1_alpha is None:
+            moe_c_silu_and_mul(
+                intermediate_cache2, intermediate_cache1.view(-1, N), limit=gemm1_limit)
 
         elif activation == "situ":
                 moe_c_situ_glu(
