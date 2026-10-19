@@ -754,7 +754,7 @@
         "hipify": "True",
         "blob_gen_cmd": "''"
     },
-    "module_prefer_hipcc": {
+    "module_topk_per_row": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/topk_per_row_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/topk_per_row.cu'"
@@ -762,13 +762,15 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "module_vgpr_compiler_flag(module_name)",
-            "'-mllvm -enable-post-misched=1'"
+            "'-mllvm -enable-post-misched=1'",
+            "'-mllvm -unroll-runtime=true'",
+            "'-mllvm -amdgpu-atomic-optimizer-strategy=None'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
         "hipify": "True",
-        "prefer_hipcc": true,
+        "prefer_hipcc": false,
         "blob_gen_cmd": "''"
     },
     "module_topk_transform": {

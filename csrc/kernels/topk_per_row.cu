@@ -601,10 +601,17 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
       for (int i = threadIdx.x; i < smemFinalDstIdx[0];
            i += kNumThreadsPerBlock) {
         int outIndex = 0;
-        auto logit = smemFinal.items.logits[i];
+        // Match the histogram's descending float order. The candidate slot
+        // makes keys unique even when values tie, so output slots cannot collide.
+        auto makeKey = [](float value, uint32_t slot) {
+          uint32_t bits = __float_as_uint(value);
+          bits = (bits & 0x80000000u) ? bits : (~bits & 0x7fffffffu);
+          return (static_cast<uint64_t>(bits) << 32) | slot;
+        };
+        auto key = makeKey(smemFinal.items.logits[i], i);
         for (int j = 0; j < smemFinalDstIdx[0]; j++) {
-          auto otherLogit = smemFinal.items.logits[j];
-          if (logit < otherLogit) {
+          auto otherKey = makeKey(smemFinal.items.logits[j], j);
+          if (otherKey < key) {
             outIndex++;
           }
         }

@@ -11,7 +11,7 @@ from ..jit.core import compile_ops
 TOPK = 2048
 
 
-@compile_ops("module_prefer_hipcc")
+@compile_ops("module_topk_per_row")
 def top_k_per_row_prefill(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -25,7 +25,7 @@ def top_k_per_row_prefill(
     pass
 
 
-@compile_ops("module_prefer_hipcc")
+@compile_ops("module_topk_per_row")
 def top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
