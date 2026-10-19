@@ -15,7 +15,8 @@ from unified_tune.tune_spec import QUANTS, read_specs
 
 def make_parser():
     parser = argparse.ArgumentParser(description="Tune AITER ASM and/or BoltOPs Triton MoE configs")
-    parser.add_argument("--backend", choices=("asm", "triton", "both"), default="both")
+    parser.add_argument("--backend", choices=("asm", "triton", "both", "route"), default="both",
+                        help="route: time asm, triton and moe_c, then write the backend-selection table")
     parser.add_argument("--input-file", "--input_file")
     parser.add_argument("--tokens", help="exact comma-separated M values; default: documented token grid")
     for flag in ("inter-dim", "model-dim", "experts", "topk"):
@@ -55,13 +56,17 @@ def main(argv=None):
         if args.replace_existing_configs and not args.install_configs:
             raise ValueError("--replace-existing-configs requires --install-configs")
         specs = read_specs(args)
-        backends = ["asm", "triton"] if args.backend == "both" else [args.backend]
+        backends = (["asm", "triton"] if args.backend == "both"
+                    else ["asm", "triton", "moe_c"] if args.backend == "route"
+                    else [args.backend])
         if args.dry_run:
             print(json.dumps({"dry_run": True, "search": args.search, "device": args.device,
                 "output_dir": str(args.output_dir.resolve()), "install_configs": args.install_configs,
                 "jobs": [{"case_id": s.case_id, "spec": s.to_dict(), "backend": b,
                           'backend_error': s.backend_error(b),
-                          "files": [] if s.backend_error(b) else [s.asm_filename()] if b == "asm" else s.triton_filenames("<detected-arch>")}
+                          "files": ([] if s.backend_error(b) or b == "moe_c"
+                                    else [s.asm_filename()] if b == "asm"
+                                    else s.triton_filenames("<detected-arch>"))}
                          for s in specs for b in backends]}, indent=2))
             return 0
         from unified_tune.tune_pipeline import run

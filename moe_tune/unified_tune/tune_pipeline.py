@@ -13,11 +13,51 @@ import sys
 import time
 import uuid
 
+from . import route_table
 from .tune_artifacts import exclusive_lock, install, resume_valid, validate_files, write_json
 from .tune_spec import digest, log_shape_progress
 
 WORKER = Path(__file__).with_name("tune_worker.py")
 ROOT = WORKER.parents[2]
+_INDTYPE = {"fp16": "torch.float16", "bf16": "torch.bfloat16"}
+
+
+def _resume_ok(args, backend, previous, fingerprint):
+    """moe_c emits no artifact files (resume_valid needs hashes), but its
+    timing manifest alone is a legitimate resume point (4.3)."""
+    if not args.resume:
+        return False
+    if previous.get("fingerprint") != fingerprint:
+        return False
+    if backend == "moe_c":
+        return previous.get("status") in ("validated", "installed")
+    return resume_valid(previous, fingerprint)
+
+
+def _tuned_tokens(manifest, backend):
+    """Tokens this backend tuned successfully."""
+    tuning = (manifest or {}).get("tuning") or {}
+    if backend == "asm":
+        return {int(c["token"]) for c in tuning.get("cases", [])
+                if (c.get("best") or {}).get("median_us")}
+    if backend == "triton":
+        return {int(c["token"]) for c in tuning.get("cases", []) if c.get("gemm_sum_ms")}
+    return {int(token) for token in (tuning.get("timings") or {})}
+
+
+def _token_timings(manifest, backend):
+    """Per-token timings (us) that are comparable across backends: the CUDA graph
+    median of the full public call, measured during validation. Tuning-time
+    numbers are not used because they cover different work per backend (for
+    example, triton's autotune time is the sum of its two GEMMs only). Tokens that
+    were not tuned or have no validation timing are left out."""
+    validation = (manifest or {}).get("validation") or {}
+    measured = {}
+    for case in validation.get("cases", []):
+        median = (case.get("graph_end_to_end") or {}).get("median_us")
+        if median:
+            measured[int(case["token"])] = float(median)
+    return {t: measured[t] for t in _tuned_tokens(manifest, backend) if t in measured}
 
 
 def _forward_shape_progress(stream):
@@ -85,6 +125,40 @@ def execute_worker(request, request_path, result_path, log_path, timeout):
     return result
 
 
+def _write_route_table(root, specs, runtime, backends, manifests, *, args, failures):
+    """route mode (moe_c in backends): per spec & token pick the
+    fastest eligible backend, emit tuned_fused_moe_route.csv under the run
+    dir and (with --install-configs) merge-install into route_config_dir.
+    All backends are compared on the validation-time CUDA graph median of the
+    full public call (see _token_timings)."""
+    if "moe_c" not in backends:
+        return None
+    rows = []
+    for spec in specs:
+        per = {b: _token_timings(manifests.get((spec.case_id, b)), b) for b in backends}
+        tokens = sorted(set().union(*[set(v) for v in per.values() if v]) if any(per.values()) else [])
+        for token in tokens:
+            cand = sorted((us, b) for b, m in per.items() for t, us in m.items() if t == token)
+            if not cand:
+                continue
+            us, backend = cand[0]
+            rows.append(dict(arch=runtime["arch"], quant_type=spec.quant_type,
+                             indtype=_INDTYPE[spec.dtype], inter_dim=spec.inter_dim,
+                             model_dim=spec.model_dim, expert=spec.experts, topk=spec.topk,
+                             q_size_n=spec.q_size_n, q_size_k=spec.q_size_k,
+                             token=token, backend=backend, time_us=round(us, 3)))
+    out_dir = root / "route"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / route_table.ROUTE_FILENAME
+    target.write_bytes(route_table.merge_route_csv(
+        target.read_bytes() if target.exists() else None, route_table.write_route_csv(rows)))
+    installed = None
+    if args.install_configs and rows:
+        installed = route_table.install_route([target], runtime)
+    return dict(file=str(target), rows=len(rows), installed=bool(installed),
+                eligible_backends=backends)
+
+
 def run(args, specs, backends):
     root = args.output_dir.resolve(); root.mkdir(parents=True, exist_ok=True)
     options = {k: getattr(args, k) for k in ("device", "search", "warmup", "iterations")}
@@ -94,6 +168,7 @@ def run(args, specs, backends):
                            probe_dir / "probe.json", probe_dir / "probe.log", args.timeout)
     runtime = probe["runtime"]
     failures = []
+    manifests = {}
     shape_total = sum(len(spec.tokens) for spec in specs)
     shape_offset = 0
     for spec in specs:
@@ -112,7 +187,7 @@ def run(args, specs, backends):
                 manifest = dict(fingerprint=fingerprint, spec=spec.to_dict(), backend=backend,
                                 options=options, runtime=runtime, status="pending")
                 try:
-                    if args.resume and resume_valid(previous, fingerprint):
+                    if _resume_ok(args, backend, previous, fingerprint):
                         manifest = previous
                         files = list(manifest["artifact_hashes"])
                         for m in spec.tokens:
@@ -129,13 +204,18 @@ def run(args, specs, backends):
                         tuned = execute_worker(dict(request, action="tune"), directory / "tune_request.json",
                             directory / "tune_result.json", directory / "tune.log", args.timeout)
                         files = tuned["files"]
-                        hashes = validate_files(spec, backend, files, runtime["arch"])
-                        validation = execute_worker(dict(request, action="validate"), directory / "validate_request.json",
+                        hashes = ({} if backend == "moe_c"
+                                  else validate_files(spec, backend, files, runtime["arch"]))
+                        validate_request = dict(request, action="validate")
+                        if "moe_c" in backends:
+                            validate_request["options"] = dict(request["options"],
+                                                                fused_moe_readback=True)
+                        validation = execute_worker(validate_request, directory / "validate_request.json",
                             directory / "validation.json", directory / "validation.log", args.timeout)
                         manifest.update(status="validated", artifact_hashes=hashes, tuning=tuned,
                                         validation=validation, wall_seconds=time.monotonic() - started)
                         write_json(manifest_path, manifest)
-                    if args.install_configs:
+                    if args.install_configs and backend != "moe_c":
                         validate_files(spec, backend, files, runtime["arch"])
                         manifest["status"] = "validated"
                         manifest.pop("installation_error", None)
@@ -151,6 +231,7 @@ def run(args, specs, backends):
                                 directory / "install_check.log", args.timeout)
                         manifest["status"] = "installed"
                         write_json(manifest_path, manifest)
+                    manifests[(spec.case_id, backend)] = manifest
                     print(f"PASS {backend}: {manifest_path}", flush=True)
                 except (Exception, KeyboardInterrupt) as exc:
                     if manifest.get("status") in ("validated", "installed"):
@@ -164,6 +245,9 @@ def run(args, specs, backends):
                     print(f"FAIL {backend}: {exc}", file=sys.stderr, flush=True)
                     if isinstance(exc, KeyboardInterrupt): raise
         shape_offset += len(spec.tokens)
+    route_summary = _write_route_table(root, specs, runtime, backends, manifests,
+                                       args=args, failures=failures)
     write_json(probe_dir / "run_result.json", dict(status="failed" if failures else "passed", failures=failures,
-                                                  output_dir=str(root), backends=backends))
+                                                  output_dir=str(root), backends=backends,
+                                                  route=route_summary))
     return 1 if failures else 0
