@@ -3,6 +3,8 @@
 """Correctness + bandwidth / W-tune for aiter.reduce_sum."""
 
 import argparse
+import os
+from typing import Optional
 
 import pandas as pd
 import torch
@@ -10,6 +12,27 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.test_common import benchmark, checkAllclose, run_perftest
+
+
+def _on_perf_model() -> bool:
+    """PerfModel: torch profiler often yields empty device rows → us=0."""
+    return os.getenv("GPU_CHIP", "").strip().lower() in {"nmz", "sb", "bw"}
+
+
+def _detect_arch() -> str:
+    """Mirror csrc detect_reduce_sum_arch (GPU_ARCHS / GPU_CHIP first)."""
+    archs = os.getenv("GPU_ARCHS", "").strip().lower()
+    if "gfx946" in archs:
+        return "gfx946"
+    if "gfx938" in archs or "gfx936" in archs:
+        return "gfx938"
+    chip = os.getenv("GPU_CHIP", "").strip().lower()
+    if chip == "sb":
+        return "gfx946"
+    if chip in {"nmz", "bw"}:
+        return "gfx938"
+    return "gfx938"
+
 
 FULL_BATCH = [
     1024,
@@ -27,16 +50,28 @@ FULL_DIM = [1024, 2048, 4096]
 W_CANDIDATES = [1, 2, 4, 8, 16]
 
 
-def pick_waves_per_block(batch: int, dim: int, override_w: int = -1) -> int:
-    """Mirror of csrc/kernels/reduce_sum_kernels.cu pick_waves_per_block."""
+def pick_waves_per_block(
+    batch: int, dim: int, override_w: int = -1, arch: Optional[str] = None
+) -> int:
+    """Mirror of csrc pick_waves_per_block_gfx938 / _gfx946."""
     if override_w > 0:
         return override_w
-    if dim <= 1024:
-        w = 4
-    elif dim <= 2048:
-        w = 8 if batch >= 131072 else 2
+    arch = arch or _detect_arch()
+    if arch == "gfx946":
+        # Provisional — replace after overnight tune.
+        if dim <= 1024:
+            w = 8 if batch >= 65536 else 4
+        elif dim <= 2048:
+            w = 8 if batch >= 131072 else 4
+        else:
+            w = 4 if batch >= 131072 else 2
     else:
-        w = 1
+        if dim <= 1024:
+            w = 4
+        elif dim <= 2048:
+            w = 8 if batch >= 131072 else 2
+        else:
+            w = 1
     return max(1, min(w, batch))
 
 
@@ -74,8 +109,15 @@ def test_reduce_sum(batch, dim, dtype, waves_per_block=-1, check=True):
 
     bytes_moved = input.nbytes + out.nbytes
     # Large tensors: Event timing to avoid rotate OOM / huge deepcopy.
-    if batch * dim * input.element_size() > 64 * 1024 * 1024:
-        us = bench_event_us(lambda: aiter.reduce_sum(out, input, waves_per_block))
+    # PerfModel: run_perftest/profiler post-process often has no CUDA rows → us=0.
+    if _on_perf_model() or batch * dim * input.element_size() > 64 * 1024 * 1024:
+        # Fewer iters on PMD: each launch is simulated and can be very slow.
+        warmup, iters = (2, 5) if _on_perf_model() else (10, 50)
+        us = bench_event_us(
+            lambda: aiter.reduce_sum(out, input, waves_per_block),
+            warmup=warmup,
+            iters=iters,
+        )
     else:
         _, us = run_perftest(
             aiter.reduce_sum,
@@ -86,10 +128,12 @@ def test_reduce_sum(batch, dim, dtype, waves_per_block=-1, check=True):
             num_warmup=5,
         )
 
+    arch = _detect_arch()
+    ret["arch"] = arch
     ret["us"] = us
     ret["TB/s"] = bytes_moved / us / 1e6 if us > 0 else 0.0
     ret["err"] = err
-    ret["W"] = pick_waves_per_block(batch, dim, waves_per_block)
+    ret["W"] = pick_waves_per_block(batch, dim, waves_per_block, arch)
     return ret
 
 
