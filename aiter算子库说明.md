@@ -1161,6 +1161,60 @@ aiter.per_token_group_quant_fp8(out_q, x, out_s, group_size, eps, use_ue8m0)
 return out_q, out_s
 ```
 
+## 6\.2 blockwise\_scaled\_cast\_transpose
+
+### 功能描述
+
+FP8/INT8 blockwise 量化数据准备算子：对连续输入 `[M, K]` 按 `1×128`（rowwise）/ `128×1`（columnwise）分块计算 amax → scale，将输入量化为 INT8 或 FP8（e4m3/e5m2），可选同时产出**转置输出**（columnwise GEMM\_READY 布局）与 **COMPACT 布局**（all-gather 就绪）。单次调用产出双布局双 scale，等价于 TransformerEngine 的 blockwise scaled cast + transpose 复合操作。
+
+由原实现（origin）移植至 aiter 并完成性能优化（编译器基座对齐 + gfx938 fp8 硬件 packed 转换），全集 event 几何平均 ≈0.94（优于 origin），36 数值组 + 异常契约 6/6 全部 atol=0 PASS。完整接口契约、实现要点与性能数据见 [blockwise\_scaled\_cast\_transpose 算子说明与性能报告](docs/blockwise_scaling_cast_transpose.md)。
+
+### 参数说明
+
+| 参数 | 类型/默认值 | 说明 |
+| --- | --- | --- |
+| `input` | `torch.Tensor` `[M, K]`，连续 | 输入激活；dtype ∈ {fp32, fp16, bf16} |
+| `output` | `Optional[Tensor]` `[M, K]` | 输出：rowwise 量化结果；`rowwise=True` 时必填；dtype ∈ {int8, float8\_e4m3fn, float8\_e5m2} |
+| `scale_inv` | `Optional[Tensor]` `[M, ceil(K/128)]` | 输出：rowwise 反量化 scale（fp32） |
+| `output_t` | `Optional[Tensor]` `[K, M]` | 输出：columnwise 量化结果（GEMM\_READY 为转置布局）；`columnwise=True` 时必填 |
+| `scale_inv_t` | `Optional[Tensor]` `[ceil(M/128), K]` | 输出：columnwise 反量化 scale |
+| `block_len` | `int` | 量化块长，仅支持 128 |
+| `block_scaling_dim` | `int` | 量化维度，仅支持 1 |
+| `rowwise` / `columnwise` | `bool` | 是否计算 rowwise / columnwise 输出 |
+| `epsilon` | `float` | amax 下限保护（防全零块 scale=0） |
+| `pow2_scale` | `bool` | scale 是否对齐到 2 的幂 |
+| `all_gather_usage` | `bool` | columnwise 输出布局：`True`=COMPACT（all-gather 就绪），`False`=GEMM\_READY |
+| `out_dtype` | `torch.dtype` | 量化输出类型：`torch.int8` / `torch.float8_e4m3fn` / `torch.float8_e5m2` |
+| 返回值 | `None` | 输出原地写入，无返回张量 |
+
+### 调用示例
+
+```Python
+import torch
+import aiter
+
+M, K = 4096, 4096
+x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+out_row = torch.empty(M, K, device="cuda", dtype=torch.float8_e4m3fn)
+scale_inv_row = torch.empty(M, K // 128, device="cuda", dtype=torch.float32)
+out_col = torch.empty(K, M, device="cuda", dtype=torch.float8_e4m3fn)
+scale_inv_col = torch.empty(K // 128, M, device="cuda", dtype=torch.float32)
+
+aiter.blockwise_scaled_cast_transpose(
+    x, out_row, scale_inv_row, out_col, scale_inv_col,
+    block_len=128, block_scaling_dim=1,
+    rowwise=True, columnwise=True,
+    epsilon=1e-10, pow2_scale=True,
+    all_gather_usage=False, out_dtype=torch.float8_e4m3fn,
+)
+```
+
+### 注意事项
+
+1. 首次调用触发 `module_blockwise_scaling` JIT 编译，性能计时前应先预热；修改 csrc 后必须 `AITER_REBUILD=1` 显式重编。
+2. `output`/`scale_inv` 的有无必须与 `rowwise` 一致、`output_t`/`scale_inv_t` 与 `columnwise` 一致，`block_len` 仅支持 128；违反契约直接抛 `RuntimeError`（fail-fast，非静默回退）。
+3. 所有张量须在同一 HIP 设备且连续；边界 case（block\_len 非法、dtype 不一致、flag mismatch、非连续输入）由测试 exc 组覆盖。
+
 # 7\. MQA
 
 ## 7\.1 mqa_logits

@@ -15,6 +15,14 @@ defaultDtypes = {
 
 _8bit_fallback = torch.uint8
 
+# Hygon FP8 formats accepted by collectives. Keep these separate
+# from the architecture-dependent arithmetic dtype and the shared tensor ABI.
+FP8_DTYPES = tuple(
+    getattr(torch, name)
+    for name in ("float8_e4m3fn", "float8_e5m2")
+    if hasattr(torch, name)
+)
+
 
 def get_dtype_fp8():
     return defaultDtypes.get(get_gfx(), {"fp8": _8bit_fallback})["fp8"]
@@ -54,6 +62,10 @@ d_dtypes = {
 
 # Map torch dtype → AiterDtype integer id (built from aiter_enum.h at import time)
 _torch_to_aiter_dtype = {d_dtypes[name]: idx for name, idx in aiter_dtypes.items() if name in d_dtypes}
+
+# The tensor ABI describes storage independently of native instruction support.
+# Communication epilogues may produce E4M3FN with software conversion on gfx936.
+_torch_to_aiter_dtype[torch.float8_e4m3fn] = aiter_dtypes["fp8"]
 
 
 def torch_to_aiter_pybind(tensor: torch.Tensor):

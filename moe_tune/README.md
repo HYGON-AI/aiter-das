@@ -146,12 +146,14 @@ python moe_tune/tune_moe.py --backend both --tokens 1,16,17,64,256 \
 | ASM INT4 | AITER `aiter/configs/tuned_fmoe_asm_w4a16.csv` / `tuned_fmoe_asm_w4a8_group.csv` |
 | Triton | 实际导入的 BoltOPs `boltops/fused_moe/triton/configs/triton_<capability>/`，例如 `triton_3_6` |
 
-Triton 文件例如 `E=4,N=128,arch=gfx936,dtype=int8_w8a8.json` 和 `E=4,N=128,arch=gfx936,dtype=int8_w8a8,is_bottom=True.json`。W8A8 block 在 `.json` 前加 `,block_shape=[128,128]`；INT4 group 沿用原生命名，不包含 group size，由安装来源记录防止冲突。非量化文件无 dtype 片段。当前公开调用消费系统 BoltOPs 路径；把文件复制到 AITER 旧 `aiter/ops/triton/configs/moe` 不会让本路径读取它。
+Triton 文件例如 `E=4,N=128,K=256,topk=2,arch=gfx936,dtype=int8_w8a8.json` 和 `E=4,N=128,K=256,topk=2,arch=gfx936,dtype=int8_w8a8,is_bottom=True.json`。K 为 `--model-dim`，INT4 也使用打包前的逻辑维度。W8A8 block 在 `.json` 前加 `,block_shape=[128,128]`；INT4 group 沿用原生命名，不包含 group size，由安装来源记录防止冲突。非量化文件无 dtype 片段。当前公开调用消费系统 BoltOPs 路径；把文件复制到 AITER 旧 `aiter/ops/triton/configs/moe` 不会让本路径读取它。
+
+生成产物验证和安装后的命中检查共用 `E/N/K/top_k/dtype/block_n/block_k/is_bottom` 完整查询参数。安装后启动新 worker，直接查询系统 BoltOPs 的实际配置目录，核对两个阶段每个请求 token 的配置与调优产物一致，结果写入 `install_check.json` / `install_check.log`，通过后才标记 `installed`。安装合并的其他 token 不影响检查；命中失败时命令返回非零，manifest 保留 `validated` 和 `installation_error`，已写入文件及事务备份可从安装收据查看。
 
 原生配置键有以下限制：
 
 - ASM 查找不区分 FP16/BF16。同一个原生 shape 分组存在另一 dtype 时，安装拒绝覆盖。
-- Triton 文件名不区分 D、topk、FP16/BF16；INT4 文件名也不区分 group size 或 zero-point 模式，W4A8 group/channel 会同名。安装通过 `.moe_tune_owners.json` 保存完整契约；不同契约拒绝混写。
+- Triton 文件名区分 K（D）和 topk，但不区分 FP16/BF16；INT4 文件名也不区分 group size 或 zero-point 模式，W4A8 group/channel 会同名。安装通过 `.moe_tune_owners.json` 保存完整契约；不同契约拒绝混写。
 - 已有 Triton 文件没有上述来源记录，或在安装后被外部修改时，默认拒绝接管。核对这些文件适用于当前 shape 后，可显式加 `--replace-existing-configs`。此参数不能绕过已有来源记录中的不同 shape 契约。
 - 双 JSON 安装使用目录锁、备份和可恢复事务；写入失败会恢复旧文件，进程中断后的下次安装先恢复未完成事务。收据在 `.moe_tune_backups/<id>/receipt.json`。运行时读者不持有安装锁，因此应在推理进程启动前完成安装，并重启已有进程清除配置缓存。
 

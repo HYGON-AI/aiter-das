@@ -22,13 +22,7 @@ from jit.utils.cpp_extension import IS_HIP_EXTENSION, BuildExtension
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
 
 
-def env_flag_enabled(name):
-    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
-
-
-PACKAGE_NAME = (
-    "aiter_rpc" if env_flag_enabled("AITER_ENABLE_SUPERNODE_AR") else "aiter"
-)
+PACKAGE_NAME = "aiter"
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 
 if BUILD_TARGET == "auto":
@@ -254,7 +248,7 @@ class ForcePlatlibDistribution(Distribution):
         return True
 
 
-AITER_FIXED_VERSION = os.environ.get("AITER_FIXED_VERSION", "0.1.6")
+AITER_FIXED_VERSION = os.environ.get("AITER_FIXED_VERSION", "0.1.7")
 AITER_USE_SCM_VERSION = int(os.environ.get("AITER_USE_SCM_VERSION", 0))
 version_kwargs = {"use_scm_version": True} if AITER_USE_SCM_VERSION else {"version": AITER_FIXED_VERSION}
 

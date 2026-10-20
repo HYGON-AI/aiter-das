@@ -91,6 +91,13 @@ static void moe_c_moe_gemm_marlin_w4a8_impl(
               "w4a8 requires int8 activation input");
 
   const bool first_stage = !topk_weights.has_value();
+  TORCH_CHECK(mode >= 10000000 && mode < 30000000,
+              "unsupported W4A8 mode encoding: ", mode);
+  TORCH_CHECK(mode / 10000000 == (first_stage ? 1 : 2),
+              "W4A8 mode stage does not match GEMM stage: ", mode);
+  TORCH_CHECK((mode / 1000000) % 10 == 1,
+              "W4A8 requires moe_align mode: ", mode);
+  const bool is_decode = (mode / 100000) % 10 == 0;
   const bool gemm1_n256_layout = b_scale.stride(0) == 256;
   const float* topk_weights_ptr =
       topk_weights.has_value() ? topk_weights.value().data_ptr<float>() : nullptr;
@@ -110,7 +117,7 @@ static void moe_c_moe_gemm_marlin_w4a8_impl(
 
   bool launched = false;
   if (first_stage) {
-    if (config_m <= 512) {
+    if (is_decode) {
       launched = dispatch_w4a8_kernel_map(
           kernel_maps_gemm1_decode_w4a8<scalar_t>, mode, params);
       TORCH_CHECK(launched, "unsupported w4a8 GEMM1 decode kernel mode: ", mode);
@@ -132,7 +139,7 @@ static void moe_c_moe_gemm_marlin_w4a8_impl(
     return;
   }
 
-  if (config_m <= 512) {
+  if (is_decode) {
     launched = dispatch_w4a8_kernel_map(
         kernel_maps_gemm2_decode_w4a8<scalar_t>, mode, params);
     TORCH_CHECK(launched, "unsupported w4a8 GEMM2 decode kernel mode: ", mode);

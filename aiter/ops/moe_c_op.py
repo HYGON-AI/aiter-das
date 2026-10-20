@@ -617,8 +617,9 @@ def moe_c_silu_and_mul(
     input: torch.Tensor,
     rows_per_block: int = 1,
     vec_size: int = 2,
+    limit: Optional[float] = None,
 ) -> None:
-    """Compute out = SiLU(gate) * up for input laid out as [gate, up]."""
+    """Compute SiLU(gate) * up, optionally clamping gate/up before activation."""
     pass
 
 

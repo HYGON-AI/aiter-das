@@ -78,7 +78,8 @@ def execute_worker(request, request_path, result_path, log_path, timeout):
             finally:
                 _forward_shape_progress(progress_log)
     result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else {}
-    expected_status = {"probe": "passed", "tune": "tuned", "validate": "passed"}[request['action']]
+    expected_status = {"probe": "passed", "tune": "tuned", "validate": "passed",
+                       "verify_install": "passed"}[request['action']]
     if child.returncode or result.get("status") != expected_status:
         raise RuntimeError(f"{request['action']} failed ({child.returncode}): {result.get('error', 'no result')}; log: {log_path}")
     return result
@@ -136,8 +137,18 @@ def run(args, specs, backends):
                         write_json(manifest_path, manifest)
                     if args.install_configs:
                         validate_files(spec, backend, files, runtime["arch"])
+                        manifest["status"] = "validated"
+                        manifest.pop("installation_error", None)
+                        manifest.pop("installation_validation", None)
                         manifest["installation"] = install(spec, backend, files, runtime,
                             replace_existing=args.replace_existing_configs)
+                        write_json(manifest_path, manifest)
+                        if backend == "triton":
+                            check_request = dict(action="verify_install", spec=spec.to_dict(), backend=backend,
+                                                 options=options, workdir=str(directory))
+                            manifest["installation_validation"] = execute_worker(check_request,
+                                directory / "install_check_request.json", directory / "install_check.json",
+                                directory / "install_check.log", args.timeout)
                         manifest["status"] = "installed"
                         write_json(manifest_path, manifest)
                     print(f"PASS {backend}: {manifest_path}", flush=True)

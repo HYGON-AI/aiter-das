@@ -275,6 +275,22 @@ MOE_C_3RDPARTY_DIR = os.environ.get(
 
 MOE_C_DIR = MOE_C_3RDPARTY_DIR
 
+def get_moe_c_arch_source_variant() -> str:
+    override = os.environ.get("MOE_C_ARCH_SOURCE_VARIANT", "").strip()
+    if override:
+        return override
+    return "936_938"
+
+
+MOE_C_ARCH_SOURCE_VARIANT = get_moe_c_arch_source_variant()
+MOE_C_CSRC_FOR_AITER_DIR = f"{MOE_C_DIR}/csrc_for_aiter/{MOE_C_ARCH_SOURCE_VARIANT}"
+if not os.path.isdir(MOE_C_CSRC_FOR_AITER_DIR):
+    raise RuntimeError(
+        "moe_c architecture source directory does not exist: "
+        f"{MOE_C_CSRC_FOR_AITER_DIR}. "
+        "Set MOE_C_ARCH_SOURCE_VARIANT explicitly if needed."
+    )
+
 os.environ["AITER_META_DIR"] = AITER_META_DIR
 
 
@@ -1081,6 +1097,7 @@ def compile_ops(
     gen_func: Optional[Callable[..., dict[str, Any]]] = None,
     gen_fake: Optional[Callable[..., Any]] = None,
     develop: bool = False,
+    tensor_native: Optional[str] = None,
 ):
     def decorator(func):
         func.arg_checked = False
@@ -1270,6 +1287,17 @@ def compile_ops(
             if develop:
                 import torch
                 from ..utility.dtypes import torch_to_aiter_pybind
+
+                # Opt-in bindings consume live tensors and construct temporary
+                # ABI descriptors inside the native call. Older extensions keep
+                # using the descriptor path below. Never cache tensor metadata
+                # or a stream: callers may resize/rebind tensors or change streams.
+                tensor_op = getattr(module, tensor_native, None) if tensor_native else None
+                if tensor_op is not None:
+                    return tensor_op(
+                        *args, **kwargs,
+                        stream_ptr=torch.cuda.current_stream().cuda_stream,
+                    )
 
                 args = tuple(
                     torch_to_aiter_pybind(a) if isinstance(a, torch.Tensor) else a

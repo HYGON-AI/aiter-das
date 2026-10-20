@@ -41,8 +41,9 @@ grouped_gemm_layout parse_grouped_gemm_layout(const std::string& layout)
     {
         return {'C', 'R'};
     }
+    if(layout == "TT") return {'C', 'C'};
     TORCH_CHECK(false, "ck_grouped_gemm: unsupported layout '", layout,
-                "', expected one of NT/NN/TN");
+                "', expected one of NT/NN/TN/TT");
     return {'R', 'C'}; // unreachable; silences non-void return warning
 }
 
@@ -53,18 +54,20 @@ int dtype_to_grouped_gemm_dtype(const at::ScalarType dtype)
     case at::ScalarType::Half: return CK_TILE_HCU_GROUPED_GEMM_FP16;
     case at::ScalarType::BFloat16: return CK_TILE_HCU_GROUPED_GEMM_BF16;
     case at::ScalarType::Float8_e4m3fn: return CK_TILE_HCU_GROUPED_GEMM_FP8;
+    case at::ScalarType::Float8_e5m2: return CK_TILE_HCU_GROUPED_GEMM_BF8;
     case at::ScalarType::Char: return CK_TILE_HCU_GROUPED_GEMM_INT8;
+    case at::ScalarType::Byte: return CK_TILE_HCU_GROUPED_GEMM_INT4;
     default: TORCH_CHECK(false, "ck_grouped_gemm: unsupported dtype: ", dtype);
     }
 }
 
 at::ScalarType output_dtype(const at::ScalarType dtype)
 {
-    if(dtype == at::ScalarType::Char)
+    if(dtype == at::ScalarType::Char || dtype == at::ScalarType::Byte)
     {
         return at::ScalarType::Int;
     }
-    if(dtype == at::ScalarType::Float8_e4m3fn)
+    if(dtype == at::ScalarType::Float8_e4m3fn || dtype == at::ScalarType::Float8_e5m2)
     {
         return at::ScalarType::Float;
     }
@@ -75,25 +78,32 @@ void check_grouped_gemm_tensor(const torch::Tensor& t, const char* name)
 {
     TORCH_CHECK(t.is_cuda(), "ck_grouped_gemm: ", name, " must be a CUDA tensor");
     TORCH_CHECK(t.dim() == 2, "ck_grouped_gemm: ", name, " tensors must be 2D");
-    TORCH_CHECK(t.is_contiguous(), "ck_grouped_gemm: ", name, " tensors must be contiguous");
+    TORCH_CHECK(t.stride(1) == 1 && t.stride(0) >= t.size(1),
+                "ck_grouped_gemm: ", name, " must have unit inner stride and nonoverlapping rows");
 }
 
 void check_supported_shape(const at::ScalarType dtype, int64_t m, int64_t n, int64_t k)
 {
     if(dtype == at::ScalarType::Half || dtype == at::ScalarType::BFloat16)
     {
-        TORCH_CHECK(n % 128 == 0 && k % 64 == 0 && k >= 128,
-                    "ck_grouped_gemm: fp16/bf16 requires N % 128 == 0, K % 64 == 0, K >= 128");
+        TORCH_CHECK(k >= 128, "ck_grouped_gemm: fp16/bf16 requires K >= 128");
     }
-    else if(dtype == at::ScalarType::Float8_e4m3fn)
+    else if(dtype == at::ScalarType::Float8_e4m3fn || dtype == at::ScalarType::Float8_e5m2)
     {
         TORCH_CHECK(n % 128 == 0 && k % 128 == 0,
                     "ck_grouped_gemm: fp8 requires N % 128 == 0, K % 128 == 0");
+        TORCH_CHECK(k >= 256,
+                    "ck_grouped_gemm: current fp8/bf8 double-buffer kernel needs at least two K tiles");
     }
     else if(dtype == at::ScalarType::Char)
     {
-        TORCH_CHECK(m % 32 == 0 && n % 32 == 0 && k % 128 == 0,
-                    "ck_grouped_gemm: int8 requires M % 32 == 0, N % 32 == 0, K % 128 == 0");
+        TORCH_CHECK(m % 32 == 0 && n % 32 == 0 && k % 128 == 0 && k >= 256,
+                    "ck_grouped_gemm: int8 requires M/N % 32 == 0, K % 128 == 0 and K >= 256");
+    }
+    else if(dtype == at::ScalarType::Byte)
+    {
+        TORCH_CHECK(m % 128 == 0 && n % 128 == 0 && k % 256 == 0 && k >= 512,
+                    "ck_grouped_gemm: packed int4 requires M/N % 128 == 0, logical K % 256 == 0 and K >= 512");
     }
 }
 
@@ -128,15 +138,19 @@ ck_grouped_gemm_impl(std::vector<torch::Tensor>& a_tensors,
     const auto device  = a_tensors[0].device();
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(a_tensors[0]));
     const auto c_dtype = output_dtype(dtype);
+    // Validate dtype before allocating outputs or selecting a backend.
+    const int ck_dtype = dtype_to_grouped_gemm_dtype(dtype);
+    const bool packed_int4 = dtype == at::ScalarType::Byte;
 
     const grouped_gemm_layout gemm_layout = parse_grouped_gemm_layout(layout);
     // NN/TN currently validated only for fp16/bf16 (CK fast configs declare
     // SupportsFastRowMajorB / SupportsFastColumnMajorA for those dtypes).
     if(layout != "NT")
     {
-        TORCH_CHECK(dtype == at::ScalarType::Half || dtype == at::ScalarType::BFloat16,
+        TORCH_CHECK(dtype == at::ScalarType::Half || dtype == at::ScalarType::BFloat16 ||
+                        (packed_int4 && layout == "TT"),
                     "ck_grouped_gemm: layout ", layout,
-                    " is only supported for fp16/bf16");
+                    " is only supported for fp16/bf16 (packed int4 also supports TT)");
     }
 
     std::vector<torch::Tensor> outputs;
@@ -169,33 +183,35 @@ ck_grouped_gemm_impl(std::vector<torch::Tensor>& a_tensors,
         if(gemm_layout.a_layout == 'R')
         {
             m = a.size(0);
-            k = a.size(1);
-            stride_a = a.size(1); // K
+            k = a.size(1) * (packed_int4 ? 2 : 1);
+            stride_a = a.stride(0);
         }
         else // 'C': a stored [K,M] row-major, logical A is [M,K]
         {
-            k = a.size(0);
+            // Packed INT4 is packed along K in either layout: TT A is [K/2,M].
+            k = a.size(0) * (packed_int4 ? 2 : 1);
             m = a.size(1);
-            stride_a = a.size(1); // M
+            stride_a = a.stride(0);
         }
         if(gemm_layout.b_layout == 'C')
         {
             n = b.size(0);
-            TORCH_CHECK(b.size(1) == k, "ck_grouped_gemm: K mismatch at group ", i);
-            stride_b = b.size(1); // K
+            TORCH_CHECK(b.size(1) * (packed_int4 ? 2 : 1) == k, "ck_grouped_gemm: K mismatch at group ", i);
+            stride_b = b.stride(0);
         }
         else // 'R': b stored [K,N] row-major
         {
             TORCH_CHECK(b.size(0) == k, "ck_grouped_gemm: K mismatch at group ", i);
             n = b.size(1);
-            stride_b = b.size(1); // N
+            stride_b = b.stride(0);
         }
         stride_c = n;
 
         TORCH_CHECK(m > 0 && n > 0 && k > 0, "ck_grouped_gemm: all dimensions must be positive");
         check_supported_shape(dtype, m, n, k);
         TORCH_CHECK(m <= std::numeric_limits<int>::max() && n <= std::numeric_limits<int>::max() &&
-                        k <= std::numeric_limits<int>::max(),
+                        k <= std::numeric_limits<int>::max() && stride_a <= std::numeric_limits<int>::max() &&
+                        stride_b <= std::numeric_limits<int>::max(),
                     "ck_grouped_gemm: dimensions exceed int range expected by CK C ABI");
 
         torch::Tensor c;
@@ -210,6 +226,8 @@ ck_grouped_gemm_impl(std::vector<torch::Tensor>& a_tensors,
             TORCH_CHECK(c.size(0) == m && c.size(1) == n,
                         "ck_grouped_gemm: c tensor shape mismatch at group ", i,
                         ", expected [", m, ", ", n, "]");
+            stride_c = c.stride(0);
+            TORCH_CHECK(stride_c <= std::numeric_limits<int>::max(), "ck_grouped_gemm: C stride exceeds int range");
         }
         else
         {
@@ -239,7 +257,7 @@ ck_grouped_gemm_impl(std::vector<torch::Tensor>& a_tensors,
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     const int rc             = ck_tile_hcu_grouped_gemm_run(descs.data(),
                                                 static_cast<int>(descs.size()),
-                                                dtype_to_grouped_gemm_dtype(dtype),
+                                                ck_dtype,
                                                 gemm_layout.a_layout,
                                                 gemm_layout.b_layout,
                                                 workspace.data_ptr(),

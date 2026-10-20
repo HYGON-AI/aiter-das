@@ -14,31 +14,38 @@ Fabric 内存完成通信。测试按每节点4张HCU组织，支持以下常用
 ### 普通 AllReduce 输入大小
 
 普通 `CustomAllreduce.should_custom_ar()` / `custom_all_reduce()` 默认允许
-每 rank 最大 **256 MiB** 的输入，并始终受 `max_size / 2` 的容量约束。
+每 rank 最大 **64 MiB**（67,108,864字节）的输入，
+并始终受 `max_size / 2` 的容量约束。超过门限时返回不适用，由框架选择
+RCCL等回退后端。
 框架无需传入 `prefill_support=True`；SGLang 的外层筛选与 AITER 包装函数
 内部复检会采用同一策略。默认 `max_size=1 GiB`，本次调整不会改变其预分配
-input/meta 缓冲区大小，也不会固定按256MiB复制数据，实际复制量等于输入大小。
+input/meta 缓冲区大小，实际复制量等于输入大小。
 
 可在启动所有 rank 前设置正整数环境变量 `AITER_AR_MAX_SIZE_MB`（单位为
-MiB，即1024×1024字节）覆盖普通 AllReduce 门限，例如 `64` 可恢复旧的
-普通 AllReduce 大小策略；未设置时为 `256`。显式传入
+MiB，即1024×1024字节）覆盖普通 AllReduce 门限；未设置时为 `64`，
+例如显式设置 `256` 可用于较大输入的功能验证，不代表性能更优。显式传入
 `prefill_support=True` 的已有调用仍按 `max_size / 2` 检查。
 ReduceScatter 和原先共用此筛选函数的融合入口保留原有64MiB限制；
 AllGather的大小策略保持不变。
 
 大小门限控制是否选择此后端，不代表所有输入都比NCCL更快。大输入基本
-功能测试可在同节点IPC或超节点Fabric上执行，以下使用TP4：
+功能测试可在同节点IPC或超节点Fabric上执行。以下使用已有测试脚本验证
+TP4 BF16的56MiB和64MiB输入，显式清除门限覆盖以使用默认值：
 
 ```bash
-python -B op_tests/multigpu_tests/test_custom_allreduce_size_limit.py --policy-only
-AITER_AR_TRANSPORT=ipc HIP_VISIBLE_DEVICES=0,1,2,3 \
+unset AITER_AR_MAX_SIZE_MB
+AITER_AR_TRANSPORT=ipc AITER_AR_ENABLE_REG_CAPTURE=0 HIP_VISIBLE_DEVICES=0,1,2,3 \
   torchrun --standalone --nproc-per-node=4 \
-  op_tests/multigpu_tests/test_custom_allreduce_size_limit.py
+  op_tests/multigpu_tests/super_node/test_custom_allreduce_supernode.py \
+  --transport ipc --expect-world-size 4 --direct-custom-ar --dist-backend gloo \
+  --direct-max-size-mib 128 --dtype bf16 \
+  --shape 4096,7168 --shape 8192,4096 --repeats 3
 ```
 
-默认覆盖FP16/BF16/FP32，1/56/64/84/112/168/256MiB输入，eager和Graph
-copy-in各3次更换输入后比较全部元素；另检查256MiB以上、容量、布局等拒绝
-条件。该测试直接调用AITER并断言返回有效输出，不通过框架回退到NCCL。
+该示例覆盖eager，并直接调用AITER断言有效输出，不通过
+框架回退到RCCL。84/112/168/256MiB输入在默认普通AR策略下会被拒绝；
+需要验证这些大输入的custom路径时，应显式提高 `AITER_AR_MAX_SIZE_MB`，
+并保证 `--direct-max-size-mib` 至少是最大输入MiB数的两倍。
 
 ## 1. 通信模型：不依赖 MPI
 
@@ -128,7 +135,7 @@ communicator 路径及 SHA256；各 rank、两种 dtype 均通过后，rank 0 �
 bash op_tests/multigpu_tests/super_node/build_custom_allreduce_transport.sh
 ```
 
-- 不传参数：默认按参数 `0` 构建IPC-only版本，与工程编译默认值一致。
+- 不传参数：默认按参数 `1` 构建支持超节点 Fabric 的版本，与工程编译默认值一致。
 - 参数 `1`：设置 `AITER_ENABLE_SUPERNODE_AR=1`，重新构建 Fabric 版本。
 - 参数 `0`：构建不包含 HSA RPC 的 IPC-only 版本，用于兼容性回归。
 - 脚本设置 `AITER_REBUILD=1`，强制重新检查/构建对应 JIT 模块。
@@ -268,9 +275,14 @@ bash op_tests/multigpu_tests/super_node/final_verify_custom_allreduce.sh
 | `fabric` | 强制使用 HSA RPC Fabric；未编译或初始化失败时明确报错 |
 | `auto` | 同节点选择 IPC；跨节点在已编译 Fabric feature 时选择 Fabric，初始化失败时按上层契约回退 |
 
-默认编译不启用Fabric能力，也不链接HSA runtime；默认运行时transport仍是
-`ipc`。需要超节点Fabric时，必须在JIT构建/重建前显式设置
-`AITER_ENABLE_SUPERNODE_AR=1`，或使用本目录构建脚本的参数 `1`。
+wheel 预编译和 JIT 默认启用 Fabric 能力，并链接 `hsa-runtime64`，无需设置
+`AITER_ENABLE_SUPERNODE_AR`。编译环境需要提供 HSA RPC 头文件和库；安装后的
+运行环境也需要能加载带 RPC 接口的 HSA runtime。默认运行时 transport 仍是
+`ipc`，使用超节点通信时选择 `fabric` 或 `auto`。
+
+需要 IPC-only 兼容性构建时，可显式设置 `AITER_ENABLE_SUPERNODE_AR=0`，
+或使用本目录构建脚本的参数 `0`。无论是否启用 Fabric，wheel 发行包名统一为
+`aiter`，Python 导入名也为 `aiter`。
 
 注意：在一个已经构建完成的 `.so` 上临时修改
 `AITER_ENABLE_SUPERNODE_AR` 不会改变该模块；该变量必须在JIT构建/重建时
@@ -317,13 +329,13 @@ export MASTER_ADDR=master-node-address
 ping -c 2 "${MASTER_ADDR}"
 ```
 
-## 5. 构建 Fabric 版本
+## 5. 构建默认支持 Fabric 的版本
 
 推荐使用聚焦构建脚本。在共享工程根目录执行一次：
 
 ```bash
 cd aiter
-bash op_tests/multigpu_tests/super_node/build_custom_allreduce_transport.sh 1
+bash op_tests/multigpu_tests/super_node/build_custom_allreduce_transport.sh
 ```
 
 预期输出包含：
@@ -338,7 +350,6 @@ CUSTOM_AR_BUILD fabric_handle_size=256
 ```bash
 cd aiter
 
-export AITER_ENABLE_SUPERNODE_AR=1
 AITER_REBUILD=1 python - <<'PY'
 from aiter.ops import custom_all_reduce as ops
 
@@ -585,10 +596,10 @@ torchrun \
   --with-graph
 ```
 
-验证默认宏关闭构建时可执行：
+验证显式关闭 Fabric 的构建时可执行：
 
 ```bash
-bash op_tests/multigpu_tests/super_node/build_custom_allreduce_transport.sh
+bash op_tests/multigpu_tests/super_node/build_custom_allreduce_transport.sh 0
 ```
 
 宏关闭回归完成后，如还要继续运行跨节点 Fabric 测试，必须重新执行：

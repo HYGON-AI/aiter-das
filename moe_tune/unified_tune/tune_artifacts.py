@@ -86,6 +86,9 @@ def validate_files(spec, backend, files, arch):
             if not math.isfinite(float(row["time_us"])) or float(row["time_us"]) <= 0:
                 raise ValueError("ASM output has invalid timing")
     else:
+        # Manifest JSON sorts hash-map keys, so resume may reverse stage order.
+        if {Path(p).name for p in files} != set(spec.triton_filenames(arch)):
+            raise ValueError("Triton filenames do not match requested E/N/K/topk/type/stage")
         pair = [json.loads(Path(p).read_text(encoding="utf-8")) for p in files]
         expected = set(map(str, spec.tokens))
         for data in pair:

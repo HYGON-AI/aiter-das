@@ -25,7 +25,7 @@ from aiter.dist.parallel_state import (
     set_custom_all_reduce,
 )
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import benchmark, checkAllclose, perftest, format_test_summary
 
 logger = logging.getLogger("aiter")
 
@@ -275,7 +275,7 @@ if __name__ == "__main__":
     df[show_cols].to_csv("test_custom_allreduce.csv", index=False)
     logger.info(
         "custom allreduce summary (markdown):\n%s",
-        df[show_cols].to_markdown(index=False),
+        format_test_summary(df[show_cols]),
     )
     if failed_cases:
         details = "\n".join(

@@ -1,1 +1,0 @@
-python3 ./aiter_logs/run.py ./aiter_logs/ ar_asm all

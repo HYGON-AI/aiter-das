@@ -152,7 +152,8 @@ namespace py = pybind11;
             &moe_c_activation_silu_and_mul,                                             \
             py::arg("out"), py::arg("input"),                                          \
             py::arg("rows_per_block") = 1,                                             \
-            py::arg("vec_size") = 2);                                                   \
+            py::arg("vec_size") = 2,                                                   \
+            py::arg("limit") = py::none());                                            \
       m.def("moe_c_gelu_and_mul",                                                      \
             &moe_c_activation_gelu_and_mul,                                             \
             py::arg("out"), py::arg("input"),                                          \
@@ -671,6 +672,17 @@ namespace py = pybind11;
           py::arg("out"),                                                                      \
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"));                                                               \
+    m.def("ag_rs_requires_copy_in", &aiter::ag_rs_requires_copy_in); \
+    m.def("small_ar_scratch_size", &aiter::small_ar_scratch_size); \
+    m.def("configure_small_ar", &aiter::configure_small_ar); \
+    m.def("reduce_scatter_8bit", &aiter::reduce_scatter_8bit, \
+          py::arg("_fa"), py::arg("inp"), py::arg("out"), \
+          py::arg("m"), py::arg("n"), py::arg("k"), py::arg("split_dim"), \
+          py::arg("reg_ptr"), py::arg("reg_bytes"), py::arg("format")); \
+    m.def("reduce_scatter_dim", &aiter::reduce_scatter_dim, \
+          py::arg("_fa"), py::arg("inp"), py::arg("out"), \
+          py::arg("m"), py::arg("n"), py::arg("k"), py::arg("split_dim"), \
+          py::arg("reg_ptr"), py::arg("reg_bytes")); \
     m.def("all_gather_reg",                                                                    \
           &aiter::all_gather_reg,                                                              \
           py::arg("_fa"),                                                                      \
@@ -685,46 +697,77 @@ namespace py = pybind11;
           py::arg("out"),                                                                      \
           py::arg("reg_bytes"),                                                                \
           py::arg("dim"));                                                                     \
-    m.def("fused_allreduce_rmsnorm",                                                           \
-          &aiter::fused_allreduce_rmsnorm,                                                     \
-          py::arg("_fa"),                                                                      \
-          py::arg("inp"),                                                                      \
-          py::arg("res_inp"),                                                                  \
-          py::arg("res_out"),                                                                  \
-          py::arg("out"),                                                                      \
-          py::arg("w"),                                                                        \
-          py::arg("eps"),                                                                      \
-          py::arg("reg_ptr"),                                                                  \
-          py::arg("reg_bytes"),                                                                \
-          py::arg("use_1stage"));                                                              \
-    m.def("fused_allreduce_rmsnorm_quant",                                                     \
-          &aiter::fused_allreduce_rmsnorm_quant,                                               \
-          py::arg("_fa"),                                                                      \
-          py::arg("inp"),                                                                      \
-          py::arg("res_inp"),                                                                  \
-          py::arg("res_out"),                                                                  \
-          py::arg("out"),                                                                      \
-          py::arg("scale_out"),                                                                \
-          py::arg("w"),                                                                        \
-          py::arg("eps"),                                                                      \
-          py::arg("reg_ptr"),                                                                  \
-          py::arg("reg_bytes"),                                                                \
-          py::arg("use_1stage"));                                                              \
-    m.def("fused_allreduce_rmsnorm_quant_per_group",                                           \
-          &aiter::fused_allreduce_rmsnorm_quant_per_group,                                     \
-          py::arg("_fa"),                                                                      \
-          py::arg("inp"),                                                                      \
-          py::arg("res_inp"),                                                                  \
-          py::arg("res_out"),                                                                  \
-          py::arg("out"),                                                                      \
-          py::arg("scale_out"),                                                                \
-          py::arg("w"),                                                                        \
-          py::arg("eps"),                                                                      \
-          py::arg("group_size"),                                                               \
-          py::arg("reg_ptr"),                                                                  \
-          py::arg("reg_bytes"),                                                                \
-          py::arg("use_1stage"),                                                               \
-          py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                                  \
+    m.def("fused_allreduce_rmsnorm",                                                 \
+          &aiter::fused_allreduce_rmsnorm,                                           \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("res_inp"),                                                        \
+          py::arg("res_out"),                                                        \
+          py::arg("out"),                                                            \
+          py::arg("w"),                                                              \
+          py::arg("eps"),                                                            \
+          py::arg("reg_ptr"),                                                        \
+          py::arg("reg_bytes"),                                                      \
+          py::arg("use_1stage"),                                                     \
+          py::arg("gemma_norm") = false);                                            \
+    m.def("fused_allreduce_rmsnorm_pad",                                             \
+          &aiter::fused_allreduce_rmsnorm_pad,                                       \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("res_inp"),                                                        \
+          py::arg("res_out"),                                                        \
+          py::arg("out"),                                                            \
+          py::arg("w"),                                                              \
+          py::arg("eps"),                                                            \
+          py::arg("reg_ptr"),                                                        \
+          py::arg("reg_bytes"),                                                      \
+          py::arg("use_1stage"),                                                     \
+          py::arg("gemma_norm") = false);                                            \
+    m.def("fused_allreduce_rmsnorm_quant",                                           \
+          &aiter::fused_allreduce_rmsnorm_quant,                                     \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("res_inp"),                                                        \
+          py::arg("res_out"),                                                        \
+          py::arg("out"),                                                            \
+          py::arg("scale_out"),                                                      \
+          py::arg("w"),                                                              \
+          py::arg("eps"),                                                            \
+          py::arg("reg_ptr"),                                                        \
+          py::arg("reg_bytes"),                                                      \
+          py::arg("use_1stage"),                                                     \
+          py::arg("gemma_norm")   = false,                                           \
+          py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                        \
+    m.def("fused_allreduce_rmsnorm_quant_per_group",                                 \
+          &aiter::fused_allreduce_rmsnorm_quant_per_group,                           \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("res_inp"),                                                        \
+          py::arg("res_out"),                                                        \
+          py::arg("out"),                                                            \
+          py::arg("scale_out"),                                                      \
+          py::arg("w"),                                                              \
+          py::arg("eps"),                                                            \
+          py::arg("group_size"),                                                     \
+          py::arg("reg_ptr"),                                                        \
+          py::arg("reg_bytes"),                                                      \
+          py::arg("use_1stage"),                                                     \
+          py::arg("bf16_out_ptr")    = static_cast<int64_t>(0),                      \
+          py::arg("transpose_scale") = false);                                       \
+    m.def("fused_allreduce_rmsnorm_mxfp4_quant",                                     \
+          &aiter::fused_allreduce_rmsnorm_mxfp4_quant,                               \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("res_inp"),                                                        \
+          py::arg("res_out"),                                                        \
+          py::arg("out"),                                                            \
+          py::arg("scale_out"),                                                      \
+          py::arg("w"),                                                              \
+          py::arg("eps"),                                                            \
+          py::arg("reg_ptr"),                                                        \
+          py::arg("reg_bytes"),                                                      \
+          py::arg("use_1stage"),                                                     \
+          py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                        \
     m.def("fused_qknorm_allreduce",                                                            \
           &aiter::fused_qknorm_allreduce,                                                      \
           py::arg("_fa"),                                                                      \
@@ -737,6 +780,22 @@ namespace py = pybind11;
           py::arg("eps"),                                                                      \
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"));                                                               \
+    m.def("fused_qknorm_allreduce_rope",                                             \
+          &aiter::fused_qknorm_allreduce_rope,                                       \
+          py::arg("_fa"),                                                            \
+          py::arg("qkv_in"),                                                         \
+          py::arg("q_w"),                                                            \
+          py::arg("k_w"),                                                            \
+          py::arg("q_out"),                                                          \
+          py::arg("k_out"),                                                          \
+          py::arg("v_out"),                                                          \
+          py::arg("cos_sin_cache"),                                                  \
+          py::arg("position_ids"),                                                   \
+          py::arg("head_dim"),                                                       \
+          py::arg("rotary_dim"),                                                     \
+          py::arg("eps"),                                                            \
+          py::arg("reg_ptr"),                                                        \
+          py::arg("reg_bytes"));                                                     \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                                         \
     m.def("meta_size", &aiter::meta_size);                                                     \
     m.def("register_input_buffer",                                                             \
@@ -2148,3 +2207,47 @@ namespace py = pybind11;
           py::arg("KV_scale") = std::nullopt,                  \
           py::arg("clean_logits") = true,                      \
           py::arg("D_out") = std::nullopt);
+
+#define QUICK_ALL_REDUCE_PYBIND                                                            \
+    AITER_SET_STREAM_PYBIND;                                                               \
+    m.def("init_custom_qr",                                                                \
+          &aiter::init_custom_qr,                                                          \
+          py::arg("rank"),                                                                 \
+          py::arg("world_size"),                                                           \
+          py::arg("qr_max_size") = std::nullopt);                                          \
+    m.def("qr_destroy", &aiter::qr_destroy, "qr_destroy(int fa) -> ()", py::arg("fa"));    \
+    m.def("qr_all_reduce",                                                                 \
+          &aiter::qr_all_reduce,                                                           \
+          "qr_all_reduce(int fa, Tensor inp, Tensor out,"                                  \
+          "int quant_level, bool cast_bf2half) -> ()",                                     \
+          py::arg("fa"),                                                                   \
+          py::arg("inp"),                                                                  \
+          py::arg("out"),                                                                  \
+          py::arg("quant_level"),                                                          \
+          py::arg("cast_bf2half") = false);                                                \
+    m.def("qr_all_reduce_rmsnorm",                                                         \
+          &aiter::qr_all_reduce_rmsnorm,                                                   \
+          "qr_all_reduce_rmsnorm(int fa, Tensor inp, Tensor residual_inp, "                \
+          "Tensor residual_out, Tensor out, Tensor weight, float eps, int hidden_dim, "    \
+          "int quant_level, bool cast_bf2half) -> ()",                                     \
+          py::arg("fa"),                                                                   \
+          py::arg("inp"),                                                                  \
+          py::arg("residual_inp"),                                                         \
+          py::arg("residual_out"),                                                         \
+          py::arg("out"),                                                                  \
+          py::arg("weight"),                                                               \
+          py::arg("eps"),                                                                  \
+          py::arg("hidden_dim"),                                                           \
+          py::arg("quant_level"),                                                          \
+          py::arg("cast_bf2half") = false);                                                \
+    m.def("qr_get_handle",                                                                 \
+          &aiter::qr_get_handle,                                                           \
+          "qr_get_handle(int fa, int out_ptr) -> ()",                                      \
+          py::arg("fa"),                                                                   \
+          py::arg("out_ptr"));                                                             \
+    m.def("qr_open_handles",                                                               \
+          &aiter::qr_open_handles,                                                         \
+          "qr_open_handles(int fa, int[] handle_ptrs) -> ()",                              \
+          py::arg("fa"),                                                                   \
+          py::arg("handle_ptrs"));                                                         \
+    m.def("qr_max_size", &aiter::qr_max_size);

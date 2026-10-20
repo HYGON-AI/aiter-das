@@ -2622,7 +2622,7 @@ namespace aiter {
             AITER_MHC_RAW_BUFFER_LOAD_LDS(
                 x_addr,
                 (__attribute__((address_space(3))) int*)smem_x_warp_addr,
-                8 * 2, // 单位是字节, 此处读取4 * sizeof(bf16)字节
+                chunk_bytes, // Match each lane's 4/8/16-byte LDS slice.
                 global_x_offset * element_bytes,
                 0,
                 0, /* immediate offset, instruction offset */
@@ -2632,7 +2632,7 @@ namespace aiter {
             AITER_MHC_RAW_BUFFER_LOAD_LDS(
                 residual_addr,
                 (__attribute__((address_space(3))) int*)smem_residual_warp_addr0,
-                8 * 2, // 单位是字节, 此处读取4 * sizeof(bf16)字节
+                chunk_bytes, // Match each lane's 4/8/16-byte LDS slice.
                 global_residual_offset0 * element_bytes,
                 0,
                 0, /* immediate offset, instruction offset */
@@ -2641,7 +2641,7 @@ namespace aiter {
             AITER_MHC_RAW_BUFFER_LOAD_LDS(
                 residual_addr,
                 (__attribute__((address_space(3))) int*)smem_residual_warp_addr1,
-                8 * 2, // 单位是字节, 此处读取4 * sizeof(bf16)字节
+                chunk_bytes, // Match each lane's 4/8/16-byte LDS slice.
                 global_residual_offset1 * element_bytes,
                 0,
                 0, /* immediate offset, instruction offset */
@@ -2650,7 +2650,7 @@ namespace aiter {
             AITER_MHC_RAW_BUFFER_LOAD_LDS(
                 residual_addr,
                 (__attribute__((address_space(3))) int*)smem_residual_warp_addr2,
-                8 * 2, // 单位是字节, 此处读取4 * sizeof(bf16)字节
+                chunk_bytes, // Match each lane's 4/8/16-byte LDS slice.
                 global_residual_offset2 * element_bytes,
                 0,
                 0, /* immediate offset, instruction offset */
@@ -2659,7 +2659,7 @@ namespace aiter {
             AITER_MHC_RAW_BUFFER_LOAD_LDS(
                 residual_addr,
                 (__attribute__((address_space(3))) int*)smem_residual_warp_addr3,
-                8 * 2, // 单位是字节, 此处读取4 * sizeof(bf16)字节
+                chunk_bytes, // Match each lane's 4/8/16-byte LDS slice.
                 global_residual_offset3 * element_bytes,
                 0,
                 0, /* immediate offset, instruction offset */

@@ -23,6 +23,20 @@ def scaled_silu_and_mul(out: Tensor, input: Tensor, scale: Tensor) -> None: ...
 def gelu_and_mul(out: Tensor, input: Tensor) -> None: ...
 
 
+@compile_ops("module_activation_eager")
+def gelu_and_mul_eager(out: Tensor, input: Tensor) -> None:
+    """Compute ``F.gelu(x, approximate="none") * gate`` with eager rounding.
+
+    ``input`` is contiguous FP16/BF16 with shape ``[..., 2 * d]``, split
+    into ``x`` and ``gate``. ``out`` has shape ``[..., d]`` on the same
+    device and with the same dtype; it must be contiguous and not overlap
+    ``input``. GELU rounds to the input dtype before FP32 multiplication.
+    NaN payloads and bitwise equality across toolchain versions are not
+    part of the contract. See ``docs/gelu_and_mul_eager.md``.
+    """
+    ...
+
+
 @compile_ops("module_activation")
 def gelu_tanh_and_mul(out: Tensor, input: Tensor) -> None: ...
 

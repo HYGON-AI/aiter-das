@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused MoE kernel."""
 import functools
+import csv
 import json
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -1518,7 +1519,7 @@ def moe_align_block_size(
     num_tokens_post_pad = torch.empty((1),
                                       dtype=torch.int32,
                                       device=topk_ids.device)
-    if num_experts >= 224:
+    if num_experts >= 224 and num_experts != 512:
         if num_experts not in (256, 896):
             # Triton fallback only writes valid blocks. Keep padding/tail safe
             # without changing the Triton kernel semantics.
@@ -2118,6 +2119,30 @@ def _resolve_moe_compute_dtype(
         f"Unsupported hidden_states dtype: {hidden_states_dtype}")
 
 
+def _moe_c_mode_uses_moe_align(mode) -> bool:
+    try:
+        mode = int(mode)
+    except (TypeError, ValueError):
+        return False
+    if mode < 10000000:
+        return False
+    return ((mode // 1000000) % 10) == 1
+
+
+def _moe_c_config_uses_moe_align(config, use_fp8_w8a8: bool) -> bool:
+    mode = int(config.get("MODE", 0))
+    if 10000000 <= mode < 30000000:
+        return _moe_c_mode_uses_moe_align(mode)
+    sorting_method = config.get("SORTING_METHOD")
+    if sorting_method == "moe_align":
+        return True
+    if sorting_method == "ck_sorting":
+        return False
+    if "MODE" in config:
+        return _moe_c_mode_uses_moe_align(config.get("MODE"))
+    return use_fp8_w8a8
+
+
 def _torch_dtype_to_triton(dtype: torch.dtype):
     if dtype == torch.bfloat16:
         return tl.bfloat16
@@ -2205,13 +2230,20 @@ def invoke_fused_moe_kernel_marlin(A: torch.Tensor,
                             use_int4_w4a16_base: bool,
                             use_w16a16: bool,
                             is_bottom: bool,
-                            key_selected:int,
+                            selected_m_key:int,
                             block_shape: Optional[List[int]] = None,
                             real_size_k: Optional[int] = None) -> None:
     find_best = os.getenv("WHICH_TO_TEST")
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
+    if block_shape is None and (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w4a8):
+        quant = "int8_w4a8" if use_int8_w4a8 else "fp8_w8a8" if use_fp8_w8a8 else "int8_w8a8"
+        # W4 weights pack two reduction elements into each byte.
+        reduce_k = B.shape[-1] * (2 if use_int8_w4a8 else 1)
+        mode = int(config["MODE"])
+        assert config["BLOCK_SIZE_M"] == mode // 1000 % 100 * 16, "moe_c config BM disagrees with mode"
+        validate_channelwise_reduce_k(quant, mode, reduce_k, is_bottom, B.shape[-2])
 
     use_fp4_w4a8_groupwise = _check_moec_quant_legal(
         use_int4_w4a16=use_int4_w4a16,
@@ -2439,39 +2471,38 @@ def invoke_fused_moe_kernel_marlin(A: torch.Tensor,
                         if _is_marlin_tensorwise_scale(B_scale, B.shape[0]):
                             if is_bottom:
                                 aiter.moe_c_moe_gemm_marlin_w8a8_tensorwise(A, B, C, A_scale, B_scale, topk_weights,
-                                                sorted_token_ids, expert_ids, num_tokens_post_padded, 1, config["MODE"], top_k, key_selected)
+                                                sorted_token_ids, expert_ids, num_tokens_post_padded, 1, config["MODE"], top_k, selected_m_key)
                             else:
                                 aiter.moe_c_moe_gemm_marlin_w8a8_tensorwise(A, B, C, A_scale, B_scale, None,
-                                                sorted_token_ids, expert_ids, num_tokens_post_padded, top_k, config["MODE"], top_k, key_selected)
+                                                sorted_token_ids, expert_ids, num_tokens_post_padded, top_k, config["MODE"], top_k, selected_m_key)
                         else:
                             if is_bottom:
                                 assert B.shape[1] in [7168,6144,4096,3072,2048] , f" K = {B.shape[1]} is not in support"
-                                assert B.shape[2] in [128,256,384,512,768,1024,2048] , f" N = {B.shape[2]} is not in support"
                                 aiter.moe_c_moe_gemm_marlin_w8a8(A, B, C, A_scale, B_scale,topk_weights,
-                                                sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"],  top_k,key_selected)
+                                                sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"],  top_k,selected_m_key)
 
 
                             else :
                                 aiter.moe_c_moe_gemm_marlin_w8a8(A, B, C, A_scale, B_scale, None,
-                                                sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"],  top_k,key_selected)
+                                                sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"],  top_k,selected_m_key)
                         return
                     elif (use_int8_w4a8 and block_shape == None):
                         if is_bottom:
                             aiter.moe_c_moe_gemm_marlin_w4a8(A, B, C, A_scale, B_scale,topk_weights,
-                                            sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"], top_k,key_selected)
+                                            sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"], top_k,selected_m_key)
 
                         else :
                             aiter.moe_c_moe_gemm_marlin_w4a8(A, B, C, A_scale, B_scale, None,
-                                            sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"], top_k,key_selected)
+                                            sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"], top_k,selected_m_key)
 
                         return
                     elif (use_fp4_w4a8 and block_shape is None):
                         if is_bottom:
                             aiter.moe_c_moe_gemm_marlin_wfp4a8_channelwise(A, B, C, A_scale, B_scale, topk_weights,
-                                            sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"], top_k,key_selected)
+                                            sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"], top_k,selected_m_key)
                         else:
                             aiter.moe_c_moe_gemm_marlin_wfp4a8_channelwise(A, B, C, A_scale, B_scale, None,
-                                            sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"], top_k,key_selected)
+                                            sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"], top_k,selected_m_key)
                         return
                     elif (use_fp4_w4a8 and block_shape is not None and block_shape[0] == 0 and block_shape[1] == 32):
                         gemm_op_wfp4a8_groupwise = (
@@ -2481,35 +2512,345 @@ def invoke_fused_moe_kernel_marlin(A: torch.Tensor,
                         )
                         if is_bottom:
                             gemm_op_wfp4a8_groupwise(A, B, C, A_scale, B_scale, topk_weights,
-                                            sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"], top_k,key_selected)
+                                            sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"], top_k,selected_m_key)
                         else:
                             gemm_op_wfp4a8_groupwise(A, B, C, A_scale, B_scale, None,
-                                            sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"], top_k,key_selected)
+                                            sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"], top_k,selected_m_key)
                         return
                     elif (use_fp8_w8a8 and block_shape == None):
                         gemm_real_size_k = int(real_size_k or A.shape[1])
                         if _is_marlin_tensorwise_scale(B_scale, B.shape[0]):
                             if is_bottom:
                                 aiter.moe_c_moe_gemm_marlin_w8a8_fp8_tensorwise(A, B, C, A_scale, B_scale,topk_weights,
-                                                sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"],  top_k,key_selected, gemm_real_size_k)
+                                                sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"],  top_k,selected_m_key, gemm_real_size_k)
 
 
                             else :
                                 aiter.moe_c_moe_gemm_marlin_w8a8_fp8_tensorwise(A, B, C, A_scale, B_scale, None,
-                                                sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"],  top_k,key_selected, gemm_real_size_k)
+                                                sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"],  top_k,selected_m_key, gemm_real_size_k)
                         else:
                             if is_bottom:
                                 aiter.moe_c_moe_gemm_marlin_w8a8_fp8(A, B, C, A_scale, B_scale,topk_weights,
-                                                sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"],  top_k,key_selected, gemm_real_size_k)
+                                                sorted_token_ids, expert_ids, num_tokens_post_padded,1, config["MODE"],  top_k,selected_m_key, gemm_real_size_k)
 
 
                             else :
                                 aiter.moe_c_moe_gemm_marlin_w8a8_fp8(A, B, C, A_scale, B_scale, None,
-                                                sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"],  top_k,key_selected, gemm_real_size_k)
+                                                sorted_token_ids, expert_ids, num_tokens_post_padded,top_k, config["MODE"],  top_k,selected_m_key, gemm_real_size_k)
                         return
 
 
 
+
+
+def _mode_tiles(quant, stage, routing, family, bm, profile):
+    up = stage == 1
+    if quant == "int8_w4a8":
+        assert routing == 1 and bm in (16, 32, 48, 64)
+        if family == 0:
+            assert (bm, profile) == (16, 104) if up else profile == 100 + bm // 16
+            return 32 if up else 512
+        if family == 1:
+            assert profile == 200 + bm // 16
+            return 512
+        assert family == 2 or (family == 3 and not up)
+        assert profile in range(101, 106 if up else 105)
+        return 128 * (profile - 100)
+    if family == 0:
+        assert routing == 0
+        variants = ({(16, 101): 64, (16, 102): 16, (16, 103): 64, (32, 101): 128}
+                    if up and quant == "fp8_w8a8" else
+                    {(16, 101): 64, (16, 102): 16, (16, 103): 16} if up else
+                    {(16, 101): 128, (16, 102): 256, (16, 103): 512,
+                     (16, 104): 512, **({(32, 101): 128} if quant == "fp8_w8a8" else {})})
+        assert (bm, profile) in variants
+        return variants[bm, profile]
+    if quant == "int8_w8a8" and family == 1:
+        assert routing == 0
+        variants = ({(32, 201): 128, (32, 202): 128, (32, 203): 256, (32, 204): 64}
+                    if up else {(32, 201): 512, (64, 202): 512})
+        assert (bm, profile) in variants
+        return variants[bm, profile]
+    if quant == "fp8_w8a8" and family == 1:
+        assert routing == 1 and bm in (32, 48, 64, 80, 96, 128)
+        assert profile in ((101, 102, 105) if up else (101, 102, 104)) or (
+            up and bm in (80, 96) and profile == 104)
+    else:
+        assert family == 2 and routing == 0 and bm in (32, 48, 64)
+        assert profile in ((101, 102, 105) if up else (101, 102, 104)) if quant == "fp8_w8a8" else (
+            profile in ((101, 102) if up else (101, 102, 104)))
+    return 128 * (profile - 100)
+
+
+@functools.lru_cache(maxsize=512)
+def validate_channelwise_reduce_k(quant, mode, reduce_k, is_bottom, out_n=None):
+    stage = mode // 10000000
+    routing = mode // 1000000 % 10
+    family = mode // 100000 % 10
+    bm = mode // 1000 % 100 * 16
+    profile = mode % 1000
+    context = f"moe_c {quant} GEMM{2 if is_bottom else 1}: mode={mode}, reduction K={reduce_k}"
+    assert stage == (2 if is_bottom else 1), context + ": wrong mode stage"
+    assert quant in ("fp8_w8a8", "int8_w8a8", "int8_w4a8"), context
+    try:
+        tile_n = _mode_tiles(quant, stage, routing, family, bm, profile)
+    except AssertionError:
+        raise AssertionError(context + ": unsupported BM/routing/family/profile") from None
+    if out_n is not None:
+        if quant == "int8_w4a8" and stage == 1 and family == 1 and out_n == 256:
+            tile_n = 256
+        assert out_n > 0 and out_n % tile_n == 0, (
+            context + f": output N={out_n} must be a multiple of {tile_n}")
+    up = not is_bottom
+    fp8 = quant == "fp8_w8a8"
+    up_sizes = (2048, 3072, 4096, 6144, 7168)
+    w8_down = (128, 256, 320, 384, 512, 640, 768, 1024, 1280, 2048)
+    fp8_down = (128, 192, *w8_down[1:])
+    supported = None
+    step, tail, minimum = 128, None, 128
+    if quant == "int8_w4a8":
+        assert routing == 1 and family in (0, 1, 2, 3), context + ": unsupported family/routing"
+        if up and family == 0:
+            assert (bm, profile) == (16, 104), context + ": unsupported decode profile"
+            step, minimum = 512, 512
+        else:
+            tail = 64
+            if is_bottom:
+                supported = ((128, 192, 256, 384, 512, 768, 1024, 1536, 2048)
+                             if family == 0 else
+                             (192,) if family == 3 else
+                             (128, 192, 256, 384, 512, 640, 768, 1024, 1536, 2048, 3072))
+    elif family == 0:
+        if up:
+            variants = ({(16, 101): 1024, (16, 102): 512, (16, 103): 256,
+                         (32, 101): 64} if fp8 else
+                        {(16, 101): 1024, (16, 102): 512, (16, 103): 1024})
+            assert (bm, profile) in variants, context + ": unsupported decode profile"
+            step = minimum = variants[bm, profile]
+            supported = (1280, *up_sizes) if fp8 else up_sizes
+        elif fp8:
+            tail = 64
+    elif quant == "int8_w8a8" and family == 1:
+        if up:
+            assert profile in (201, 202, 203, 204), context + ": unsupported prefill profile"
+            step = 128 if profile == 204 else 64
+            supported = up_sizes
+        else:
+            tail = 64
+            supported = tuple(k for k in w8_down if k != 1280)
+    else:
+        assert family in (1, 2), context + ": unsupported family"
+        tail = 64
+        supported = ((up_sizes if routing == 1 else (1280, *up_sizes)) if up else
+                     fp8_down if routing == 1 else (*fp8_down, 1536)) if fp8 else (
+                         up_sizes if up else w8_down)
+    assert reduce_k >= minimum, context + f": minimum K is {minimum}"
+    assert supported is None or reduce_k in supported, context + f": supported K values are {supported}"
+    assert reduce_k % step == 0 or (tail is not None and reduce_k % step == tail), (
+        context + f": K must be a multiple of {step}" +
+        (f" or have remainder {tail}" if tail is not None else ""))
+
+
+CSV_NAMES = {
+    "int8_w4a8": "tuned_moe_c_w4a8_channel.csv",
+    "int8_w8a8": "tuned_moe_c_w8a8_int8_channel.csv",
+    "fp8_w8a8": "tuned_moe_c_w8a8_fp8_channel.csv",
+}
+FIELDS = ("arch", "quant_type", "indtype", "token", "inter_dim", "model_dim",
+          "expert", "topk", "q_size_n", "q_size_k", "sol_type", "sol_id", "time_us", "cu_num")
+QUANT_TYPES = {"fp8_w8a8": "fp8_w8a8_channel", "int8_w8a8": "int8_w8a8_channel",
+               "int8_w4a8": "int8_w4a8_channel"}
+
+
+def decode_pair(sol_id):
+    parts = sol_id.split("+")
+    assert len(parts) == 2, f"Invalid moe_c sol_id: {sol_id}"
+    modes = tuple(int(part) for part in parts)
+    assert modes[0] // 10000000 == 1 and modes[1] // 10000000 == 2, sol_id
+    bms = tuple(mode // 1000 % 100 * 16 for mode in modes)
+    assert bms[0] > 0 and bms[0] == bms[1], f"moe_c BM mismatch: {sol_id}"
+    assert modes[0] // 1000000 % 10 == modes[1] // 1000000 % 10, (
+        f"moe_c routing mismatch: {sol_id}")
+    return modes, bms[0]
+
+
+@functools.lru_cache(maxsize=8)
+def _read_table(path, mtime_ns, size):
+    groups = {}
+    with open(path, newline="") as stream:
+        reader = csv.DictReader(stream)
+        assert set(FIELDS) <= set(reader.fieldnames or ()), f"Invalid moe_c CSV header: {path}"
+        for line, row in enumerate(reader, 2):
+            assert row["sol_type"] == "moe_c", f"{path}:{line}: invalid sol_type"
+            assert int(row["q_size_n"]) == int(row["q_size_k"]) == 0, (
+                f"{path}:{line}: expected channelwise quantization")
+            modes, _ = decode_pair(row["sol_id"])
+            quant = next((q for q, label in QUANT_TYPES.items() if label == row["quant_type"]), None)
+            assert quant is not None, f"{path}:{line}: invalid quant_type"
+            n, k = int(row["inter_dim"]), int(row["model_dim"])
+            validate_channelwise_reduce_k(quant, modes[0], k, False, 2 * n)
+            validate_channelwise_reduce_k(quant, modes[1], n, True, k)
+            key = (row["arch"], row["quant_type"], row["indtype"],
+                   int(row["inter_dim"]), int(row["model_dim"]), int(row["expert"]),
+                   int(row["topk"]) if row["topk"] else None,
+                   int(row["cu_num"]) if row["cu_num"] else None)
+            token = int(row["token"])
+            assert token > 0 and token not in groups.get(key, {}), f"{path}:{line}: duplicate/invalid token"
+            groups.setdefault(key, {})[token] = row["sol_id"]
+    return groups
+
+
+def find_csv_config(root, arch, quant, e, n, k, topk, cu, bottom, indtype=None):
+    path = os.path.join(root, CSV_NAMES[quant])
+    if k is None or not os.path.isfile(path):
+        return None
+    stamp = os.stat(path)
+    groups = _read_table(path, stamp.st_mtime_ns, stamp.st_size)
+    requested = (cu, topk, e)
+    candidates = []
+    for key, table in groups.items():
+        a, q, dt, cn, ck, ce, ct, cc = key
+        if (a, q, cn, ck) != (arch, QUANT_TYPES[quant], n, k):
+            continue
+        if dt != str(indtype or "torch.bfloat16"):
+            continue
+        actual = (cc, ct, ce)
+        level = max((i for i, (x, y) in enumerate(zip(actual, requested), 1)
+                     if y is not None and x != y), default=0)
+        distances = tuple(abs(x - y) if x is not None and y is not None else
+                          float("inf") if y is not None else 0
+                          for x, y in zip(reversed(actual), reversed(requested)))
+        candidates.append(((level, distances, str(key)), table))
+    if not candidates:
+        return None
+    table = min(candidates, key=lambda item: item[0])[1]
+    result = {}
+    for token, sol in table.items():
+        modes, bm = decode_pair(sol)
+        result[token] = {"MODE": modes[int(bottom)], "BLOCK_SIZE_M": bm}
+    return result
+
+
+def write_config_csv(path, rows):
+    """Merge tuned rows by shape/M, retaining results for other workloads."""
+    merged = {}
+    if os.path.isfile(path):
+        with open(path, newline="") as stream:
+            for row in csv.DictReader(stream):
+                merged[tuple(str(row[field]) for field in FIELDS if field not in ("sol_id", "time_us"))] = row
+    for row in rows:
+        decode_pair(row["sol_id"])
+        merged[tuple(str(row[field]) for field in FIELDS if field not in ("sol_id", "time_us"))] = row
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=FIELDS, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(merged[key] for key in sorted(merged))
+
+
+def rows_from_pair(top, bottom, arch, quant, e, n, k, topk=None, cu=None,
+                   indtypes=("torch.bfloat16", "torch.float16"), times=None):
+    assert set(top) == set(bottom), "GEMM1/GEMM2 must have identical M keys for CSV migration"
+    rows = []
+    for token in sorted(top, key=int):
+        sol = f"{top[token]['MODE']}+{bottom[token]['MODE']}"
+        _, bm = decode_pair(sol)
+        for config in (top[token], bottom[token]):
+            assert int(config.get("BLOCK_SIZE_M", bm)) == bm, f"Config BM disagrees with {sol}"
+        for indtype in indtypes:
+            rows.append(dict(zip(FIELDS, (arch, QUANT_TYPES[quant], indtype, int(token), n, k,
+                                         e, topk if topk is not None else "", 0, 0, "moe_c", sol,
+                                         (times or {}).get(str(token), ""), cu if cu is not None else ""))))
+    return rows
+
+
+
+def _find_closest_channelwise_config(
+    E, N, dtype, is_bottom, K, top_k, num_cu, arch, config_root=None, indtype=None,
+):
+    """Require K and N; relax CU, topk, then E within a compatible stage pair."""
+    if K is None:
+        return None
+    config_root = config_root or _moe_c_config_root()
+    if os.path.isfile(os.path.join(config_root, CSV_NAMES[dtype])):
+        return find_csv_config(config_root, arch, dtype, E, N, K, top_k,
+                               num_cu, is_bottom, indtype)
+    roots = [
+        os.path.join(config_root, arch, dtype),
+        os.path.join(config_root, arch),
+        os.path.join(config_root, dtype),
+        config_root,
+    ]
+    requested = {"cu": num_cu, "topk": top_k, "E": E}
+    candidates = []
+    for root_rank, root in enumerate(roots):
+        if not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root)):
+            if not name.endswith(".json"):
+                continue
+            fields = dict(part.split("=", 1) for part in name[:-5].split(",") if "=" in part)
+            if (fields.get("N") != str(N) or fields.get("K") != str(K) or fields.get("dtype") != dtype
+                    or "E" not in fields
+                    or fields.get("is_bottom", "False") != str(is_bottom)
+                    or fields.get("gfx_version", arch) != arch):
+                continue
+            if set(fields) - {"N", "dtype", "E", "K", "cu", "topk", "is_bottom", "gfx_version"}:
+                continue
+            try:
+                values = {key: int(fields[key]) if key in fields else None for key in requested}
+            except ValueError:
+                continue
+            level = max(
+                (rank for rank, (key, target) in enumerate(requested.items(), 1)
+                 if target is not None and values[key] != target),
+                default=0,
+            )
+            distances = tuple(
+                abs(values[key] - requested[key])
+                if values[key] is not None and requested[key] is not None
+                else float("inf") if requested[key] is not None else 0
+                for key in ("E", "topk", "cu")
+            )
+            candidates.append(((level, distances, root_rank, name), os.path.join(root, name)))
+    for _, path in sorted(candidates):
+        suffix = ",is_bottom=True.json"
+        pair_path = path[:-len(suffix)] + ".json" if is_bottom else path[:-5] + suffix
+        if not os.path.isfile(pair_path):
+            continue
+        with open(path) as f:
+            config = {int(key): value for key, value in json.load(f).items()}
+        with open(pair_path) as f:
+            pair = {int(key): value for key, value in json.load(f).items()}
+        if not config or not pair:
+            continue
+        # Each stage independently picks the closest M; check every selection boundary.
+        points = set(config) | set(pair)
+        for table in (config, pair):
+            keys = sorted(table)
+            for left, right in zip(keys, keys[1:]):
+                midpoint = (left + right) // 2
+                points.update((midpoint, midpoint + 1))
+        compatible = True
+        for m in points:
+            first = config[min(config, key=lambda key: abs(key - m))]
+            second = pair[min(pair, key=lambda key: abs(key - m))]
+            def routing(row):
+                mode = int(row.get("MODE", 0))
+                if 10000000 <= mode < 30000000:
+                    return (mode // 1000000) % 10
+                return int(row.get("SORTING_METHOD") == "moe_align")
+            if (first.get("BLOCK_SIZE_M") is None
+                    or first["BLOCK_SIZE_M"] != second.get("BLOCK_SIZE_M")
+                    or routing(first) != routing(second)):
+                compatible = False
+                break
+        if compatible:
+            logger.info("Using configuration from %s for MoE layer.", path)
+            return config
+    logger.warning("No matching channelwise config pair: arch=%s dtype=%s N=%s E=%s K=%s topk=%s cu=%s",
+                   arch, dtype, N, E, K, top_k, num_cu)
+    return None
 
 # Adapted from: https://github.com/sgl-project/sglang/pull/2628
 def get_config_file_name(E: int,
@@ -2540,11 +2881,15 @@ def get_config_file_name_marlin(E: int,
                          block_shape: Optional[List[int]] = None,
                          is_bottom: bool = False,
                          use_moe_wna16_cuda: bool = False,
-                         K: Optional[int] = None) -> str:
+                         K: Optional[int] = None,
+                         top_k: Optional[int] = None,
+                         num_cu: Optional[int] = None) -> str:
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     k_selector = "" if K is None else f",K={K}"
+    topk_selector = "" if top_k is None else f",topk={top_k}"
+    cu_selector = "" if num_cu is None else f",cu={num_cu}"
     is_bottom_selector = ("" if is_bottom == False else ",is_bottom=True")
-    return f"E={E},N={N}{k_selector}{dtype_selector}{is_bottom_selector}.json"  # noqa: E501
+    return f"E={E},N={N}{k_selector}{topk_selector}{cu_selector}{dtype_selector}{is_bottom_selector}.json"  # noqa: E501
 
 
 def get_legacy_config_file_name_marlin(E: int,
@@ -2667,6 +3012,9 @@ def get_moe_configs_marlin(
     is_bottom: bool = False,
     use_moe_wna16_cuda: bool = False,
     K: Optional[int] = None,
+    top_k: Optional[int] = None,
+    num_cu: Optional[int] = None,
+    indtype: Optional[str] = None,
 ) -> Optional[Dict[int, Any]]:
     """
     Return optimized configurations for the fused MoE kernel.
@@ -2679,7 +3027,20 @@ def get_moe_configs_marlin(
 
     block_shape = [block_n if block_n is not None else 0, block_k] if block_k is not None else None
     arch = _get_gfx_version()
+    if dtype in ("fp8_w8a8", "int8_w8a8", "int8_w4a8"):
+        resolved_cu = num_cu
+        if resolved_cu is None and top_k is not None:
+            resolved_cu = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        return _find_closest_channelwise_config(
+            E, N, dtype, is_bottom, K, top_k, resolved_cu, arch, indtype=indtype)
     json_file_names = []
+    if top_k is not None:
+        resolved_cu = num_cu if num_cu is not None else torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        if K is not None:
+            json_file_names.append(get_config_file_name_marlin(
+                E, N, dtype, block_shape, is_bottom, use_moe_wna16_cuda, K, top_k, resolved_cu))
+        json_file_names.append(get_config_file_name_marlin(
+            E, N, dtype, block_shape, is_bottom, use_moe_wna16_cuda, top_k=top_k, num_cu=resolved_cu))
     if K is not None:
         json_file_names.append(get_config_file_name_marlin(
             E, N, dtype, block_shape, is_bottom, use_moe_wna16_cuda, K))
@@ -2900,112 +3261,6 @@ def try_get_optimal_moe_config(
                                         is_marlin, block_shape, is_bottom)
     return config
 
-_FP8_W8A8_PREFILL_BM_CHOICES = {32, 48, 64, 80, 96, 112, 128}
-_FP8_W8A8_PREFILL_NLOOP_CHOICES = {1, 2, 3, 4, 5}
-_FP8_W8A8_PREFILL_MODE_BASE = 80000
-_FP8_W8A8_PREFILL_MODE_BASE_CHOICES = {70000, 80000, 90000, 100000}
-_FP8_W8A8_DECODE_MODE_BASE = 60000
-_FP8_W8A8_DECODE_MODE_BASE_CHOICES = {60000}
-_FP8_W8A8_MODE_BASE_CHOICES = (
-    _FP8_W8A8_DECODE_MODE_BASE_CHOICES | _FP8_W8A8_PREFILL_MODE_BASE_CHOICES
-)
-
-
-def _strip_fp8_w8a8_mode_base(mode: int) -> int:
-    for mode_base in _FP8_W8A8_MODE_BASE_CHOICES:
-        if mode_base <= mode < mode_base + 10000:
-            return mode - mode_base
-    return mode
-
-
-def _encode_fp8_w8a8_mode(config: dict, mode_base: int, mode_suffix: int) -> dict:
-    if mode_base not in _FP8_W8A8_MODE_BASE_CHOICES:
-        raise ValueError(
-            f"Unsupported fp8_w8a8 mode base={mode_base}; "
-            f"supported values are {sorted(_FP8_W8A8_MODE_BASE_CHOICES)}"
-        )
-
-    config = dict(config)
-    config["MODE"] = mode_base + mode_suffix
-    return config
-
-
-def _maybe_encode_fp8_w8a8_decode_mode(
-    config: dict,
-    dtype: Optional[str],
-    block_shape: Optional[List[int]],
-    key_selected: int,
-    is_bottom: bool,
-) -> dict:
-    if dtype != "fp8_w8a8" or block_shape is not None or key_selected > 512:
-        return config
-
-    final_mode = config.get("MODE")
-    if final_mode is not None and int(final_mode) >= _FP8_W8A8_DECODE_MODE_BASE:
-        return config
-
-    decode_mode = config.get("DECODE_MODE", final_mode)
-    if decode_mode is None:
-        return config
-
-    decode_mode = _strip_fp8_w8a8_mode_base(int(decode_mode))
-
-    mode_base = int(config.get("MODE_BASE", config.get("DECODE_MODE_BASE", _FP8_W8A8_DECODE_MODE_BASE)))
-    if mode_base not in _FP8_W8A8_DECODE_MODE_BASE_CHOICES:
-        raise ValueError(
-            f"Unsupported fp8_w8a8 decode mode base={mode_base}; "
-            f"supported values are {sorted(_FP8_W8A8_DECODE_MODE_BASE_CHOICES)}"
-        )
-    config = _encode_fp8_w8a8_mode(config, mode_base, decode_mode)
-    stage_nloop_key = "N_LOOP2" if is_bottom else "N_LOOP1"
-    config[stage_nloop_key] = int(config.get(stage_nloop_key, config.get("N_LOOP", 1)))
-    config["DECODE_MODE"] = decode_mode
-    config["DECODE_MODE_BASE"] = mode_base
-    return config
-
-
-def _maybe_encode_fp8_w8a8_prefill_mode(
-    config: dict,
-    dtype: Optional[str],
-    block_shape: Optional[List[int]],
-    key_selected: int,
-    is_bottom: bool,
-) -> dict:
-    if dtype != "fp8_w8a8" or block_shape is not None or key_selected <= 512:
-        return config
-
-    final_mode = config.get("MODE")
-    if final_mode is not None and int(final_mode) >= min(_FP8_W8A8_PREFILL_MODE_BASE_CHOICES):
-        return config
-
-    block_size_m = config.get("BLOCK_SIZE_M")
-    if block_size_m not in _FP8_W8A8_PREFILL_BM_CHOICES:
-        return config
-
-    stage_nloop_key = "N_LOOP2" if is_bottom else "N_LOOP1"
-    n_loop = config.get(stage_nloop_key, config.get("N_LOOP"))
-    if n_loop is None:
-        return config
-
-    n_loop = int(n_loop)
-    if n_loop not in _FP8_W8A8_PREFILL_NLOOP_CHOICES:
-        raise ValueError(
-            f"Unsupported fp8_w8a8 prefill N_LOOP={n_loop}; "
-            f"supported values are {sorted(_FP8_W8A8_PREFILL_NLOOP_CHOICES)}"
-        )
-
-    mode_base = int(config.get("MODE_BASE", config.get("PREFILL_MODE_BASE", _FP8_W8A8_PREFILL_MODE_BASE)))
-    if mode_base not in _FP8_W8A8_PREFILL_MODE_BASE_CHOICES:
-        raise ValueError(
-            f"Unsupported fp8_w8a8 prefill mode base={mode_base}; "
-            f"supported values are {sorted(_FP8_W8A8_PREFILL_MODE_BASE_CHOICES)}"
-        )
-    mode_suffix = int(block_size_m) * 10 + n_loop
-    config = _encode_fp8_w8a8_mode(config, mode_base, mode_suffix)
-    config[stage_nloop_key] = n_loop
-    config["PREFILL_MODE_BASE"] = mode_base
-    return config
-
 def try_get_optimal_moe_config_marlin(
     w1_shape: Tuple[int, ...],
     w2_shape: Tuple[int, ...],
@@ -3016,6 +3271,7 @@ def try_get_optimal_moe_config_marlin(
     block_shape: Optional[List[int]] = None,
     is_bottom: bool = False,
     use_moe_wna16_cuda: bool = False,
+    indtype: Optional[str] = None,
 ):
     override_config = get_config()
     if override_config:
@@ -3036,9 +3292,9 @@ def try_get_optimal_moe_config_marlin(
                 K=logical_k,
             )
             if configs:
-                key_selected = min(configs.keys(), key=lambda x: abs(x - M))
-                config = dict(configs[key_selected])
-                config["key_selected"] = key_selected
+                selected_m_key = min(configs.keys(), key=lambda x: abs(x - M))
+                config = dict(configs[selected_m_key])
+                config["selected_m_key"] = selected_m_key
             else:
                 logger.warning("W16A16 Marlin config fallback for M=%s", M)
                 config = get_default_config(
@@ -3049,7 +3305,7 @@ def try_get_optimal_moe_config_marlin(
         logical_k = None
         if dtype in ("int8_w4a8", "fp4_w4a8"):
             logical_k = w2_shape[1]
-        elif dtype == "fp8_w8a8" and block_shape is None:
+        elif dtype in ("fp8_w8a8", "int8_w8a8") and block_shape is None:
             logical_k = w2_shape[1] if is_bottom else w1_shape[2]
 
         if dtype in ("int4_w4a16", "fp4_w4a16", "int8_w4a8", "fp4_w4a8"):
@@ -3059,18 +3315,16 @@ def try_get_optimal_moe_config_marlin(
         block_k = block_shape[1] if block_shape else 0
         configs = get_moe_configs_marlin(
             E, N, dtype, block_n, block_k, is_bottom, use_moe_wna16_cuda,
-            K=logical_k)
+            K=logical_k, top_k=top_k, indtype=indtype)
 
+        if block_shape is None and dtype in ("fp8_w8a8", "int8_w8a8", "int8_w4a8"):
+            assert configs, f"No moe_c config with matching N={N}, K={logical_k}, dtype={dtype}"
         if configs:
             # If an optimal configuration map has been found, look up the
             # optimal config
-            key_selected = min(configs.keys(), key=lambda x: abs(x - M))
-            config = dict(configs[key_selected])
-            config = _maybe_encode_fp8_w8a8_decode_mode(
-                config, dtype, block_shape, key_selected, is_bottom)
-            config = _maybe_encode_fp8_w8a8_prefill_mode(
-                config, dtype, block_shape, key_selected, is_bottom)
-            config["key_selected"] = key_selected
+            selected_m_key = min(configs.keys(), key=lambda x: abs(x - M))
+            config = dict(configs[selected_m_key])
+            config["selected_m_key"] = selected_m_key
         else:
             # Else use the default config
             config = get_default_config(M, E, N, w1_shape[2], top_k, dtype,
@@ -3834,6 +4088,7 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
         top_k_num,
         config_dtype,
         block_shape=block_shape,
+        indtype=str(compute_dtype),
     )
     # use_moe_wna16_cuda = should_moe_wna16_use_cuda(
     #         num_valid_tokens=topk_ids.numel(),
@@ -3918,12 +4173,12 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                 "MODE": int(w16a16_config[0]),
                 "BLOCK_SIZE_M": int(w16a16_config[1]),
                 "DELTA": int(w16a16_config[2]),
-                "key_selected": tokens_in_chunk,
+                "selected_m_key": tokens_in_chunk,
             }, {
                 "MODE": int(w16a16_config[3]),
                 "BLOCK_SIZE_M": int(w16a16_config[4]),
                 "DELTA": int(w16a16_config[5]),
-                "key_selected": tokens_in_chunk,
+                "selected_m_key": tokens_in_chunk,
             })
         elif use_w16a16:
             config = get_config_func(
@@ -3958,11 +4213,7 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                          if a2_scale is not None else None)
 
         find_best = os.environ.get("WHICH_TO_TEST")
-        sorting_method = config.get("SORTING_METHOD")
-        use_moe_align_sorting = (
-            sorting_method == "moe_align"
-            or (sorting_method is None and use_fp8_w8a8)
-        )
+        use_moe_align_sorting = _moe_c_config_uses_moe_align(config, use_fp8_w8a8)
         if use_w16a16:
             assert config2 is not None
             block_size_m1 = int(BM if find_best else config["BLOCK_SIZE_M"])
@@ -4057,12 +4308,13 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                                 use_int4_w4a16_base=use_int4_w4a16_base,
                                 use_w16a16=use_w16a16,
                                 is_bottom = False,
-                                key_selected=config.get("key_selected"),
+                                selected_m_key=config.get("selected_m_key"),
                                 block_shape=block_shape,
                                 real_size_k=fp8_original_k if use_fp8_w8a8 else None)
 
-        if activation == "silu" :
-                moe_c_silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+        if activation == "silu" and is_gated and gemm1_alpha is None:
+            moe_c_silu_and_mul(
+                intermediate_cache2, intermediate_cache1.view(-1, N), limit=gemm1_limit)
 
         elif activation == "situ":
                 moe_c_situ_glu(
@@ -4124,7 +4376,7 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                                 use_int4_w4a16_base=use_int4_w4a16_base,
                                 use_w16a16=use_w16a16,
                                 is_bottom = True,
-                                key_selected=config.get("key_selected") ,
+                                selected_m_key=config.get("selected_m_key") ,
                                 block_shape=block_shape,
                                 real_size_k=None)
         mode_use_triton_moe_sum = out_hidden_states.dtype == torch.float16 or  \

@@ -59,6 +59,7 @@ from .ops.activation import *
 # from .ops.attention import *
 from .ops.custom import *
 from .ops.custom_all_reduce import *
+from .ops.quick_all_reduce import *
 from .ops.moe_op import *
 from .ops.moe_c_op import *
 from .ops.moe_sorting import *
@@ -67,11 +68,12 @@ from .ops.pos_encoding import *
 from .ops.rmsnorm import *
 from .ops.awq_gemm_asm import *
 from .ops.awq_dq_asm import *
-# from .ops.communication import *
+from .ops.communication import init_dist_env, destroy_dist_env
 from .ops.rope import *
 from .ops.topk import *
 from .ops.kpool_topk import *
 # from .ops.mha import *
+from .ops.triton.mha import flash_attn_func, flash_attn_varlen_func
 from .ops.gradlib import *
 from .ops.mhc import *
 from .ops.grouped_gemm import *
@@ -79,6 +81,8 @@ from .ops.opus import *
 # from .ops.trans_ragged_layout import *
 # from . import mla
 from .ops.fla import *
+from .ops.ck_gdn import *
 from .ops.kvcache_metadata import fused_metadata_kernel_general
+from .ops.blockwise_scaling import *
 from .utility import dtypes,fp4_utils
 from .ops.fused_rmsnorm_rope import *
