@@ -6,7 +6,7 @@ import os
 import shutil
 import sys
 
-from setuptools import Distribution, setup
+from setuptools import Distribution, find_namespace_packages, setup
 
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
@@ -252,15 +252,31 @@ AITER_FIXED_VERSION = os.environ.get("AITER_FIXED_VERSION", "0.1.7")
 AITER_USE_SCM_VERSION = int(os.environ.get("AITER_USE_SCM_VERSION", 0))
 version_kwargs = {"use_scm_version": True} if AITER_USE_SCM_VERSION else {"version": AITER_FIXED_VERSION}
 
+# Include implicit namespaces such as configs and ops, not just packages with
+# __init__.py. Keep generated sources exclusive to non-editable distributions.
+# Package discovery must not reintroduce JIT build trees pruned by MANIFEST.in.
+package_roots = ["aiter"] if IS_DEVELOP_MODE else ["aiter", "aiter_meta"]
+packages = find_namespace_packages(
+    include=[pattern for root in package_roots for pattern in (root, f"{root}.*")],
+    exclude=[
+        "aiter.jit.build",
+        "aiter.jit.build.*",
+        "aiter.jit.jit.build",
+        "aiter.jit.jit.build.*",
+        "*.__pycache__",
+        "*.__pycache__.*",
+    ],
+)
+
 setup(
     name=PACKAGE_NAME,
     **version_kwargs,
-    packages=["aiter"] if IS_DEVELOP_MODE else ["aiter_meta", "aiter"],
+    packages=packages,
     include_package_data=True,
     license_files=["LICENSE", "THIRD_PARTY_NOTICES.md", "LICENSE.Apache-2.0"],
-    package_data={
-        "": ["*"],
-    },
+    # Keep explicit globs at the original roots; nested resources come from
+    # MANIFEST.in, including its exclusions, rather than a glob per subpackage.
+    package_data={root: ["*"] for root in package_roots},
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
