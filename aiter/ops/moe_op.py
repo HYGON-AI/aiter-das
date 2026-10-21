@@ -46,7 +46,7 @@ def moe_align_block_size(
 def ep_scatter(
     aq: Tensor,                      # [M, H] int8, per-token quantized
     aq_scale: Tensor,                # [M] or [M, 1] fp32
-    topk_ids: Tensor,                # [M, K] int64
+    topk_ids: Tensor,                # [M, K] int32/int64, 1 <= K <= 30
     expert_map: Optional[Tensor],    # int32, -1 = dropped (None for TP)
     expert_num_tokens: Tensor,       # [E] int32 counts (in) / offsets (out)
     aq_out: Tensor,                  # [M_sum, H] int8
@@ -61,7 +61,7 @@ def ep_scatter(
 @compile_ops("module_moe_utils")
 def ep_gather(
     a: Tensor,                       # [M_sum, H] fp16/bf16/fp32
-    topk_ids: Tensor,                # [M, K] int64
+    topk_ids: Tensor,                # [M, K] int32/int64, 1 <= K <= 30
     topk_weights: Tensor,            # [M, K] fp32
     inv_perm: Tensor,                # [M, K] int32
     expert_map: Optional[Tensor],
@@ -81,7 +81,7 @@ def ep_build_m_indices(
 @compile_ops("module_moe_utils")
 def ep_fused_quant_scatter(
     input: Tensor,                   # [M, H] fp16/bf16
-    topk_ids: Tensor,                # [M, K] int64
+    topk_ids: Tensor,                # [M, K] int32/int64, 1 <= K <= 30
     expert_map: Optional[Tensor],
     expert_num_tokens: Tensor,       # [E] int32 counts (in) / offsets (out)
     aq_out: Tensor,                  # [M_sum, H] int8
@@ -96,7 +96,7 @@ def ep_fused_quant_scatter(
 @compile_ops("module_moe_utils")
 def ep_fused_fp8_quant_scatter(
     input: Tensor,                   # [M, H] fp16/bf16
-    topk_ids: Tensor,                # [M, K] int64
+    topk_ids: Tensor,                # [M, K] int32/int64, 1 <= K <= 30
     expert_map: Optional[Tensor],
     expert_num_tokens: Tensor,       # [E] int32 counts (in) / offsets (out)
     aq_out: Tensor,                  # [M_sum, H] fp8 bytes
@@ -113,7 +113,7 @@ def ep_fused_fp8_quant_scatter(
 @compile_ops("module_moe_utils")
 def ep_fused_smooth_quant_scatter(
     input: Tensor,                   # [M, H] fp16/bf16
-    topk_ids: Tensor,                # [M, K] int64 (K = 4 or 8)
+    topk_ids: Tensor,                # [M, K] int32/int64, 1 <= K <= 30
     expert_map: Optional[Tensor],
     expert_offsets: Tensor,          # [E] int32 start offsets (pre-scanned)
     smooth_scale: Tensor,            # [E, H] fp32

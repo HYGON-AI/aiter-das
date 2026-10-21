@@ -88,3 +88,9 @@ from .ops.kvcache_metadata import fused_metadata_kernel_general
 from .ops.blockwise_scaling import *
 from .utility import dtypes,fp4_utils
 from .ops.fused_rmsnorm_rope import *
+from .ops.moe_routing import (
+    RoutingBuffers, allocate_moe_routing, moe_routing_workspace_size,
+    moe_routing_prepare_out, moe_routing_scatter_out, moe_routing_gather_out,
+    moe_routing_cumsum_out, check_moe_routing_status, moe_init_routing_out,
+    moe_finalize_routing_out,
+)

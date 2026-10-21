@@ -19,7 +19,7 @@ vs torch cast may differ on rounding ties).
 Besides the original shapes, the suite pins down every host dispatch branch
 and the kernel-side edge cases:
 
-  * ep_scatter: fast-vs-generic kernel boundary (num_tokens=4096 / H=8192),
+  * ep_scatter: fast-vs-generic kernel boundary (K=8 / H=8192),
     M=1, K=1, E=1 (single expert), E=1024 (EP_SCAN_MAX_EXPERTS), align=1,
     all tokens dropped (M_sum=0), all tokens on one expert (skew).
   * ep_build_m_indices: E=1024 grid-stride tail, E=1 / align=1, odd M with
@@ -57,6 +57,127 @@ from aiter.ops.moe_op import (
 )
 
 DEV = "cuda"
+
+
+@pytest.mark.parametrize("K", [1,2,4,8,9,15,16,17,20,25,30])
+@pytest.mark.parametrize("id_dtype", [torch.int32,torch.int64])
+def test_l03_extended_routes(K, id_dtype):
+    M,H,E,A=7,128,1200,16
+    ids=torch.arange(M*K,device=DEV).reshape(M,K)%3+1202
+    ids=ids.to(id_dtype)
+    mapping=torch.full((1208,),-1,device=DEV,dtype=torch.int32)
+    mapping[1202:1205]=torch.tensor([0,1024,1199],device=DEV,dtype=torch.int32)
+    ids.flatten()[::11]=-1
+    ids.flatten()[1::13]=2**31-1
+    mapped=map_ids(ids,mapping,E)
+    valid,counts,starts,padded,T=layout(mapped,E,A)
+    x=torch.randn(M,H,device=DEV,dtype=torch.bfloat16)
+    q=torch.randint(-127,128,(M,H),device=DEV,dtype=torch.int8)
+    scale=torch.rand(M,1,device=DEV); out=torch.zeros(T,H,device=DEV,dtype=torch.int8)
+    oscale=torch.ones(T,1,device=DEV); mi=torch.full((T,),-1,device=DEV,dtype=torch.int32)
+    inv=torch.full((M,K),-1,device=DEV,dtype=torch.int32)
+    ep_scatter(q,scale,ids,mapping,counts.int(),out,oscale,mi,inv,E,A)
+    check_perm_layout(inv,mi,mapped,counts,starts,T)
+    check_scatter_data(out,oscale,inv,mapped,q,scale)
+    for mode in ['int8','fp8','smooth']:
+        inv.fill_(123);mi.fill_(-1)
+        if mode=='int8':ep_fused_quant_scatter(x,ids,mapping,counts.int(),out,oscale,mi,inv,E,A)
+        elif mode=='fp8':ep_fused_fp8_quant_scatter(x,ids,mapping,counts.int(),out,oscale,mi,inv,E,A,1,False)
+        else:
+            smooth=torch.ones(E,H,device=DEV)
+            ep_fused_smooth_quant_scatter(x,ids,mapping,starts.int(),smooth,out,oscale,mi,inv,E,A)
+        check_perm_layout(inv,mi,mapped,counts,starts,T)
+        mid=torch.randn(T,H,device=DEV,dtype=torch.float32);w=torch.rand(M,K,device=DEV);y=torch.full((M,H),100.,device=DEV)
+        ep_gather(mid,ids,w,inv,mapping,y)
+        ref=torch.zeros_like(y)
+        for k in range(K):
+            mask=inv[:,k]>=0;ref[mask]+=mid[inv[mask,k].long()]*w[mask,k,None]
+        torch.testing.assert_close(y,ref,rtol=2e-6,atol=2e-6)
+    built=torch.empty(T,device=DEV,dtype=torch.int32)
+    ep_build_m_indices(mapped,built,E,A)
+    assert torch.equal(built,full_m_indices_ref_fast(starts,counts,padded,E,fill_with_expert=False))
+
+
+def test_l03_zero_empty_and_generic_k():
+    ids=torch.zeros(2,30,device=DEV,dtype=torch.int32)
+    x=torch.zeros(2,128,device=DEV,dtype=torch.bfloat16)
+    q=torch.empty(60,128,device=DEV,dtype=torch.int8);s=torch.empty(60,1,device=DEV)
+    mi=torch.empty(60,device=DEV,dtype=torch.int32);inv=torch.empty_like(ids)
+    ep_fused_quant_scatter(x,ids,None,torch.tensor([60],device=DEV,dtype=torch.int32),q,s,mi,inv,1,1)
+    assert torch.count_nonzero(q)==0 and torch.equal(s,torch.ones_like(s))
+    empty=ids[:0];cursor=torch.full((1,),77,device=DEV,dtype=torch.int32)
+    ep_fused_quant_scatter(x[:0],empty,None,cursor,q,s,mi,inv[:0],1,1)
+    assert torch.count_nonzero(cursor)==0 and torch.all(mi==-1)
+    many=torch.zeros((2,33),device=DEV,dtype=torch.int64);built=torch.empty(66,device=DEV,dtype=torch.int32)
+    ep_build_m_indices(many,built,1,1)
+    assert torch.count_nonzero(built)==0
+
+
+@pytest.mark.parametrize('mode',['plain','int8','fp8_e4m3','fp8_e5m2','smooth'])
+def test_l03_changing_graph_stream(mode):
+    from aiter.ops.moe_routing import allocate_moe_routing
+    M,H,K,E,A=31,128,30,1200,16
+    ids=torch.randint(E,(M,K),device=DEV,dtype=torch.int32);w=torch.randn(M,K,device=DEV)
+    b=allocate_moe_routing(ids,E,A);T=b.route_ids.numel()
+    x=torch.randn(M,H,device=DEV,dtype=torch.bfloat16);q=torch.randint(-127,128,(M,H),device=DEV,dtype=torch.int8)
+    src_scale=torch.ones(M,1,device=DEV);smooth=torch.rand(E,H,device=DEV)+.5
+    out=torch.empty(T,H,device=DEV,dtype=torch.int8);scale=torch.empty(T,1,device=DEV)
+    mi=torch.empty(T,device=DEV,dtype=torch.int32);inv=torch.empty(M,K,device=DEV,dtype=torch.int32);built=torch.empty_like(mi);cursor=torch.empty_like(b.counts)
+    mid=torch.randn(T,H,device=DEV,dtype=torch.float32);y=torch.empty(M,H,device=DEV)
+    def run():
+        b.prepare(ids,w);out.zero_();scale.fill_(1);mi.fill_(-1)
+        cursor.copy_(b.offsets if mode=='smooth' else b.counts)
+        if mode=='plain':ep_scatter(q,src_scale,ids,None,cursor,out,scale,mi,inv,E,A)
+        elif mode=='int8':ep_fused_quant_scatter(x,ids,None,cursor,out,scale,mi,inv,E,A)
+        elif mode=='smooth':ep_fused_smooth_quant_scatter(x,ids,None,cursor,smooth,out,scale,mi,inv,E,A)
+        else:ep_fused_fp8_quant_scatter(x,ids,None,cursor,out,scale,mi,inv,E,A,int(mode=='fp8_e5m2'),False)
+        ep_gather(mid,ids,w,inv,None,y);ep_build_m_indices(ids,built,E,A)
+    stream=torch.cuda.Stream();stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph=torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):run()
+    for i in range(3):
+        ids.copy_(torch.randint(E,ids.shape,device=DEV,dtype=torch.int32));ids.view(-1)[::i+2]=-1
+        x.add_(.25);q.add_(1);w.mul_(-.5);graph.replay();torch.cuda.synchronize()
+        mapped=map_ids(ids,None,E);valid,counts,starts,padded,total=layout(mapped,E,A)
+        check_perm_layout(inv,mi,mapped,counts,starts,T)
+        expected=torch.full((T,),-1,device=DEV,dtype=torch.int32)
+        expected[:total]=full_m_indices_ref_fast(starts,counts,padded,E,fill_with_expert=False)
+        assert torch.equal(built,expected)
+        reference=torch.zeros_like(y)
+        for k in range(K):
+            valid=inv[:,k]>=0;reference[valid]+=mid[inv[valid,k].long()]*w[valid,k,None]
+        torch.testing.assert_close(y,reference,rtol=2e-6,atol=2e-6)
+        if mode=='plain':check_scatter_data(out,scale,inv,mapped,q,src_scale)
+
+
+def test_l03_empty_dtype_validation():
+    ids=torch.empty(0,1,device=DEV,dtype=torch.int32)
+    count=torch.zeros(1,device=DEV,dtype=torch.int32)
+    x=torch.empty(0,128,device=DEV,dtype=torch.bfloat16)
+    q=torch.empty(0,128,device=DEV,dtype=torch.int8)
+    scale=torch.empty(0,1,device=DEV)
+    mi=torch.empty(0,device=DEV,dtype=torch.int32);inv=torch.empty_like(ids)
+    with pytest.raises(RuntimeError):ep_scatter(x,scale,ids,None,count,q,scale,mi,inv,1,1)
+    with pytest.raises(RuntimeError):ep_fused_fp8_quant_scatter(x,ids,None,count,x,scale,mi,inv,1,1,0,False)
+    with pytest.raises(RuntimeError):ep_fused_fp8_quant_scatter(x,ids,None,count,q,scale,mi,inv,1,1,2,False)
+
+
+def test_l03_reject_metadata():
+    x=torch.ones(2,128,device=DEV,dtype=torch.bfloat16);ids=torch.zeros(2,1,device=DEV,dtype=torch.int32)
+    counts=torch.tensor([2],device=DEV,dtype=torch.int32);q=torch.empty(2,128,device=DEV,dtype=torch.int8)
+    scale=torch.empty(2,1,device=DEV);mi=torch.empty(2,device=DEV,dtype=torch.int32);inv=torch.empty_like(ids)
+    for K in [0,31]:
+        bad=torch.zeros(2,K,device=DEV,dtype=torch.int32)
+        with pytest.raises(RuntimeError):ep_fused_quant_scatter(x,bad,None,counts,q,scale,mi,torch.empty_like(bad),1,1)
+    with pytest.raises(RuntimeError):ep_fused_quant_scatter(x,ids,None,counts.cpu(),q,scale,mi,inv,1,1)
+    with pytest.raises(RuntimeError):ep_fused_quant_scatter(x[:,1:],ids,None,counts,q,scale,mi,inv,1,1)
+    raw=torch.empty(x.numel()+1,device=DEV,dtype=x.dtype);unaligned=raw[1:].view_as(x)
+    with pytest.raises(RuntimeError):ep_fused_quant_scatter(unaligned,ids,None,counts,q,scale,mi,inv,1,1)
+    with pytest.raises(RuntimeError):ep_build_m_indices(ids,ids.view(-1),1,1)
+    mid=torch.ones(2,128,device=DEV);w=torch.ones(2,1,device=DEV)
+    with pytest.raises(RuntimeError):ep_gather(mid,ids,w,inv,None,mid)
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +350,7 @@ def _run_ep_scatter_case(topk_ids, expert_map, E_local, align, *, H=2048):
     [
         (512, 7168, 8, 64, 256, False),    # fast kernel, deepseek-like shape
         (333, 2048, 4, 64, 128, False),    # fast kernel, odd num_tokens
-        (5000, 2048, 8, 64, 256, False),   # num_tokens > 4096 -> generic kernel
+        (5000, 2048, 8, 64, 256, False),   # large-M fast kernel
         (256, 16384, 2, 8, 256, False),    # H > 8192 -> generic kernel
         (200, 1024, 4, 32, 64, True),      # expert_map with dropped experts
     ],
