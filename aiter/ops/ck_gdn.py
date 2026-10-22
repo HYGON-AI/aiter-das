@@ -13,7 +13,7 @@ implicit fallback between them.
 CK GDN constraints (enforced by the native layer):
 
 * ``head_dim == 128`` and ``chunk_size == 64`` are fixed;
-* ``h_v / h_qk`` must be in ``{1, 2, 4}``;
+* prefill requires ``h_v / h_qk`` in ``{1, 2, 3, 4}``;
 * inputs are packed -- there is no leading batch dimension;
 * prefill always materialises ``v_new`` internally because CK's output stage
   consumes it;

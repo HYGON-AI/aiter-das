@@ -131,11 +131,22 @@ def test_wrong_head_dim_is_rejected():
         aiter.ck_gdn_prefill_workspace_bytes(q, v)
 
 
+@pytest.mark.parametrize("heads,value_heads", [(2, 10), (4, 20)])
+def test_unsupported_head_ratio_is_rejected(heads, value_heads):
+    torch.manual_seed(0)
+    q = torch.randn(64, heads, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(64, value_heads, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(RuntimeError, match=r"h_v / h_qk in \{1,2,3,4\}"):
+        aiter.ck_gdn_prefill_workspace_bytes(q, v)
+
+
 # --------------------------------------------------------------------------- #
 # 2. CK prefill vs CK decode
 # --------------------------------------------------------------------------- #
+# (2, 6) and (8, 24) cover the ratio-3 grouping (small and large value-head
+# counts, i.e. the GroupSize=1 two-row and GroupSize=3 paths).
 @pytest.mark.parametrize("dtype_name", ["bf16", "fp16"])
-@pytest.mark.parametrize("heads,value_heads", [(2, 8), (2, 4), (2, 2)])
+@pytest.mark.parametrize("heads,value_heads", [(2, 8), (2, 4), (2, 2), (2, 6), (8, 24)])
 @pytest.mark.parametrize("tokens", [192, 1024])
 def test_ck_prefill_matches_ck_decode(dtype_name, heads, value_heads, tokens):
     torch.manual_seed(0)
