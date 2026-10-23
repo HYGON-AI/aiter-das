@@ -233,12 +233,25 @@ class NinjaBuildExtension(BuildExtension):
         super().__init__(*args, **kwargs)
 
 
+AITER_FIXED_VERSION = os.environ.get("AITER_FIXED_VERSION", "0.1.7")
+AITER_USE_SCM_VERSION = int(os.environ.get("AITER_USE_SCM_VERSION", 0))
+version_kwargs = {"use_scm_version": True} if AITER_USE_SCM_VERSION else {"version": AITER_FIXED_VERSION}
+
+# setup_requires is checked against the active environment in
+# --no-build-isolation builds, and a mismatch triggers a download that fails
+# offline. setuptools_scm is only used for SCM versioning.
 setup_requires = [
     "packaging",
     "psutil",
-    "ninja==1.11.1",
-    "setuptools_scm==10.2.1",
+    # ninja is intentionally not checked here: the kernel prebuild above runs
+    # before setup() processes setup_requires, and JIT builds invoke the
+    # `ninja` executable on PATH, which a fetched setup_requires egg does not
+    # provide. The pin stays in pyproject.toml, requirements.txt and
+    # install_requires.
+    # "ninja==1.11.1",
 ]
+if AITER_USE_SCM_VERSION:
+    setup_requires.append("setuptools_scm==10.2.1")
 if PREBUILD_KERNELS == 1:
     setup_requires.append("pandas")
 
@@ -247,10 +260,6 @@ class ForcePlatlibDistribution(Distribution):
     def has_ext_modules(self):
         return True
 
-
-AITER_FIXED_VERSION = os.environ.get("AITER_FIXED_VERSION", "0.1.7")
-AITER_USE_SCM_VERSION = int(os.environ.get("AITER_USE_SCM_VERSION", 0))
-version_kwargs = {"use_scm_version": True} if AITER_USE_SCM_VERSION else {"version": AITER_FIXED_VERSION}
 
 # Include implicit namespaces such as configs and ops, not just packages with
 # __init__.py. Keep generated sources exclusive to non-editable distributions.
