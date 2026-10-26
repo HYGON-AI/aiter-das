@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 // Modified by Hygon Information Technology Co., Ltd.: adapt vector loads and
-// quantization dispatch, handle zero scales, and add fused SwiGLU quantization.
+// quantization dispatch, handle zero scales, add fused SwiGLU quantization,
+// and optimize per-token INT8 quantization with wave-contained reductions.
 // SPDX-License-Identifier: Apache-2.0 AND MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 // Copyright (c) 2026 Hygon Information Technology Co., Ltd.
@@ -537,6 +538,56 @@ dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     }
 }
 
+template <typename DTYPE_I, int cols>
+__global__ void dynamic_per_token_int8_quant_wave_kernel(
+    ck_tile::int8_t* __restrict__ out,
+    float* __restrict__ scale,
+    const DTYPE_I* __restrict__ input,
+    int rows,
+    const int32_t* __restrict__ num_rows,
+    int num_rows_factor)
+{
+    constexpr int group_size     = 32;
+    constexpr int vec_size       = 4;
+    constexpr int rows_per_block = 4;
+    constexpr int chunks         = cols / (group_size * vec_size);
+    static_assert(cols % (group_size * vec_size) == 0);
+    const int row = blockIdx.x * rows_per_block + threadIdx.x / group_size;
+    if(row >= rows || (num_rows != nullptr && row >= *num_rows * num_rows_factor))
+        return;
+
+    const int lane = threadIdx.x % group_size;
+    using vec_i    = ck_tile::vec_t<DTYPE_I, vec_size>;
+    using vec_o    = ck_tile::vec_t<ck_tile::int8_t, vec_size>;
+    vec_i values[chunks];
+    float abs_max = 0.0f;
+#pragma unroll
+    for(int c = 0; c < chunks; ++c)
+    {
+        const int64_t offset = int64_t(row) * cols + (lane + c * group_size) * vec_size;
+        values[c] = *reinterpret_cast<const vec_i*>(input + offset);
+#pragma unroll
+        for(int j = 0; j < vec_size; ++j)
+            abs_max = fmaxf(abs_max, fabsf(ck_tile::type_convert<float>(values[c][j])));
+    }
+    // Each row fits in half a wave; no LDS or block-wide synchronization is needed.
+#pragma unroll
+    for(int offset = group_size / 2; offset > 0; offset /= 2)
+        abs_max = fmaxf(abs_max, __shfl_xor(abs_max, offset, group_size));
+
+    abs_max = fmaxf(abs_max, 1e-10f);
+    const float multiplier = 127.0f / abs_max;
+    if(lane == 0)
+        scale[row] = abs_max * (1.0f / 127.0f);
+#pragma unroll
+    for(int c = 0; c < chunks; ++c)
+    {
+        const int64_t offset = int64_t(row) * cols + (lane + c * group_size) * vec_size;
+        *reinterpret_cast<vec_o*>(out + offset) =
+            ck_tile::vec_convert<ck_tile::int8_t, DTYPE_I, vec_size>(values[c], multiplier);
+    }
+}
+
 template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16>
 __device__ std::tuple<float, float*>
 smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
@@ -790,6 +841,19 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
+    if(cols == 640 && rows >= 512 && input.scalar_type() == torch::kBFloat16 &&
+       out.scalar_type() == torch::kInt8)
+    {
+        aiter::dynamic_per_token_int8_quant_wave_kernel<ck_tile::bf16_t, 640>
+            <<<(rows + 3) / 4, 128, 0, stream>>>(
+                reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()),
+                scales.data_ptr<float>(),
+                reinterpret_cast<const ck_tile::bf16_t*>(input.data_ptr()),
+                rows,
+                num_rows_ptr,
+                num_rows_factor);
+        return;
+    }
 
     if(cols == 32 || cols == 64 || cols == 128)
     {
