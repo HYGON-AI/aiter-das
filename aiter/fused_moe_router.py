@@ -227,6 +227,8 @@ def _asm_execute(ctx: FusedMoeExecContext):
     shuffle tables, sorting, activation and moe_sum itself, and launches only
     solutions whose block size matches the blob's launch bounds.
     """
+    import torch
+
     from aiter.fused_moe_asm_wna16 import fused_experts_asm_impl
     from aiter.ops.shuffle import asm_shuffle_weight_b8
 
@@ -235,6 +237,11 @@ def _asm_execute(ctx: FusedMoeExecContext):
     if "SOL_ID1" not in cfg or "SOL_ID2" not in cfg:
         return None  # no usable solution in the config: do not launch
     out_dtype = ctx.dtype or ctx.hidden_states.dtype
+    if out_dtype == torch.float32:
+        raise ValueError(
+            "fused_moe(asm): fp32 output is unsupported; asm supports only "
+            "fp16 and bf16 output"
+        )
     is_w8a8 = problem.quant_kind in ("w8a8", "w8a8_block")
     use_shuffle = int(cfg.get("USE_SHUFFLE", problem.use_shuffle) or 0)
     padded_k = cfg.get("PADDED_K")
@@ -349,6 +356,12 @@ def _moe_c_execute(ctx: FusedMoeExecContext):
     from aiter.fused_moe_c import moe_c_fused_experts
 
     problem, plan = ctx.problem, ctx.plan
+    out_dtype = ctx.dtype or ctx.hidden_states.dtype
+    if out_dtype != ctx.hidden_states.dtype:
+        raise ValueError(
+            "fused_moe(moe_c): dtype must equal activation dtype; "
+            f"got dtype={out_dtype}, activation dtype={ctx.hidden_states.dtype}"
+        )
     w1, w2 = ctx.w1, ctx.w2
     # Weights marked "marlin" were already shuffled by the same functions; do
     # not shuffle twice.
@@ -615,6 +628,9 @@ def _moe_c_lookup(problem: FusedMoeProblem) -> dict | None:
         _moe_block_size(problem),
         k=problem.model_dim,
         top_k=problem.topk,
+        # Must match the execute-time key str(compute_dtype); without it fp16
+        # problems match bf16 rows and the execute-time lookup asserts.
+        indtype=str(_torch_dtype(problem)),
     )
     if cfg is None:
         return None
