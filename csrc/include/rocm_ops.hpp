@@ -107,7 +107,7 @@ namespace py = pybind11;
 
 #define ACTIVATION_PYBIND                                                                               \
       m.def("silu_and_mul", &aiter::silu_and_mul, "Activation function used in SwiGLU.",                \
-            py::arg("out"), py::arg("input"));                                                          \
+            py::arg("out"), py::arg("input"), py::arg("limit") = 0.0f);                                 \
       m.def("scaled_silu_and_mul", &aiter::scaled_silu_and_mul, "Activation function used in scaled SwiGLU.",\
             py::arg("out"), py::arg("input"), py::arg("scale"));                                             \
       m.def("gelu_and_mul", &aiter::gelu_and_mul, "Activation function used in GELU.",                       \
