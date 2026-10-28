@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Static checks for the vLLM-schema MoE configs owned by AITER.
 
 These tests need neither a GPU nor an installed ``aiter`` package: the config
