@@ -11,6 +11,7 @@ _PERF_MODEL_CHIP_ARCHS = {
     # discovery, so keep the build target explicit when Shaobo is requested.
     "sb": "gfx946",
     "sbx2": "gfx946",
+    "sbx4": "gfx946",
 }
 
 
