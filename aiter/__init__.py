@@ -51,7 +51,7 @@ from .jit import core
 # from .ops.enum import *
 from .ops.norm import *
 from .ops.quant import *
-# from .ops.gemm_op_a8w8 import *
+from .ops.gemm_op_a8w8 import gemm_a8w8, gemm_a8w8_CK, gemm_a8w8_blockscale, gemm_a8w8_blockscale_CK
 # from .ops.batched_gemm_op_a8w8 import *
 # from .ops.batched_gemm_op_bf16 import *
 from .ops.aiter_operator import *

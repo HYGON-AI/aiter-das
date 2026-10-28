@@ -6,6 +6,7 @@
 #include "gemm_a8w8_manifest.h"
 #include "gemm_a8w8_lookup.h"
 #include <cmath>
+#include <climits>
 #include "py_itfs_common.h"
 
 using RowwiseKernel = std::function<
@@ -36,6 +37,19 @@ using RowwiseKernelMap = std::unordered_map<
 template <typename ABDataType, typename DDataType, typename EDataType>
 RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
 {
+#if AITER_W8A8_HCU
+  // Small M needs enough independent workgroups. Larger M/N can amortize
+  // global loads with wider tiles; avoid the 128-row tile at medium M/N.
+  if(M >= 64 && N >= 128)
+  {
+    if(M >= 512 || (M >= 128 && N >= 8192))
+      return a8w8_rowwise_256x128x128x128_16x16_4x4_8x32x1_8x32x1_1x32x1x8_4x4x1_1x1_intrawave_v1<ABDataType, DDataType, EDataType>;
+    return a8w8_rowwise_256x64x128x128_16x16_2x4_8x32x1_8x32x1_1x32x1x8_4x4x1_1x1_intrawave_v1<ABDataType, DDataType, EDataType>;
+  }
+  if(M >= 16 && N >= 64)
+    return a8w8_rowwise_128x16x64x128_16x16_1x2_8x16x1_8x16x1_1x16x1x8_4x4x1_1x1_intrawave_v1<ABDataType, DDataType, EDataType>;
+  return a8w8_rowwise_64x16x16x128_16x16_1x1_8x8x1_8x8x1_1x16x1x4_4x4x1_1x1_intrawave_v1<ABDataType, DDataType, EDataType>;
+#else
   // Apply shape heuristics to find a suitable kernel implementation.
   if (M < 64 && N < 2048 && K < 2048)
   {
@@ -87,6 +101,7 @@ RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
     // Fallback large kernel.
     return a8w8_rowwise_256x224x256x128_16x16_7x8_8x32x1_8x32x1_1x32x1x8_8x8x1_1x2_intrawave_v3<ABDataType, DDataType, EDataType>;
   }
+#endif
 }
 
 // Helper function to return the next largest power of 2
@@ -150,14 +165,37 @@ torch::Tensor gemm_a8w8(
     std::optional<torch::Tensor> bias,
     int splitK)
 {
+  TORCH_CHECK(XQ.dim() == 2 && WQ.dim() == 2 && Y.dim() == 2,
+              "W8A8 expects two-dimensional A, B and output");
+  TORCH_CHECK(XQ.size(1) == WQ.size(1) && XQ.size(1) > 0 && WQ.size(0) > 0 &&
+                  Y.size(0) == XQ.size(0) && Y.size(1) == WQ.size(0), "W8A8 shape mismatch");
+  for (const auto& tensor : {XQ, WQ, x_scale, w_scale, Y})
+    TORCH_CHECK(tensor.is_cuda() && tensor.device() == XQ.device() && tensor.is_contiguous(),
+                "W8A8 tensors must be contiguous on the same HIP device");
+  TORCH_CHECK(XQ.numel() <= INT_MAX && WQ.numel() <= INT_MAX && Y.numel() <= INT_MAX,
+              "W8A8 exceeds CK 32-bit indexing capacity");
+  TORCH_CHECK(x_scale.numel() == XQ.size(0) && w_scale.numel() == WQ.size(0),
+              "W8A8 rowwise scale sizes must be M and N");
+  TORCH_CHECK(x_scale.scalar_type() == at::ScalarType::Float || x_scale.scalar_type() == Y.scalar_type(),
+              "W8A8 scales must be FP32 or match the output dtype");
+  TORCH_CHECK(Y.scalar_type() == at::ScalarType::Half || Y.scalar_type() == at::ScalarType::BFloat16,
+              "W8A8 output must be FP16 or BF16");
+#if AITER_W8A8_HCU
+  TORCH_CHECK(splitK == 0, "W8A8 HCU baseline supports splitK=0; split-K with bias/low-precision atomics is not supported");
+#else
+  TORCH_CHECK(splitK >= 0 && splitK <= 16, "W8A8 invalid splitK exponent");
+#endif
   TORCH_CHECK((XQ.dtype() == at::ScalarType::Char || XQ.dtype() == torch_fp8) &&
                   XQ.dtype() == WQ.dtype(),
               "Weights and activations should both be int8/fp8!");
   TORCH_CHECK(x_scale.dtype() == w_scale.dtype(),
               "Scales should have the same dtype!");
   if (bias != std::nullopt)
-    TORCH_CHECK(bias.value().dtype() == Y.dtype(),
-                "Out and bias should have the same dtype!");
+    TORCH_CHECK(bias.value().dtype() == Y.dtype() && bias.value().is_contiguous() &&
+                    bias.value().device() == XQ.device() && bias.value().numel() == WQ.size(0),
+                "W8A8 bias must contain N contiguous elements and match output dtype/device");
+
+  if (XQ.size(0) == 0) return Y;
 
   int M = XQ.size(0);
   int N = WQ.size(0);

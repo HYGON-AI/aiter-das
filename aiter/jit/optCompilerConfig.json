@@ -1,4 +1,39 @@
 {
+    "module_gemm_a8w8": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gemm_a8w8.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DAITER_W8A8_HCU=1'",
+            "'-DCK_W8A8_NATIVE_I8_X32=1'",
+            "'-DCK_W8A8_ENABLE_MULTIDIE=1' if 'gfx946' in get_gfx().split(';') else None"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/include'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --hcu --working_path {{}}'"
+    },
+    "module_gemm_a8w8_blockscale": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DAITER_W8A8_HCU=1'",
+            "'-DCK_W8A8_ENABLE_MULTIDIE=1' if 'gfx946' in get_gfx().split(';') else None"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/include'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --hcu --working_path {{}}'"
+    },
     "module_aiter_enum": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/aiter_enum_pybind.cu'"

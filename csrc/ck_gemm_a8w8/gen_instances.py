@@ -160,7 +160,7 @@ torch::Tensor
         INSTANCE_template = """// SPDX-License-Identifier: MIT
  
 
-#include "{name}.cuh"
+#include "../impl/{name}.cuh"
 
 template torch::Tensor
 {name}<{dtypes}>(
@@ -318,6 +318,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tune", action="store_true", required=False, help="generated tune instances"
     )
+    parser.add_argument("--hcu", action="store_true", help="generate native HCU 16x16 MMAC instances")
 
     # parser.add_argument(
     #     "--out_type",
@@ -340,7 +341,20 @@ if __name__ == "__main__":
     args = parser.parse_args()
     codegen = gemm_a8w8_fwd_codegen(args.working_path, args.tune)
 
-    if args.tune:
+    if args.hcu:
+        # Native 16x16 MMAC instances measured on gfx938. Keep the small
+        # fallback for decode/tiny shapes; large tiles increase A/B reuse.
+        codegen.gen_instances({
+            -1: kernelInstance(64, 16, 16, 128, 16, 16, 1, 1,
+                [8, 8, 1], [8, 8, 1], [1, 16, 1, 4], [4, 4, 1], 1, 1, "Intrawave", 1),
+            -2: kernelInstance(128, 16, 64, 128, 16, 16, 1, 2,
+                [8, 16, 1], [8, 16, 1], [1, 16, 1, 8], [4, 4, 1], 1, 1, "Intrawave", 1),
+            -3: kernelInstance(256, 64, 128, 128, 16, 16, 2, 4,
+                [8, 32, 1], [8, 32, 1], [1, 32, 1, 8], [4, 4, 1], 1, 1, "Intrawave", 1),
+            -4: kernelInstance(256, 128, 128, 128, 16, 16, 4, 4,
+                [8, 32, 1], [8, 32, 1], [1, 32, 1, 8], [4, 4, 1], 1, 1, "Intrawave", 1),
+        })
+    elif args.tune:
         codegen.gen_instances(kernels_list)
     else:
         codegen.gen_instances(get_tune_dict(args.tune_file))

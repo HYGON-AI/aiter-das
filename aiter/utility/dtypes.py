@@ -10,6 +10,7 @@ defaultDtypes = {
 
     "gfx938": {"fp8": torch.float8_e4m3fn},
     "gfx92a": {"fp8": torch.float8_e4m3fn},
+    "gfx946": {"fp8": torch.float8_e4m3fn},
 
 }
 
