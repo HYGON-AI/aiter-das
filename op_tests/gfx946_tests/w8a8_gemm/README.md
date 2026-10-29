@@ -2,6 +2,21 @@
 
 `test_w8a8_gemm.py` 只依赖标准库、AITER、Torch 和当前环境的 HIP/HSA 软件包。不导入临时脚本、不读取历史结果；`--json` 可省略，指定时只写本轮结果。首次构建需要仓库内完整 CK 子模块和 HIP 编译器。每个数值用例仅调用一次公开算子，没有 warmup、Graph 或性能循环。
 
+## 架构支持与混合架构构建
+
+`gemm_a8w8_CK` 的 INT8 路径支持 gfx936；本次 FP8 rowwise、block128 和 MX32 路径使用原生 16×16 FP8 MMAC，仅支持 gfx92a、gfx938、gfx946。gfx936 上调用非空 FP8 GEMM 会明确报错，不做隐式精度转换。空 M 保持返回空输出的约定。gfx92a 为源码支持范围，本文未提供该架构的运行验证。
+
+`GPU_ARCHS='gfx936;gfx938'` 构建会保留 gfx936 INT8 和 gfx938 INT8/FP8，FP8 实例按设备编译目标隔离。运行时使用输入 Tensor 的实际设备检查支持范围，不以 `GPU_ARCHS` 或当前设备代替输入设备。
+
+从仓库根目录执行下面的 gfx936 回归，覆盖 16 个 INT8 数值用例，以及公开接口和 native 接口的 12 个 FP8 拒绝用例。修改源码后需先重新构建两个 JIT 模块；也可指定一个新的 `AITER_JIT_DIR` 使用独立缓存。
+
+```bash
+GPU_ARCHS='gfx936;gfx938' PYTHONPATH="$(pwd)" \
+  python op_tests/gfx946_tests/w8a8_gemm/test_w8a8_arch.py
+```
+
+2026-10-29 回归结果：DTK 26.04 下两个模块的 `gfx936;gfx938` 混合构建通过；gfx936 上述 28 项通过，gfx938 的 `full`、`optimized`、`contracts` 共 80 项通过。gfx946 使用 HIP 6.3.3 重新构建，Perf Model 单 die quick 8 项、双 die quick 8 项及双 die FP8 route 6 项均通过。这些结果验证编译与正确性，不代表 gfx946 实机性能。
+
 ## Perf Model
 
 在已配置 PyTorch/HIP 和 Perf Model 的环境中，从 AITER 仓库根目录执行。先按实际安装环境设置 `ROCM_PATH`（HIP SDK 根目录）和 `PMD_PATH`（Perf Model 运行库目录）；下面命令沿用这两个环境变量。

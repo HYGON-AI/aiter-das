@@ -8,6 +8,7 @@
 #include <cmath>
 #include <climits>
 #include "py_itfs_common.h"
+#include "w8a8_arch.h"
 
 namespace {
 struct E8M0ScaleArgs
@@ -163,6 +164,7 @@ torch::Tensor gemm_a8w8_blockscale(
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(),
                 "Scales should have the same dtype!");
     if (XQ.size(0) == 0) return Y;
+    check_w8a8_fp8_device(XQ);
 
   int M = XQ.size(0);
   int N = WQ.size(0);

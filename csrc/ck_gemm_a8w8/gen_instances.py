@@ -187,6 +187,12 @@ template torch::Tensor
                         intsance = INSTANCE_template.format(
                             name=k.name, dtypes=f"{ABDtype}, {DDtype}, {EDtype}"
                         )
+                        if ABDtype == "F8":
+                            # Keep host symbols and supported device code in a fat
+                            # binary, without instantiating FP8 CK kernels on gfx936.
+                            intsance = """#if !defined(__HIP_DEVICE_COMPILE__) || !defined(AITER_W8A8_HCU) || \\
+    defined(__gfx92a__) || defined(__gfx938__) || defined(__gfx946__)
+""" + intsance + "\n#endif\n"
                         Path(
                             os.path.join(
                                 self.instances_path,

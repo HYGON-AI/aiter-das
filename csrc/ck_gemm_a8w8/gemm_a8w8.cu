@@ -8,6 +8,7 @@
 #include <cmath>
 #include <climits>
 #include "py_itfs_common.h"
+#include "w8a8_arch.h"
 
 using RowwiseKernel = std::function<
     torch::Tensor(torch::Tensor &, torch::Tensor &,
@@ -227,6 +228,7 @@ torch::Tensor gemm_a8w8(
   }
   else
   {
+    check_w8a8_fp8_device(XQ);
     if (x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
       rowwise_dispatch<F8, F32, F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);

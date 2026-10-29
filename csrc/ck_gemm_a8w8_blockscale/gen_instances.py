@@ -112,6 +112,11 @@ torch::Tensor
         )
 
         INSTANCE_template = """// SPDX-License-Identifier: MIT
+
+// FP8 has no native CK implementation on gfx936. Keep the host symbols
+// and only instantiate device kernels for supported targets in fat binaries.
+#if !defined(__HIP_DEVICE_COMPILE__) || !defined(AITER_W8A8_HCU) || \\
+    defined(__gfx92a__) || defined(__gfx938__) || defined(__gfx946__)
  
 
 #include "../impl/{name}.cuh"
@@ -125,6 +130,7 @@ template torch::Tensor
     torch::Tensor &Y
     );
 
+#endif
 """
         scale_type = "F32"
         INSTANCE_dFP32_eBF16 = INSTANCE_template.format(name=k.name, dtypes=f"{scale_type}, B16")
