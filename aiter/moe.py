@@ -350,8 +350,9 @@ def _try_get_asm_config(
             if block_size == 32:
                 if top_k > 8 or n != 256 or k != 7168:
                     return None
-                else:
-                    return decode_sol_w4a16_gw32()
+                if arch == "gfx92a":
+                    return None
+                return decode_sol_w4a16_gw32()
 
             solution = get_moe_asm_solution(
                 arch=arch,
