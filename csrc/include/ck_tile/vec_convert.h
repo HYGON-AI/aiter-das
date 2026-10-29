@@ -41,12 +41,14 @@ struct numeric<fp4x2_t>
 CK_TILE_DEVICE fp32x2_v amd_assembly_pk_mul_f32(fp32x2_v a, fp32x2_t b)
 {
     fp32x2_v c;
-#if defined(__gfx938__) || defined(__gfx946__) || defined(__gfx936__)
+#if defined(__gfx92a__) || defined(__gfx938__) || defined(__gfx946__) || defined(__gfx936__)
     asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(c) : "v"(a), "v"(b));
 #else
+    // The first multiply writes its output before the second consumes its inputs.
+    // Keep that output from aliasing an input still needed by the second multiply.
     asm volatile("v_mul_f32 %[v_result0], %[v_a0], %[v_b0]\n\t"
                  "v_mul_f32 %[v_result1], %[v_a1], %[v_b1]\n\t"
-                 : [v_result0] "=v"(c[0]), [v_result1] "=v"(c[1])
+                 : [v_result0] "=&v"(c[0]), [v_result1] "=v"(c[1])
                  : [v_a0] "v"(a[0]), [v_a1] "v"(a[1]), [v_b0] "v"(b[0]), [v_b1] "v"(b[1]));
     
 #endif
