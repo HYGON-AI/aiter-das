@@ -6,6 +6,7 @@ from op_tests.utility.scalar_type import ScalarType, scalar_types
 from op_tests.utility.utils import quantize_weights
 from op_tests.utility.utils import torch_moe as torch_score_moe
 from aiter.fused_moe import fused_moe, fused_topk, torch_moe
+from aiter.fused_moe_layout import fused_moe_prepare_weights
 from aiter import ActivationType, QuantType
 from aiter.test_common import checkAllclose, perftest,benchmark
 from aiter import dtypes
@@ -163,22 +164,28 @@ def test_fused_moe_wn16(m: int,
     torch_triton_output, avg_torch = torch_moe_test(input, w1_ref, w2_ref, topk_weights, topk_ids)
 
 
-    # checkAllclose is disabled: no backend supports this family yet (triton gptq
-    # needs explicit zero points). Re-enable once one does.
-    # w4a16 mapping: QuantType.No + packed-int4 (uint8) weights
-    with pytest.raises(NotImplementedError):
-        fused_moe(
-            input,
-            w1_qweight,
-            w2_qweight,
-            topk_weights,
-            topk_ids,
-            expert_mask=e_map,
-            quant_type=QuantType.No,
-            w1_scale=w1_scales,
-            w2_scale=w2_scales,
-            dtype=dtype,
-        )
+    # w4a16 group32 has_zp released via triton (moe_c stays excluded while the
+    # host int4 gaps remain). Real verdict with zp args + checkAllclose.
+    wna16_out = fused_moe(
+        input,
+        w1_qweight,
+        w2_qweight,
+        topk_weights,
+        topk_ids,
+        expert_mask=e_map,
+        quant_type=QuantType.No,
+        w1_scale=w1_scales,
+        w2_scale=w2_scales,
+        dtype=dtype,
+        w1_zp=w1_qzeros,
+        w2_zp=w2_qzeros,
+        # w4a16 家族的布局决策固定为 raw（不重排），显式传参避免歧义
+        weight_layout="raw",
+    )
+    assert torch.isfinite(wna16_out).all(), "wna16 triton-section: non-finite output"
+    _ret = checkAllclose(torch_triton_output, wna16_out, rtol=0.01, atol=0.03,
+                         msg="wna16 triton-section parity")
+    assert _ret <= 0.03, f"wna16 triton-section accuracy failed: ratio={_ret:.4f}"
     # msg = f"[TRITON_perf] {m=}, {k=}, {n=}, {e=}, {topk=}, dtype: {dtype}, torch_avg: {avg_torch:<8.2f} us, triton_avg: {avg_triton:>8.2f} us,uplift: {avg_torch/avg_triton-1:.1%}"
     # checkAllclose(torch_triton_output, triton_output, rtol=0.01, atol=0.01, msg=msg)
     ##################################### ASM Solution ##########################################
@@ -258,22 +265,27 @@ def test_fused_moe_wn16(m: int,
     torch_asm_output, avg_torch = torch_moe_test(input, w1_ref, w2_ref, topk_weights, topk_ids)
 
 
-    # checkAllclose is disabled: no backend supports this family yet (triton gptq
-    # needs explicit zero points). Re-enable once one does.
-    # w4a16 mapping: QuantType.No + packed-int4 (uint8) weights
-    with pytest.raises(NotImplementedError):
-        fused_moe(
-            input,
-            w1_qweight,
-            w2_qweight,
-            topk_weights,
-            topk_ids,
-            expert_mask=e_map,
-            quant_type=QuantType.No,
-            w1_scale=w1_scales,
-            w2_scale=w2_scales,
-            dtype=dtype,
-        )
+    # The raise is gone (w4a16 routable via triton). This section packs qzeros
+    # in the ASM convention (column pairs), which the moe_c/triton
+    # marlin-gptq kernels do NOT consume -- asm-side numeric parity is not
+    # asserted yet, so run + finite only.
+    wna16_out = fused_moe(
+        input,
+        w1_qweight,
+        w2_qweight,
+        topk_weights,
+        topk_ids,
+        expert_mask=e_map,
+        quant_type=QuantType.No,
+        w1_scale=w1_scales,
+        w2_scale=w2_scales,
+        dtype=dtype,
+        w1_zp=w1_qzeros,
+        w2_zp=w2_qzeros,
+        # w4a16 家族的布局决策固定为 raw（不重排），显式传参避免歧义
+        weight_layout="raw",
+    )
+    assert torch.isfinite(wna16_out).all(), "wna16 asm-section: non-finite output"
 
 
 
@@ -358,23 +370,29 @@ def test_fused_moe_wn16(m: int,
     torch_moe_c_output, avg_torch = torch_moe_test(input, w1_ref, w2_ref, topk_weights, topk_ids)
 
 
-    # fused_moe shuffles the weight layout internally
-    # checkAllclose is disabled: no backend supports this family yet (triton gptq
-    # needs explicit zero points). Re-enable once one does.
-    # w4a16 mapping: QuantType.No + packed-int4 (uint8) weights
-    with pytest.raises(NotImplementedError):
-        fused_moe(
-            input,
-            w1_qweight,
-            w2_qweight,
-            topk_weights,
-            topk_ids,
-            expert_mask=e_map,
-            quant_type=QuantType.No,
-            w1_scale=w1_scales,
-            w2_scale=w2_scales,
-            dtype=dtype,
-        )
+    # Real verdict with row-packed zp args + check. fused_moe shuffles the
+    # weight layout internally for moe_c; routing lands on triton (moe_c
+    # abstains on int4), both consume row-packed qzeros.
+    wna16_out = fused_moe(
+        input,
+        w1_qweight,
+        w2_qweight,
+        topk_weights,
+        topk_ids,
+        expert_mask=e_map,
+        quant_type=QuantType.No,
+        w1_scale=w1_scales,
+        w2_scale=w2_scales,
+        dtype=dtype,
+        w1_zp=w1_qzeros,
+        w2_zp=w2_qzeros,
+        # w4a16 家族的布局决策固定为 raw（不重排），显式传参避免歧义
+        weight_layout="raw",
+    )
+    assert torch.isfinite(wna16_out).all(), "wna16 moe_c-section: non-finite output"
+    _ret = checkAllclose(torch_moe_c_output, wna16_out, rtol=0.01, atol=0.03,
+                         msg="wna16 moe_c-section parity")
+    assert _ret <= 0.03, f"wna16 moe_c-section accuracy failed: ratio={_ret:.4f}"
 
     # msg = f"[moe_c_perf] {m=}, {k=}, {n=}, {e=}, {topk=}, dtype: {dtype}, torch_avg: {avg_torch:<8.2f} us, triton_avg: {avg_moe_c:>8.2f} us,uplift: {avg_torch/avg_moe_c-1:.1%}"
     # checkAllclose(torch_moe_c_output, moe_c_output, rtol=0.01, atol=0.01, msg=msg)

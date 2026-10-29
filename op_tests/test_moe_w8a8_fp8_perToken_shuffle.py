@@ -1,6 +1,7 @@
 import torch
 
 from aiter.fused_moe import fused_moe, fused_topk, torch_moe
+from aiter.fused_moe_layout import fused_moe_prepare_weights
 from aiter import ActivationType, QuantType
 from aiter.test_common import checkAllclose, perftest
 from aiter import dtypes
@@ -53,7 +54,8 @@ def fused_moe_test(hidden_states: torch.Tensor,
                    expert_mask: torch.Tensor = None,  # EP
                    dtype=None,
                    quant_type=QuantType.No,
-                   activation=ActivationType.Silu):
+                   activation=ActivationType.Silu,
+                   weight_layout=None):
     # single fused_moe entry: the router picks the backend; dynamic
     # per-token activation quant is internal (QuantType.per_Token), so
     # no pre-quantized activation input is passed
@@ -67,7 +69,8 @@ def fused_moe_test(hidden_states: torch.Tensor,
                      quant_type=quant_type,
                      w1_scale=w1_scale,
                      w2_scale=w2_scale,
-                     dtype=dtype)
+                     dtype=dtype,
+                     weight_layout=weight_layout)
 
 
 def test_fused_moe_w8a8(m: int, 
@@ -144,13 +147,18 @@ def test_fused_moe_w8a8(m: int,
     torch_output, avg_torch = torch_moe_test(input, w1_ref, w2_ref, topk_weights, topk_ids)
 
 
-    # Single fused_moe comparison against the torch reference. fused_moe handles
-    # the weight layout internally. Raw fp16 input: dynamic per-token
+    # Single fused_moe comparison against the torch reference. fused_moe consumes
+    # the prepared layout marker. Raw fp16 input: dynamic per-token
     # activation quant is internal (QuantType.per_Token).
+    # 加载期一次性准备（布局决策 + 如需重排），前向零重排
+    w1_prep, w2_prep, layout = fused_moe_prepare_weights(
+        w1_qweight, w2_qweight, quant_type=QuantType.per_Token,
+        w1_scale=w1_scales, w2_scale=w2_scales, dtype=dtype, topk=topk,
+        activation=ActivationType.Silu, expert_mask=e_map)
     fused_output, avg_fused = fused_moe_test(
         input,
-        w1_qweight,
-        w2_qweight,
+        w1_prep,
+        w2_prep,
         topk_weights,
         topk_ids,
         w1_scale=w1_scales,
@@ -158,7 +166,8 @@ def test_fused_moe_w8a8(m: int,
         expert_mask=e_map,
         dtype=dtype,
         quant_type=QuantType.per_Token,
-        activation=ActivationType.Silu)
+        activation=ActivationType.Silu,
+        weight_layout=layout)
 
     msg = f"[FUSED_MOE_perf] {m=}, {k=}, {n=}, {e=}, {topk=}, dtype: {dtype}, torch_avg: {avg_torch:<8.2f} us, fused_moe_avg: {avg_fused:>8.2f} us,uplift: {avg_torch/avg_fused-1:.1%}"
     checkAllclose(torch_output, fused_output, rtol=0.01, atol=5, msg=msg)  # largest measured error: 0.122

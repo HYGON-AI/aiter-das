@@ -12,6 +12,7 @@ from op_tests.utility.scalar_type import ScalarType, scalar_types
 from op_tests.utility.utils import quantize_weights
 from op_tests.utility.utils import torch_moe as torch_score_moe
 from aiter.fused_moe import fused_moe, fused_topk, torch_moe
+from aiter.fused_moe_layout import fused_moe_prepare_weights
 from aiter import ActivationType, QuantType
 from aiter.test_common import checkAllclose, perftest,benchmark
 from aiter import dtypes
@@ -60,6 +61,7 @@ def fused_moe_test(
     w2_scale=None,  # [expert, model_dim, 1]
     quant_type=QuantType.No,
     expert_mask=None,
+    weight_layout=None,
 ):
     return fused_moe(
         hidden_states,
@@ -72,6 +74,7 @@ def fused_moe_test(
         quant_type=quant_type,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
+        weight_layout=weight_layout,
     )
 
 @benchmark()
@@ -191,16 +194,22 @@ def test_fmoe_w8a8_channel_ep(
     # (asm/moe_c refuse EP) and quantizes activations per token internally,
     # so the raw bf16 input is passed and a1_scale stays None. fused_moe
     # converts the 0/1 expert_mask to an expert map internally.
+    # 加载期一次性准备（布局决策 + 如需重排），前向零重排
+    w1_prep, w2_prep, layout = fused_moe_prepare_weights(
+        w1_qweight, w2_qweight, quant_type=QuantType.per_Token,
+        w1_scale=w1_scales, w2_scale=w2_scales, dtype=dtype, topk=topk,
+        activation=ActivationType.Silu, expert_mask=expert_mask)
     fused_output, avg_fused = fused_moe_test(
         input,
-        w1_qweight,
-        w2_qweight,
+        w1_prep,
+        w2_prep,
         topk_weights,
         topk_ids,
         w1_scale=w1_scales,
         w2_scale=w2_scales,
         quant_type=QuantType.per_Token,
         expert_mask=expert_mask,
+        weight_layout=layout,
     )
     msg = f"[fused_perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_torch:<8.2f} us, fused_avg: {avg_fused:>8.2f} us,uplift: {avg_torch/avg_fused-1:.1%}"
     checkAllclose(torch_moe_golden, fused_output, rtol=0.01, atol=50, msg=msg)  # largest measured error: 40.6

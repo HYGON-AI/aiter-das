@@ -35,7 +35,9 @@ ROUTE_FILENAME = "tuned_fused_moe_route.csv"
 ROUTE_QUANT_TYPES = ("int8_w8a8_channel", "f8_w8a8_channel", "int8_w8a8_block",
                      "f8_w8a8_block", "no_quant", "int8_w8a16")
 
-VALID_BACKENDS = ("asm", "triton", "moe_c")  # ck is not a candidate in the router
+# ck is accepted on the write side; fused_moe_router keeps it out of
+# _CANDIDATE_ORDER and selects it only via an explicit route row.
+VALID_BACKENDS = ("asm", "triton", "moe_c", "ck")
 
 
 def write_route_csv(rows):

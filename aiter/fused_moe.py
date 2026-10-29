@@ -9,7 +9,6 @@ import os
 from typing import Optional
 import functools
 import aiter
-from aiter import logger
 from aiter import ActivationType, QuantType, dtypes
 
 # from aiter import get_hip_quant as get_quant
@@ -25,8 +24,8 @@ from aiter.fused_moe_router import (
     FusedMoeProblem,
     plan as _route_plan,
 )
-from aiter.fused_moe_layout import get_weight_layout
-from aiter.fused_moe_types import GateMode, Stage2ScatterContext
+from aiter.fused_moe_layout import resolve_weight_layout
+from aiter.fused_moe_types import GateMode, Stage2ScatterContext, SUPPORTED_ACTIVATIONS
 
 BLOCK_SIZE_M = 32
 
@@ -117,9 +116,22 @@ _DTYPE_KIND = {
     torch.int32: "int4",
 }
 
-# Quant families fused_moe routes. Everything else (per_1x32 / a4w4 / a16w4 /
+
+def _infer_w4_group(w1_scale, model_dim):
+    """w4 族 group size from a [E, N, K//group] scale tensor.
+    Returns None when not inferable (no scale / non-3D / indivisible)."""
+    if w1_scale is None or w1_scale.dim() != 3:
+        return None
+    last = int(w1_scale.shape[-1])
+    if last <= 0 or model_dim % last != 0:
+        return None
+    return model_dim // last
+
+
+# Quant families fused_moe routes. Everything else (a4w4 / a16w4 /
 # MXFP8 / ...) is rejected and handled by aiter_moe.
-_SUPPORTED_KINDS = ("none", "w8a8", "w8a8_block", "w4a8", "a8w4", "w4a16", "w8a16")
+_SUPPORTED_KINDS = ("none", "w8a8", "w8a8_block", "w4a8", "a8w4", "w4a16", "w8a16",
+                    "wfp4a16", "wfp4a8")
 
 
 def _normalize_problem(
@@ -135,16 +147,42 @@ def _normalize_problem(
     block_size_M,
     doweight_stage1,
     splitk,
+    w1_scale=None,
+    w2_scale=None,
+    w1_zp=None,
+    w2_zp=None,
+    routed_scaling_factor=1.0,
+    gemm1_alpha=None,
+    gemm1_limit=None,
+    *,
+    model_dim=None,
+    M=None,
+    topk=None,
+    dtype=None,
+    weight_layout=None,
 ):
     """Normalize the fused_moe arguments into a torch-free routing problem.
 
     Stored-vs-real inter_dim handling mirrors the aiter_moe callers; the asm
     CSV lookup keys must match the per-branch conventions.
+
+    Keyword-only ``model_dim`` / ``M`` / ``topk`` / ``dtype`` let the weight
+    preparation API reuse this derivation without activation tensors.
     """
-    dtype_str = _DTYPE_KIND.get(hidden_states.dtype)
+    if (w1_zp is None) != (w2_zp is None):
+        raise ValueError(
+            "fused_moe: w1_zp and w2_zp must be provided together "
+            f"(got w1_zp={'None' if w1_zp is None else 'tensor'}, "
+            f"w2_zp={'None' if w2_zp is None else 'tensor'})")
+    act_dtype = dtype if dtype is not None else (
+        hidden_states.dtype if hidden_states is not None else None)
+    if act_dtype is None:
+        raise ValueError(
+            "fused_moe: dtype is required when hidden_states is not provided")
+    dtype_str = _DTYPE_KIND.get(act_dtype)
     if dtype_str not in ("bf16", "fp16"):
         raise NotImplementedError(
-            f"fused_moe: unsupported activation dtype {hidden_states.dtype}"
+            f"fused_moe: unsupported activation dtype {act_dtype}"
         )
     q_dtype_w_kind = _DTYPE_KIND.get(w1.dtype)  # raw: bf16/fp16/fp8/int8/int4
     if q_dtype_w_kind is None:
@@ -172,23 +210,35 @@ def _normalize_problem(
     # Unmarked tensors are "raw". w1 and w2 must carry the same marker.
     # use_shuffle means the weights are already in the asm shuffle layout; the
     # router then skips backends that cannot use it and _asm_lookup picks the
-    # shuffle CSV.
-    weight_layout = get_weight_layout(w1, w2)
+    # shuffle CSV. An explicit ``weight_layout`` argument wins over the marker
+    # and is cross-checked against it.
+    weight_layout = resolve_weight_layout(w1, w2, weight_layout)
+    # marlin uint8 tensors come in two flavors: w8a16 marlin is a pure reorder
+    # (unpacked geometry, w1.shape[1] == 2 * w2.shape[2]) while w4a16/w4a8
+    # marlin keeps the packed-int4 geometry (w1.shape[1] != 2 * w2.shape[2]).
+    # Only the w8a16 flavor may be reinterpreted as int8 weights.
+    _marlin_w8a16_geom = (weight_layout == "marlin"
+                          and w1.shape[1] == 2 * w2.shape[2])
     # The w8a16 marlin packer returns its reordered output viewed as uint8,
     # which dtype inference would read as packed int4. For quant_type=No the
     # marker decides: marlin means int8 weights (w8a16). Marlin w8a8 keeps its
     # int8/fp8 dtypes, so it needs no override.
-    if weight_layout == "marlin" and quant_str == "no" and q_dtype_w == "int4":
+    if (_marlin_w8a16_geom and quant_str == "no" and q_dtype_w == "int4"):
         q_dtype_w_kind = "int8"
         q_dtype_w = "int8"
 
     if quant_str == "per_1x32":
-        raise NotImplementedError(
-            "fused_moe: per_1x32 (MXFP4 / a4w4) is not routed; "
-            "use aiter_moe for this quantization"
-        )
+        # fp4x2 packed weights arrive as uint8 (the dtype fallback maps them
+        # there), the same container as int4 nibbles: per_1x32 is the only
+        # discriminator.
+        if q_dtype_w != "int4":
+            raise NotImplementedError(
+                f"fused_moe: per_1x32 requires fp4x2 packed weights, "
+                f"got w1.dtype={w1.dtype}")
+        quant_kind = "wfp4a8" if q_dtype_a in ("int8", "fp8") else "wfp4a16"
+        q_dtype_w = "int4"  # 保持 router 侧 q_dtype_w 口径（int4 容器）
 
-    if quant_str == "no":
+    elif quant_str == "no":
         if q_dtype_w == "none":
             quant_kind = "none"
         elif q_dtype_w == "int4":
@@ -234,15 +284,26 @@ def _normalize_problem(
         raise NotImplementedError(f"fused_moe: unsupported quant family {quant_kind}")
 
     act_str = _enum_name(activation, ActivationType)
-    if act_str not in ("silu", "gelu"):
+    # Whitelist matches the aiter_moe activation set; per-backend acceptance
+    # is narrowed further by the router (_activation_ok). Gated/non-gated
+    # inference remains shape-based (problem.g1u1 below).
+    if act_str not in SUPPORTED_ACTIVATIONS:
         raise NotImplementedError(
             f"fused_moe: unsupported activation {act_str} for the current backends"
         )
 
-    M, topk = topk_ids.shape
+    if M is not None and topk is not None:
+        M, topk = int(M), int(topk)
+    else:
+        M, topk = topk_ids.shape
     E = expert_mask.numel() if expert_mask is not None else w1.shape[0]
-    model_dim = hidden_states.shape[1]
-    if w1.dtype == torch.uint8 and weight_layout == "marlin":
+    explicit_model_dim = model_dim is not None
+    if not explicit_model_dim:
+        if hidden_states is None:
+            model_dim = None  # 权重形状兜底（packed_mul 计算之后补）
+        else:
+            model_dim = hidden_states.shape[1]
+    if w1.dtype == torch.uint8 and weight_layout == "marlin" and _marlin_w8a16_geom:
         packed_mul = 1  # marlin w8a16 uint8 view only reorders; element count
                         # and shapes are unchanged
     elif w1.dtype == torch.uint8:
@@ -251,6 +312,10 @@ def _normalize_problem(
         packed_mul = 8  # int4 packed, 8 nibbles per word
     else:
         packed_mul = 1
+    if model_dim is None:
+        # 无激活张量时按权重形状推导真实 K（int4 容器按 packed_mul 还原）
+        model_dim = int(w1.shape[2]) * packed_mul
+    model_dim = int(model_dim)
     inter_dim = w2.shape[2] * packed_mul
     is_g1u1 = w1.shape[1] == 2 * w2.shape[2] * packed_mul or (
         w1.shape[1] * packed_mul == 2 * w2.shape[2]
@@ -258,6 +323,22 @@ def _normalize_problem(
     # blockwise families (DeepSeek-style): 128x128 weight blocks / 1x128 activation
     # groups, whichever of the two enum names the caller used
     block_shape = (128, 128) if quant_str in ("per_1x128", "per_128x128") else None
+
+    # w4 族 group 推断：per-channel scale [E,N,1] -> group == model_dim
+    # -> channelwise (None)；groupwise scale [E,N,K//g] -> (0, g)。仅 int4/fp4 四族生效。
+    if quant_kind in ("w4a16", "w4a8", "wfp4a16", "wfp4a8") and block_shape is None:
+        _g = _infer_w4_group(w1_scale, model_dim)
+        block_shape = None if _g is None or _g == model_dim else (0, _g)
+
+    # Reject shapes no backend can serve, before routing.
+    if quant_kind == "w4a16" and block_shape not in (None, (0, 32)):
+        raise NotImplementedError(
+            f"fused_moe: w4a16 supports group_size=32 only "
+            f"(inferred group={block_shape[1]}); use aiter_moe for other groups")
+    if quant_kind == "w4a8" and block_shape is not None:
+        raise NotImplementedError(
+            "fused_moe: w4a8 supports channelwise scales only "
+            f"(inferred block_shape={block_shape}); use aiter_moe for groupwise w4a8")
 
     return FusedMoeProblem(
         arch=get_gfx(),
@@ -281,6 +362,7 @@ def _normalize_problem(
         splitk=int(splitk or 0),
         block_size_M=int(block_size_M) if block_size_M else None,
         local_E=int(w1.shape[0]),
+        has_zp=(w1_zp is not None and w2_zp is not None),
     )
 
 
@@ -323,10 +405,19 @@ def fused_moe(
     quant_type_a=None,
     quant_dtype_a=None,
     quant_dtype_a2=None,
+    w1_zp=None,
+    w2_zp=None,
+    routed_scaling_factor=1.0,
+    gemm1_alpha=None,
+    gemm1_limit=None,
+    weight_layout=None,
 ):
     """Public fused_moe entry. Dispatches to an aiter backend chosen by the
     stage-level router. Unsupported features raise NotImplementedError instead
     of silently degrading.
+
+    ``weight_layout``: 准备函数返回的布局（raw / asm_shuffle / marlin）。
+    为 None 时回退读取张量属性；两者都在时由 resolve_weight_layout 交叉校验。
     """
     if (
         any(
@@ -370,7 +461,11 @@ def fused_moe(
         topk_weight=topk_weight,
         topk_ids=topk_ids,
         expert_mask=expert_mask,
-        activation=activation.value if hasattr(activation, "value") else activation,
+        # The op schema binds activation as str (the 7-string aiter_moe path;
+        # the 4-member ActivationType enum cannot represent gelu_tanh / situ /
+        # swigluoai / swiglustep / relu2). _enum_name accepts the enum default,
+        # int codes and plain strings alike.
+        activation=_enum_name(activation, ActivationType),
         quant_type=quant_type.value if hasattr(quant_type, "value") else quant_type,
         doweight_stage1=doweight_stage1,
         w1_scale=w1_scale,
@@ -403,6 +498,12 @@ def fused_moe(
         ),
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
+        routed_scaling_factor=routed_scaling_factor,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
+        weight_layout=weight_layout,
     )
 
 
@@ -449,7 +550,7 @@ def fused_moe_fake(
     topk_weight: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_mask: torch.Tensor | None = None,
-    activation: int = ActivationType.Silu.value,
+    activation: str = "silu",
     quant_type: int = QuantType.No.value,
     doweight_stage1: bool = False,
     w1_scale: torch.Tensor | None = None,
@@ -478,6 +579,12 @@ def fused_moe_fake(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    w1_zp: torch.Tensor | None = None,
+    w2_zp: torch.Tensor | None = None,
+    routed_scaling_factor: float = 1.0,
+    gemm1_alpha: float | None = None,
+    gemm1_limit: float | None = None,
+    weight_layout: str | None = None,
 ) -> torch.Tensor:
     M, _topk = topk_ids.shape
     out_dtype = dtype if dtype is not None else hidden_states.dtype
@@ -496,7 +603,7 @@ def fused_moe_(
     topk_weight: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_mask: torch.Tensor | None = None,
-    activation: int = ActivationType.Silu.value,
+    activation: str = "silu",
     quant_type: int = QuantType.No.value,
     doweight_stage1: bool = False,
     w1_scale: torch.Tensor | None = None,
@@ -525,6 +632,12 @@ def fused_moe_(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    w1_zp: torch.Tensor | None = None,
+    w2_zp: torch.Tensor | None = None,
+    routed_scaling_factor: float = 1.0,
+    gemm1_alpha: float | None = None,
+    gemm1_limit: float | None = None,
+    weight_layout: str | None = None,
 ) -> torch.Tensor:
     return _fused_moe_impl(
         hidden_states=hidden_states,
@@ -562,6 +675,34 @@ def fused_moe_(
         quant_type_a=quant_type_a,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
+        routed_scaling_factor=routed_scaling_factor,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
+        weight_layout=weight_layout,
+    )
+
+
+# 运行期可行布局复核：传入布局不在可行集合内一律报错。
+def _check_runtime_layout(problem) -> None:
+    from aiter.fused_moe_router import feasible_layouts
+
+    try:
+        feasible = feasible_layouts(problem)
+    except NotImplementedError:
+        return  # 家族本身不可路由：交给 plan() 抛既有错误
+    if problem.weight_layout in feasible:
+        return
+    raise ValueError(
+        f"fused_moe: weight_layout={problem.weight_layout!r} is not directly "
+        f"usable for this problem (quant_kind={problem.quant_kind!r}, "
+        f"activation={problem.activation!r}, topk={problem.topk}, "
+        f"E={problem.E}, N={problem.inter_dim}, K={problem.model_dim}, "
+        f"dtype={problem.dtype!r}, is_ep={problem.is_ep}); "
+        f"feasible layouts: {sorted(feasible)}. Check that activation / topk / "
+        f"expert_mask / dtype match the values used at preparation time, or call "
+        f"fused_moe_prepare_weights again."
     )
 
 
@@ -602,6 +743,12 @@ def _fused_moe_impl(
     quant_type_a=None,
     quant_dtype_a=None,
     quant_dtype_a2=None,
+    w1_zp=None,
+    w2_zp=None,
+    routed_scaling_factor=1.0,
+    gemm1_alpha=None,
+    gemm1_limit=None,
+    weight_layout=None,
 ):
     """Core dispatch: normalize -> route -> execute. Backends are reached
     through BACKEND_REGISTRY entries, so there are no per-backend branches here."""
@@ -623,7 +770,16 @@ def _fused_moe_impl(
         block_size_M=block_size_M,
         doweight_stage1=doweight_stage1,
         splitk=splitk,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
+        routed_scaling_factor=routed_scaling_factor,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
+        weight_layout=weight_layout,
     )
+    _check_runtime_layout(problem)
     if problem.quant_kind == "w8a8" and problem.quant_type == "per_tensor":
         w1_scale = _per_tensor_to_channel_scale(w1_scale, w1.shape[0], w1.shape[1], "w1_scale")
         w2_scale = _per_tensor_to_channel_scale(w2_scale, w2.shape[0], w2.shape[1], "w2_scale")
@@ -653,6 +809,14 @@ def _fused_moe_impl(
         w2_scale=w2_scale,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
+        # None normalizes to 1.0 (same as aiter_moe).
+        routed_scaling_factor=(
+            1.0 if routed_scaling_factor is None else routed_scaling_factor
+        ),
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
         num_local_tokens=num_local_tokens,
         plan=moe_plan,
         problem=problem,

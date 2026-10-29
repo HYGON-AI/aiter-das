@@ -13,6 +13,15 @@ from enum import Enum
 DEFAULT_SITUV2_BETA = 4.0
 DEFAULT_SITUV2_LINEAR_BETA = 25.0
 
+# Default activation whitelist for fused_moe, aligned with aiter_moe
+# (aiter/ops/triton/moe_activation.py:_apply_activation + moe_c situ case).
+# Gated/non-gated inference stays shape-based (problem.g1u1); the activation
+# string never participates in gate inference. Per-backend capability faces
+# are parameterized in fused_moe_router._BACKEND_ACTIVATIONS.
+SUPPORTED_ACTIVATIONS = (
+    "silu", "situ", "gelu", "gelu_tanh", "swigluoai", "swiglustep", "relu2",
+)
+
 
 class GateMode(str, Enum):
     """Gate/Up computation mode for the stage1 GEMM.

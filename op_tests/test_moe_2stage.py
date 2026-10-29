@@ -16,6 +16,7 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
+from aiter.fused_moe_layout import fused_moe_prepare_weights
 
 
 from aiter import ActivationType
@@ -114,11 +115,15 @@ def test_fmoe(
     # ######################## fused_moe (all stages) ###########
     # fused_moe does not support doweight_stage1=True, so the list below only
     # contains False.
+    # 加载期一次性准备（布局决策 + 如需重排），前向零重排
+    w1_prep, w2_prep, layout = fused_moe_prepare_weights(
+        w1_qt, w2_qt, quant_type=qType, w1_scale=w1_scale, w2_scale=w2_scale,
+        dtype=dtype, topk=topk, activation=actType)
     out2_aiter, us_fuse = run_perftest(
         fused_moe,
         input,
-        w1_qt,
-        w2_qt,
+        w1_prep,
+        w2_prep,
         topk_weights,
         topk_ids,
         w1_scale=w1_scale,
@@ -126,6 +131,7 @@ def test_fmoe(
         quant_type=qType,
         activation=actType,
         doweight_stage1=doweight_stage1,
+        weight_layout=layout,
     )
 
     err = checkAllclose(

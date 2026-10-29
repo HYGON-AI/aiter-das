@@ -6,6 +6,7 @@ from op_tests.utility.scalar_type import ScalarType, scalar_types
 from op_tests.utility.utils import quantize_weights
 from op_tests.utility.utils import torch_moe as torch_score_moe
 from aiter.fused_moe import fused_moe, fused_topk, torch_moe
+from aiter.fused_moe_layout import fused_moe_prepare_weights
 from aiter import ActivationType, QuantType
 from aiter.test_common import checkAllclose, perftest,benchmark
 from aiter import dtypes
@@ -49,7 +50,8 @@ def torch_moe_test(
 
 @perftest(num_warmup=5, num_iters=10, testGraph=False)
 def fused_moe_impl(hidden_states, w1, w2, topk_weights, topk_ids,
-                   w1_scale=None, w2_scale=None, dtype=None, expert_mask=None):
+                   w1_scale=None, w2_scale=None, dtype=None, expert_mask=None,
+                   weight_layout=None):
     # per-channel int8 w8a8: QuantType.per_Token with the [E, N, 1] / [E, K, 1] scales
     return fused_moe(
         hidden_states,
@@ -62,12 +64,14 @@ def fused_moe_impl(hidden_states, w1, w2, topk_weights, topk_ids,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         dtype=dtype,
+        weight_layout=weight_layout,
     )
 
 
 @perftest()
 def torchcompile_fused_moe_impl(hidden_states, w1, w2, topk_weights, topk_ids,
-                                w1_scale=None, w2_scale=None, dtype=None, expert_mask=None):
+                                w1_scale=None, w2_scale=None, dtype=None, expert_mask=None,
+                                weight_layout=None):
     fn = torch.compile(fused_moe, backend="inductor", fullgraph=True)
     return fn(
         hidden_states,
@@ -80,6 +84,7 @@ def torchcompile_fused_moe_impl(hidden_states, w1, w2, topk_weights, topk_ids,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         dtype=dtype,
+        weight_layout=weight_layout,
     )
 
 
@@ -154,28 +159,35 @@ def test_fused_moe_w8a8(m: int,
 
 
     #Triton Solution
+    # 加载期一次性准备（布局决策 + 如需重排），前向零重排
+    w1_prep, w2_prep, layout = fused_moe_prepare_weights(
+        w1_qweight, w2_qweight, quant_type=QuantType.per_Token,
+        w1_scale=w1_scales, w2_scale=w2_scales, dtype=dtype, topk=topk,
+        activation=ActivationType.Silu, expert_mask=e_map)
     triton_output, avg_triton = fused_moe_impl(
         input,
-        w1_qweight,
-        w2_qweight,
+        w1_prep,
+        w2_prep,
         topk_weights,
         topk_ids,
         w1_scale=w1_scales,
         w2_scale=w2_scales,
         dtype=dtype,
-        expert_mask=e_map)
+        expert_mask=e_map,
+        weight_layout=layout)
 
     # fused_moe shuffles the weight layout internally
     c_output, avg_c = torchcompile_fused_moe_impl(
         input,
-        w1_qweight,
-        w2_qweight,
+        w1_prep,
+        w2_prep,
         topk_weights,
         topk_ids,
         w1_scale=w1_scales,
         w2_scale=w2_scales,
         dtype=dtype,
-        expert_mask=e_map)
+        expert_mask=e_map,
+        weight_layout=layout)
 
     msg = f"[TRITON_perf] {m=}, {k=}, {n=}, {e=}, {topk=}, dtype: {dtype}, torch_avg: {avg_torch:<8.2f} us, triton_avg: {avg_triton:>8.2f} us,uplift: {avg_torch/avg_triton-1:.1%}"
     checkAllclose(torch_output, triton_output, rtol=0.01, atol=30, msg=msg)  # largest measured error: 14.0

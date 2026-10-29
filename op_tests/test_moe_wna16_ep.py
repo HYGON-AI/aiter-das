@@ -12,6 +12,7 @@ from op_tests.utility.scalar_type import ScalarType, scalar_types
 from op_tests.utility.utils import quantize_weights
 from op_tests.utility.utils import torch_moe as torch_score_moe
 from aiter.fused_moe import fused_moe, fused_topk, torch_moe
+from aiter.fused_moe_layout import fused_moe_prepare_weights
 from aiter import ActivationType, QuantType
 from aiter.test_common import checkAllclose, perftest
 from aiter import dtypes

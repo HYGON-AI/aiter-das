@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from aiter.test_common import checkAllclose, run_perftest
 from aiter.fused_moe import fused_moe, torch_moe, fused_topk
+from aiter.fused_moe_layout import fused_moe_prepare_weights
 from aiter import ActivationType, QuantType
 from aiter import pertoken_quant
 from aiter import dtypes
@@ -236,11 +237,16 @@ def test_fmoe(
 
     # fused_moe shuffles the weight layout and does the dynamic block
     # activation quant internally, so it takes raw activations
+    # 加载期一次性准备，前向零重排
+    w1_prep, w2_prep, layout = fused_moe_prepare_weights(
+        w1_q, w2_q, quant_type=QuantType.per_1x128, w1_scale=w1_scale_3d,
+        w2_scale=w2_scale_3d, dtype=dtype, topk=topk,
+        activation=ActivationType.Silu)
     out, us = run_perftest(
         fused_moe,
         input,
-        w1_q,
-        w2_q,
+        w1_prep,
+        w2_prep,
         topk_weights,
         topk_ids,
         expert_mask=None,
@@ -248,6 +254,7 @@ def test_fmoe(
         quant_type=QuantType.per_1x128,
         w1_scale=w1_scale_3d,
         w2_scale=w2_scale_3d,
+        weight_layout=layout,
     )
     msg = f"[perf] a8w8 fused_moe: {us:>8.2f} us ...... {m=}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, dtype: {dtype}"
     # per_1x128 runs on the triton blockwise backend, which re-quantizes the
