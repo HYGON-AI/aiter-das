@@ -837,14 +837,22 @@ def build_module(
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         # gfx946 builds require its HIP multi-die SDK. Compile both launch paths;
         # the selected device's runtime topology decides which one to use.
-        if md_name == "module_norm" and "gfx946" in archs:
-            flags_hip.append("-DCK_TILE_LAYERNORM_ENABLE_MULTIDIE=1")
-        if md_name == "module_rmsnorm" and "gfx946" in archs:
-            flags_hip.append("-DCK_TILE_RMSNORM_ENABLE_MULTIDIE=1")
-        if md_name in {"module_quant", "module_cpp_api"} and "gfx946" in archs:
-            flags_hip.append("-DAITER_QUANT_ENABLE_MULTIDIE=1")
-        if md_name == "module_activation" and "gfx946" in archs:
-            flags_hip.append("-DAITER_SILU_ENABLE_MULTIDIE=1")
+        if "gfx946" in archs:
+            if md_name == "module_norm":
+                flags_hip.append("-DCK_TILE_LAYERNORM_ENABLE_MULTIDIE=1")
+            elif md_name == "module_rmsnorm":
+                flags_hip.append("-DCK_TILE_RMSNORM_ENABLE_MULTIDIE=1")
+            elif md_name == "module_quant":
+                flags_hip.append("-DAITER_QUANT_ENABLE_MULTIDIE=1")
+            elif md_name == "module_cpp_api":
+                flags_hip.extend(
+                    [
+                        "-DAITER_QUANT_ENABLE_MULTIDIE=1",
+                        "-DAITER_MOE_TOPK_ENABLE_MULTIDIE=1",
+                    ]
+                )
+            elif md_name == "module_activation":
+                flags_hip.append("-DAITER_SILU_ENABLE_MULTIDIE=1")
         parallel_jobs = os.getenv("AITER_HIP_PARALLEL_JOBS")
         if parallel_jobs is not None:
             if not parallel_jobs.isdigit() or int(parallel_jobs) < 1:

@@ -12,6 +12,7 @@
  */
 
 #include "dispatch_utils.h"
+#include "moe_topk_launch.h"
 #include "hip_reduce.h"
 #include "py_itfs_common.h"
 #include "warp_sort.h"
@@ -462,6 +463,20 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
                 }
             }
 
+            // The DPP sequence below covers groups of at most 8 lanes. For
+            // NUM_GRP=1/2/4, merge both maxima across the full 64/32/16 lanes.
+            if constexpr(THREAD_PER_GRP > 8)
+            {
+#pragma unroll
+                for(int offset = 1; offset < THREAD_PER_GRP; offset *= 2)
+                {
+                    const float remote_max1 = __shfl_xor(max1, offset, THREAD_PER_GRP);
+                    const float remote_max2 = __shfl_xor(max2, offset, THREAD_PER_GRP);
+                    max2 = fmaxf(fminf(max1, remote_max1), fmaxf(max2, remote_max2));
+                    max1 = fmaxf(max1, remote_max1);
+                }
+            }
+            else
             {
                 constexpr int row_mask    = 0xf;
                 constexpr int bank_mask   = 0xf;
@@ -1104,7 +1119,8 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
 } // namespace aiter
 
 #define LAUNCH_KERNEL()                                    \
-    switch(num_experts % 4)                                \
+    /* Vectors must not straddle expert-group boundaries. */ \
+    switch((num_experts / num_expert_group) % 4)            \
     {                                                      \
     case 0:                                                \
         using vec4_type = ck_tile::ext_vector_t<float, 4>; \
@@ -1161,7 +1177,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
 
 #define LAUNCHER_biased_grouped_topk_kernel(VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)      \
     VLLM_DISPATCH_FLOATING_TYPES(gating_output.scalar_type(), "biased_grouped_topk_kernel", [&] {  \
-        hipLaunchKernelGGL(                                                                        \
+        aiter::moe_topk_detail::launch(                                                                        \
             (aiter::                                                                               \
                  grouped_topk_kernel<scalar_t, VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax>), \
             dim3(grid),                                                                            \
@@ -1182,7 +1198,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
 
 #define LAUNCHER_grouped_topk_kernel(VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)             \
     VLLM_DISPATCH_FLOATING_TYPES(gating_output.scalar_type(), "grouped_topk_kernel", [&] {         \
-        hipLaunchKernelGGL(                                                                        \
+        aiter::moe_topk_detail::launch(                                                                        \
             (aiter::                                                                               \
                  grouped_topk_kernel<scalar_t, VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax>), \
             dim3(grid),                                                                            \
@@ -1205,7 +1221,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
     VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)                             \
     VLLM_DISPATCH_FLOATING_TYPES(                                                 \
         gating_output.scalar_type(), "biased_grouped_topk_opt_sort_kernel", [&] { \
-            hipLaunchKernelGGL((aiter::grouped_topk_opt_sort_kernel<scalar_t,     \
+            aiter::moe_topk_detail::launch((aiter::grouped_topk_opt_sort_kernel<scalar_t,     \
                                                                     VEC_F,        \
                                                                     NUM_GRP,      \
                                                                     need_renorm,  \

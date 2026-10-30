@@ -17,6 +17,7 @@
  * limitations under the License.
  */
 #include "hip_compat.h"
+#include "moe_topk_launch.h"
 #include "hip_reduce.h"
 #include "vec_convert.h"
 #include <ATen/hip/HIPContext.h>
@@ -477,14 +478,14 @@ __global__ void moe_fused_gate_kernel(void* input,
         constexpr int ROWS_PER_WARP =                                                         \
             ((EXPERT_GROUP) <= WARP_SIZE) ? (WARP_SIZE / (EXPERT_GROUP)) : 1;                 \
         constexpr int ROWS_PER_CTA = WARPS_PER_CTA * ROWS_PER_WARP;                           \
-        moe_fused_gate_kernel<T,                                                              \
+        aiter::moe_topk_detail::launch(moe_fused_gate_kernel<T,                                                              \
                               VPT,                                                            \
                               (EXPERTS),                                                      \
                               (EXPERT_GROUP),                                                 \
                               ROWS_PER_WARP,                                                  \
                               ROWS_PER_CTA,                                                   \
-                              WARPS_PER_CTA>                                                  \
-            <<<num_blocks, block_dim, shared_mem_size, stream>>>(input.data_ptr(),            \
+                              WARPS_PER_CTA>,                                                 \
+            dim3(num_blocks), block_dim, shared_mem_size, stream, input.data_ptr(),            \
                                                                  bias.data_ptr(),             \
                                                                  output.data_ptr<float>(),    \
                                                                  indices.data_ptr<int32_t>(), \
@@ -732,8 +733,8 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
         // currently only support num_experts / num_expert_group <= 32 for dynamic kernels
         if(input.scalar_type() == at::kBFloat16)
         {
-            moe_fused_gate_kernel_dynamic<bfloat16_t>
-                <<<num_blocks, block_dim, shared_mem_size, stream>>>(input.data_ptr(),
+            aiter::moe_topk_detail::launch(moe_fused_gate_kernel_dynamic<bfloat16_t>,
+                dim3(num_blocks), block_dim, shared_mem_size, stream, input.data_ptr(),
                                                                      bias.data_ptr(),
                                                                      output.data_ptr<float>(),
                                                                      indices.data_ptr<int32_t>(),
@@ -748,8 +749,8 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
         }
         else if(input.scalar_type() == at::kHalf)
         {
-            moe_fused_gate_kernel_dynamic<float16_t>
-                <<<num_blocks, block_dim, shared_mem_size, stream>>>(input.data_ptr(),
+            aiter::moe_topk_detail::launch(moe_fused_gate_kernel_dynamic<float16_t>,
+                dim3(num_blocks), block_dim, shared_mem_size, stream, input.data_ptr(),
                                                                      bias.data_ptr(),
                                                                      output.data_ptr<float>(),
                                                                      indices.data_ptr<int32_t>(),
@@ -764,8 +765,8 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
         }
         else if(input.scalar_type() == at::kFloat)
         {
-            moe_fused_gate_kernel_dynamic<float32_t>
-                <<<num_blocks, block_dim, shared_mem_size, stream>>>(input.data_ptr(),
+            aiter::moe_topk_detail::launch(moe_fused_gate_kernel_dynamic<float32_t>,
+                dim3(num_blocks), block_dim, shared_mem_size, stream, input.data_ptr(),
                                                                      bias.data_ptr(),
                                                                      output.data_ptr<float>(),
                                                                      indices.data_ptr<int32_t>(),

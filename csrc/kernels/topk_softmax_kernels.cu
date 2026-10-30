@@ -23,6 +23,7 @@
 #include "dispatch_utils.h"
 #include "hip_compat.h"
 #include "hip_reduce.h"
+#include "moe_topk_launch.h"
 #include "py_itfs_common.h"
 #include "vec_convert.h"
 #include <ATen/hip/HIPContext.h>
@@ -76,7 +77,7 @@ __launch_bounds__(TPB) __global__
     for(int ii = threadIdx.x; ii < num_cols; ii += TPB)
     {
         const int idx = thread_row_offset + ii;
-        threadData    = max(static_cast<float>(input[idx]), threadData);
+        threadData    = max(ck_tile::type_convert<float>(input[idx]), threadData);
     }
 
     const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, hipcub::Max());
@@ -91,7 +92,7 @@ __launch_bounds__(TPB) __global__
     for(int ii = threadIdx.x; ii < num_cols; ii += TPB)
     {
         const int idx = thread_row_offset + ii;
-        threadData += exp((static_cast<float>(input[idx]) - float_max));
+        threadData += exp((ck_tile::type_convert<float>(input[idx]) - float_max));
     }
 
     const auto Z = BlockReduce(tmpStorage).Reduce(threadData, sum);
@@ -105,7 +106,7 @@ __launch_bounds__(TPB) __global__
     for(int ii = threadIdx.x; ii < num_cols; ii += TPB)
     {
         const int idx   = thread_row_offset + ii;
-        const float val = exp((static_cast<float>(input[idx]) - float_max)) * normalizing_factor;
+        const float val = exp((ck_tile::type_convert<float>(input[idx]) - float_max)) * normalizing_factor;
         output[idx]     = val;
     }
 }
@@ -502,8 +503,9 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
     dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
     if(need_renorm)
     {
-        topkGatingSoftmax<DTYPE, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, true>
-            <<<num_blocks, block_dim, 0, stream>>>(input,
+        aiter::moe_topk_detail::launch(
+            topkGatingSoftmax<DTYPE, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, true>,
+            dim3(num_blocks), block_dim, 0, stream, input,
                                                    finished,
                                                    output,
                                                    num_rows,
@@ -517,8 +519,9 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
     }
     else
     {
-        topkGatingSoftmax<DTYPE, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, false>
-            <<<num_blocks, block_dim, 0, stream>>>(input,
+        aiter::moe_topk_detail::launch(
+            topkGatingSoftmax<DTYPE, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, false>,
+            dim3(num_blocks), block_dim, 0, stream, input,
                                                    finished,
                                                    output,
                                                    num_rows,
@@ -579,9 +582,11 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
             softmax_workspace != nullptr,
             "softmax_workspace must be provided for num_experts that are not a power of 2.");
         static constexpr int TPB = 256;
-        moeSoftmax<DTYPE, TPB><<<num_tokens, TPB, 0, stream>>>(
+        aiter::moe_topk_detail::launch(moeSoftmax<DTYPE, TPB>,
+            dim3(num_tokens), dim3(TPB), 0, stream,
             gating_output, nullptr, softmax_workspace, num_experts);
-        moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(softmax_workspace,
+        aiter::moe_topk_detail::launch(moeTopK<TPB>,
+            dim3(num_tokens), dim3(TPB), 0, stream, softmax_workspace,
                                                      nullptr,
                                                      topk_weights,
                                                      topk_indicies,
