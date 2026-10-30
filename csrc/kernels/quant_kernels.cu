@@ -25,6 +25,7 @@
 #include "dispatch_utils.h"
 #include "hip_reduce.h"
 #include "quant_common.cuh"
+#include "quant_launch.h"
 #include "rocprim/rocprim.hpp"
 #include "vec_convert.h"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
@@ -306,15 +307,50 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     return std::make_tuple(row_scale, reinterpret_cast<DTYPE_I*>(&vec_cur));
 }
 
+// Keep partial row maxima raw: a zero row must not contribute the per-token
+// zero-scale sentinel (1.0) to a tensor-wide reduction.
+template <typename DTYPE_I>
+__device__ float quant_row_absmax(const DTYPE_I* input, int cols)
+{
+    float value = 0.0f;
+    const auto* row = input + int64_t(blockIdx.x) * cols;
+    if(cols % 8 == 0 && reinterpret_cast<uintptr_t>(row) % 16 == 0)
+    {
+        using vec = ck_tile::vec_t<DTYPE_I, 8>;
+        for(int i = threadIdx.x; i < cols / 8; i += BlockSize)
+        {
+            const auto x = reinterpret_cast<const vec*>(row)[i];
+#pragma unroll
+            for(int j = 0; j < 8; ++j)
+                value = fmaxf(value, fabsf(ck_tile::type_convert<float>(x[j])));
+        }
+    }
+    else
+    {
+        for(int i = threadIdx.x; i < cols; i += BlockSize)
+            value = fmaxf(value, fabsf(ck_tile::type_convert<float>(row[i])));
+    }
+    return block_reduce<float, hipcub::Max, BlockSize, true>(value, hipcub::Max());
+}
+
 template <typename DTYPE_I, typename DTYPE_O>
 __global__ void
 data_to_scale_kernel(float* __restrict__ scale, const DTYPE_I* __restrict__ input, const int cols)
 {
-    auto res        = data_to_per_row_scale<DTYPE_I, DTYPE_O, 0>(input, cols);
-    float row_scale = std::get<0>(res);
+    const float row_max = quant_row_absmax(input, cols);
     if(threadIdx.x == 0)
     {
-        vllm::atomicMaxFloat(scale, row_scale);
+        vllm::atomicMaxFloat(scale, row_max);
+    }
+}
+
+template <typename DTYPE_O>
+__global__ void finalize_tensor_scale(float* scale)
+{
+    if(threadIdx.x == 0)
+    {
+        const float maximum = ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max());
+        *scale = *scale == 0.0f ? 1.0f : *scale / maximum;
     }
 }
 
@@ -479,13 +515,127 @@ __device__ void scaled_quant_vgpr_impl(DTYPE_O* __restrict__ out,
     }
 }
 
+template <typename DTYPE_O, typename DTYPE_I, int N>
+__device__ auto quant_convert_clamped(ck_tile::vec_t<DTYPE_I, N> values, float multiplier)
+{
+    ck_tile::vec_t<float, N> normalized;
+    const float maximum = ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max());
+    const float minimum = std::is_same_v<DTYPE_O, ck_tile::int8_t> ? -128.0f : -maximum;
+#pragma unroll
+    for(int j = 0; j < N; ++j)
+        normalized[j] = fminf(maximum, fmaxf(minimum,
+                            ck_tile::type_convert<float>(values[j]) * multiplier));
+    return ck_tile::vec_convert<DTYPE_O, float, N>(normalized, 1.0f);
+}
+
+template <typename DTYPE_I, typename DTYPE_O>
+__device__ void quant_store_row(DTYPE_O* out, const DTYPE_I* input,
+                                int cols, float multiplier)
+{
+    const int64_t offset = int64_t(blockIdx.x) * cols;
+    const auto* row = input + offset;
+    auto* dest = out + offset;
+    if constexpr(std::is_same_v<DTYPE_O, ck_tile::int8_t>)
+    {
+        // Construct each packed word from masked unsigned bytes.  In the
+        // gfx946 PMD SDK, the vector<int8> store produced 0xff in byte 3.
+        auto quant_byte = [&](int i) {
+            float v = ck_tile::type_convert<float>(row[i]) * multiplier;
+            float rounded = rintf(fminf(127.0f, fmaxf(-128.0f, v)));
+#if defined(__gfx946__)
+            // The failing PMD binary contains SDWA byte/word conversion.
+            // Keep conversion and byte masking as full-width instructions.
+            uint32_t q;
+            asm volatile("v_cvt_i32_f32 %0, %1\n\tv_and_b32 %0, 255, %0"
+                         : "=&v"(q) : "v"(rounded));
+            return q;
+#else
+            return static_cast<uint32_t>(static_cast<int>(rounded)) & 0xffu;
+#endif
+        };
+        if(cols % 4 == 0 && reinterpret_cast<uintptr_t>(dest) % 4 == 0)
+        {
+            for(int i = threadIdx.x * 4; i < cols; i += BlockSize * 4)
+            {
+                uint32_t a = quant_byte(i), b = quant_byte(i + 1);
+                uint32_t c = quant_byte(i + 2), d = quant_byte(i + 3);
+#if defined(__gfx946__)
+                asm volatile("v_lshlrev_b32 %1, 8, %1\n\t"
+                             "v_lshlrev_b32 %2, 16, %2\n\t"
+                             "v_lshlrev_b32 %3, 24, %3\n\t"
+                             "v_or_b32 %0, %0, %1\n\t"
+                             "v_or_b32 %0, %0, %2\n\t"
+                             "v_or_b32 %0, %0, %3"
+                             : "+v"(a), "+v"(b), "+v"(c), "+v"(d));
+                uint32_t packed = a;
+#else
+                uint32_t packed = a | (b << 8) | (c << 16) | (d << 24);
+#endif
+                reinterpret_cast<uint32_t*>(dest)[i / 4] = packed;
+            }
+        }
+        else
+        {
+            auto* bytes = reinterpret_cast<uint8_t*>(dest);
+            for(int i = threadIdx.x; i < cols; i += BlockSize)
+                bytes[i] = static_cast<uint8_t>(quant_byte(i));
+        }
+        return;
+    }
+    if(cols % 8 == 0 && reinterpret_cast<uintptr_t>(row) % 16 == 0 &&
+       reinterpret_cast<uintptr_t>(dest) % 8 == 0)
+    {
+        using vi = ck_tile::vec_t<DTYPE_I, 8>;
+        using vo = ck_tile::vec_t<DTYPE_O, 8>;
+        for(int i = threadIdx.x; i < cols / 8; i += BlockSize)
+            reinterpret_cast<vo*>(dest)[i] = quant_convert_clamped<DTYPE_O>(
+                reinterpret_cast<const vi*>(row)[i], multiplier);
+    }
+    else
+    {
+        for(int i = threadIdx.x * 2; i < cols; i += BlockSize * 2)
+        {
+            ck_tile::vec_t<DTYPE_I, 2> values;
+            values[0] = row[i];
+            values[1] = i + 1 < cols ? row[i + 1] : ck_tile::type_convert<DTYPE_I>(0.0f);
+            auto result = quant_convert_clamped<DTYPE_O>(values, multiplier);
+            dest[i] = result[0];
+            if(i + 1 < cols)
+                dest[i + 1] = result[1];
+        }
+    }
+}
+
 template <typename DTYPE_I, typename DTYPE_O>
 __global__ void scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                     const DTYPE_I* __restrict__ input,
                                     const float* __restrict__ scale,
                                     const int cols)
 {
-    scaled_quant_impl<DTYPE_I>(out, input, scale, cols);
+    quant_store_row(out, input, cols, 1.0f / *scale);
+}
+
+template <typename DTYPE_I, typename DTYPE_O>
+__global__ void dynamic_per_token_scaled_quant_safe_kernel(
+    DTYPE_O* out, float* scales, const DTYPE_I* input, int cols,
+    const int32_t* num_rows, int factor)
+{
+    if(num_rows != nullptr && int64_t(blockIdx.x) >= int64_t(*num_rows) * factor)
+        return;
+    float maximum = quant_row_absmax(input, cols);
+    if constexpr(std::is_same_v<DTYPE_O, ck_tile::int8_t>)
+        maximum = fmaxf(maximum, 1e-10f);
+    else if(cols == 32 || cols == 64 || cols == 128)
+        maximum = fmaxf(maximum, 1e-10f);
+    const float limit = ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max());
+    const float scale = maximum == 0.0f ? 1.0f : maximum / limit;
+    if(threadIdx.x == 0)
+        scales[blockIdx.x] = scale;
+    // Match the public Torch reference's FP32 reciprocal-then-multiply
+    // evaluation for INT8. Direct division can round differently at ties.
+    const float multiplier = std::is_same_v<DTYPE_O, ck_tile::int8_t>
+                                 ? (1.0f / maximum) * limit : 1.0f / scale;
+    quant_store_row(out, input, cols, multiplier);
 }
 
 template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16>
@@ -703,21 +853,44 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     scaled_quant_vgpr_impl<float, DTYPE_O, thread_data_size>(out, vec_ptr, &row_scale, cols);
 }
 
+inline void check_quant_buffers(const torch::Tensor& out, const torch::Tensor& input,
+                                const torch::Tensor& scale, bool per_tensor)
+{
+    TORCH_CHECK(input.is_cuda() && out.is_cuda() && scale.is_cuda(),
+                "quant input, output and scale must be on a HIP device");
+    TORCH_CHECK(input.device() == out.device() && input.device() == scale.device(),
+                "quant buffers must be on the same device");
+    TORCH_CHECK(input.dim() >= 1 && input.size(-1) > 0, "quant requires a nonempty last dimension");
+    TORCH_CHECK(input.is_contiguous() && out.is_contiguous() && scale.is_contiguous(),
+                "quant buffers must be contiguous");
+    TORCH_CHECK(input.scalar_type() == torch::kHalf || input.scalar_type() == torch::kBFloat16,
+                "quant input must be FP16 or BF16");
+    TORCH_CHECK(out.numel() == input.numel(), "quant output size must match input");
+    TORCH_CHECK(scale.scalar_type() == torch::kFloat32, "quant scale must be FP32");
+    TORCH_CHECK(scale.numel() == (per_tensor ? 1 : input.numel() / input.size(-1)),
+                "quant scale has the wrong number of elements");
+    TORCH_CHECK(input.size(-1) <= INT32_MAX && input.numel() / input.size(-1) <= INT32_MAX,
+                "quant row/column count exceeds int32 range");
+}
+
 void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
                              torch::Tensor const& input, // [..., d]
                              torch::Tensor const& scale) // [1]
 {
+    check_quant_buffers(out, input, scale, true);
     const int cols = input.size(-1);
     int rows       = input.numel() / cols;
     dim3 grid(rows);
     dim3 block(BlockSize);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
+    if(rows == 0)
+        return;
     if(out.dtype() == torch::kInt8)
     {
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
             using input_dtype = typename t2ck<scalar_t>::type;
-            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+            quant_detail::launch(aiter::scaled_quant_kernel<input_dtype, ck_tile::int8_t>, grid, block, stream,
                 reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 scale.data_ptr<float>(),
@@ -729,7 +902,7 @@ void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
     {
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
             using input_dtype = typename t2ck<scalar_t>::type;
-            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+            quant_detail::launch(aiter::scaled_quant_kernel<input_dtype, FP8_TYPE>, grid, block, stream,
                 reinterpret_cast<FP8_TYPE*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 scale.data_ptr<float>(),
@@ -743,17 +916,21 @@ void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
     }
 }
 
-#define DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA)      \
-    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {              \
-        using input_dtype = typename t2ck<scalar_t>::type;                                  \
-        aiter::quant_kernel<input_dtype, DTYPE_O, THREAD_DATA><<<grid, block, 0, stream>>>( \
-            reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                     \
-            scales.data_ptr<float>(),                                                       \
-            reinterpret_cast<input_dtype*>(input.data_ptr()),                               \
-            scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,                   \
-            cols,                                                                           \
-            num_rows_ptr,                                                                   \
-            num_rows_factor);                                                               \
+#define DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA)         \
+    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                 \
+        using input_dtype = typename t2ck<scalar_t>::type;                                     \
+        if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)                               \
+            aiter::quant_kernel<input_dtype, DTYPE_O, THREAD_DATA><<<grid, block, 0, stream>>>(\
+                reinterpret_cast<DTYPE_O*>(out.data_ptr()), scales.data_ptr<float>(),          \
+                reinterpret_cast<input_dtype*>(input.data_ptr()),                              \
+                scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,                  \
+                cols, num_rows_ptr, num_rows_factor);                                           \
+        else                                                                                   \
+            quant_detail::launch(aiter::quant_kernel<input_dtype, DTYPE_O, THREAD_DATA>,       \
+                grid, block, stream, reinterpret_cast<DTYPE_O*>(out.data_ptr()),                \
+                scales.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()),    \
+                scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,                  \
+                cols, num_rows_ptr, num_rows_factor);                                           \
     });
 
 #define DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(quant_kernel, DTYPE_O, cols) \
@@ -778,12 +955,19 @@ void dynamic_per_tensor_quant(torch::Tensor& out,         // [..., d]
                               torch::Tensor const& input, // [..., d]
                               torch::Tensor& scale)       // [1]
 {
+    check_quant_buffers(out, input, scale, true);
     const int cols = input.size(-1);
     int rows       = input.numel() / cols;
     dim3 grid(rows);
     dim3 block(BlockSize);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
+    if(rows == 0)
+    {
+        vllm::initializeScale<<<1, 64, 0, stream>>>(scale.data_ptr<float>(), 1, 1.0f);
+        HIP_CHECK_ERROR(hipGetLastError());
+        return;
+    }
 
     if(out.dtype() == torch::kInt8)
     {
@@ -791,9 +975,11 @@ void dynamic_per_tensor_quant(torch::Tensor& out,         // [..., d]
             using input_dtype = typename t2ck<scalar_t>::type;
             vllm::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
                 scale.data_ptr<float>(), 1, 0.0f);
-            aiter::data_to_scale_kernel<input_dtype, ck_tile::int8_t><<<grid, block, 0, stream>>>(
+            quant_detail::launch(aiter::data_to_scale_kernel<input_dtype, ck_tile::int8_t>, grid, block, stream,
                 scale.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
-            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+            quant_detail::launch(aiter::finalize_tensor_scale<ck_tile::int8_t>,
+                                 dim3(1), dim3(64), stream, scale.data_ptr<float>());
+            quant_detail::launch(aiter::scaled_quant_kernel<input_dtype, ck_tile::int8_t>, grid, block, stream,
                 reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 scale.data_ptr<float>(),
@@ -807,9 +993,11 @@ void dynamic_per_tensor_quant(torch::Tensor& out,         // [..., d]
             using input_dtype = typename t2ck<scalar_t>::type;
             vllm::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
                 scale.data_ptr<float>(), 1, 0.0f);
-            aiter::data_to_scale_kernel<input_dtype, FP8_TYPE><<<grid, block, 0, stream>>>(
+            quant_detail::launch(aiter::data_to_scale_kernel<input_dtype, FP8_TYPE>, grid, block, stream,
                 scale.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
-            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+            quant_detail::launch(aiter::finalize_tensor_scale<FP8_TYPE>,
+                                 dim3(1), dim3(64), stream, scale.data_ptr<float>());
+            quant_detail::launch(aiter::scaled_quant_kernel<input_dtype, FP8_TYPE>, grid, block, stream,
                 reinterpret_cast<FP8_TYPE*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 scale.data_ptr<float>(),
@@ -833,19 +1021,68 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
 {
     TORCH_CHECK(input.is_contiguous());
     TORCH_CHECK(out.is_contiguous());
+#ifndef GPU_ENABLE_FP8
+    TORCH_CHECK(out.scalar_type() != torch_fp8, "FP8 quantization is not enabled in this build");
+#endif
+
+    // Packed FP4/group APIs share this implementation and retain their own
+    // output/scale layout. Validate the per-token INT8/FP8 contract here.
+    if(out.scalar_type() == torch::kInt8 || out.scalar_type() == torch_fp8)
+        check_quant_buffers(out, input, scales, false);
+    TORCH_CHECK(num_rows_factor > 0, "num_rows_factor must be positive");
+    if(num_rows.has_value())
+        TORCH_CHECK(num_rows->is_cuda() && num_rows->device() == input.device() &&
+                    num_rows->scalar_type() == torch::kInt32 && num_rows->is_contiguous() &&
+                    num_rows->numel() == 1, "num_rows must be one contiguous device int32");
 
     int const cols        = input.size(-1);
     int const rows        = input.numel() / cols;
     int32_t* num_rows_ptr = num_rows.has_value() ? num_rows->data_ptr<int32_t>() : nullptr;
 
+    if(rows == 0)
+        return;
+
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    const int vector_width = cols <= 2048 ? 8 : (cols <= 4096 || cols > 8192 ? 16 : 32);
+    bool use_safe = cols % vector_width != 0 ||
+                    reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 != 0 ||
+                    reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 != 0;
+#if AITER_QUANT_ENABLE_MULTIDIE
+    // The existing vector INT8 paths fail the gfx946 PMD byte-packing
+    // reference test; FP8 also differs at some FP32 rounding midpoints.
+    // Use the bounded conversion with the same scale order as tensor quant.
+    if(!shuffle_scale && out.size(-1) == cols &&
+       ck_tile::get_hip_device_info().arch_name == "gfx946")
+        use_safe = true;
+#endif
+    if((out.scalar_type() == torch::kInt8 || out.scalar_type() == torch_fp8) &&
+       use_safe && !shuffle_scale && out.size(-1) == cols)
+    {
+        AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_safe", [&] {
+            using input_dtype = typename t2ck<scalar_t>::type;
+            if(out.scalar_type() == torch::kInt8)
+                quant_detail::launch(dynamic_per_token_scaled_quant_safe_kernel<input_dtype, ck_tile::int8_t>,
+                    dim3(rows), dim3(BlockSize), stream,
+                    reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()), scales.data_ptr<float>(),
+                    reinterpret_cast<const input_dtype*>(input.data_ptr()), cols, num_rows_ptr, num_rows_factor);
+#ifdef GPU_ENABLE_FP8
+            else
+                quant_detail::launch(dynamic_per_token_scaled_quant_safe_kernel<input_dtype, FP8_TYPE>,
+                    dim3(rows), dim3(BlockSize), stream,
+                    reinterpret_cast<FP8_TYPE*>(out.data_ptr()), scales.data_ptr<float>(),
+                    reinterpret_cast<const input_dtype*>(input.data_ptr()), cols, num_rows_ptr, num_rows_factor);
+#endif
+        });
+        return;
+    }
 
     if(cols == 640 && rows >= 512 && input.scalar_type() == torch::kBFloat16 &&
        out.scalar_type() == torch::kInt8)
     {
-        aiter::dynamic_per_token_int8_quant_wave_kernel<ck_tile::bf16_t, 640>
-            <<<(rows + 3) / 4, 128, 0, stream>>>(
+        quant_detail::launch(aiter::dynamic_per_token_int8_quant_wave_kernel<ck_tile::bf16_t, 640>,
+            dim3((rows + 3) / 4), dim3(128), stream,
                 reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()),
                 scales.data_ptr<float>(),
                 reinterpret_cast<const ck_tile::bf16_t*>(input.data_ptr()),

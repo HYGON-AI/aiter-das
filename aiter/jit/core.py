@@ -841,6 +841,8 @@ def build_module(
             flags_hip.append("-DCK_TILE_LAYERNORM_ENABLE_MULTIDIE=1")
         if md_name == "module_rmsnorm" and "gfx946" in archs:
             flags_hip.append("-DCK_TILE_RMSNORM_ENABLE_MULTIDIE=1")
+        if md_name in {"module_quant", "module_cpp_api"} and "gfx946" in archs:
+            flags_hip.append("-DAITER_QUANT_ENABLE_MULTIDIE=1")
         if md_name == "module_activation" and "gfx946" in archs:
             flags_hip.append("-DAITER_SILU_ENABLE_MULTIDIE=1")
         parallel_jobs = os.getenv("AITER_HIP_PARALLEL_JOBS")
