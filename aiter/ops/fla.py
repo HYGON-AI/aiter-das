@@ -161,11 +161,17 @@ def _sglang_fused_sigmoid_gating_delta_rule_update(
     cu_seqlens: Optional[torch.Tensor] = None,
     is_kda: bool = False,
     lower_bound: Optional[float] = None,
+    beta_scale: float = 1.0,
     disable_state_update: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: int = 0,
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    cache_replayssm_inputs: bool = False,
+    replayssm_rawv: Optional[torch.Tensor] = None,
+    replayssm_rawk: Optional[torch.Tensor] = None,
+    replayssm_g: Optional[torch.Tensor] = None,
+    replayssm_beta: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     ...
 
@@ -370,15 +376,31 @@ def sglang_fused_sigmoid_gating_delta_rule_update(
     cu_seqlens: Optional[torch.Tensor] = None,
     is_kda: bool = False,
     lower_bound: Optional[float] = None,
+    beta_scale: float = 1.0,
     disable_state_update: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    cache_replayssm_inputs: bool = False,
+    replayssm_rawv: Optional[torch.Tensor] = None,
+    replayssm_rawk: Optional[torch.Tensor] = None,
+    replayssm_g: Optional[torch.Tensor] = None,
+    replayssm_beta: Optional[torch.Tensor] = None,
     kernel_cfg: Optional[dict[str, Any]] = None,
 ) -> torch.Tensor:
-    """SGLang recurrent fused sigmoid-gating delta-rule update HIP path."""
-    del(kernel_cfg)
+    """SGLang recurrent fused sigmoid-gating delta-rule update HIP path.
+
+    ``beta_scale`` scales sigmoid(b) in both GDN and KDA. ``lower_bound``
+    applies only to KDA; ReplaySSM buffers are used only when staging is enabled.
+    Nonnegative slot indices must be in range; a negative initial-state slot
+    starts from zero, and a negative cache slot skips intermediate caching.
+    cu_seqlens must partition the packed tokens, and cache_steps must cover
+    every sequence when intermediate caching is used.
+    Tree parents must refer to earlier steps. Concurrent sequences must use
+    distinct writable state/cache slots.
+    """
+    del kernel_cfg
 
     (out,) = _sglang_fused_sigmoid_gating_delta_rule_update(
         A_log,
@@ -397,11 +419,17 @@ def sglang_fused_sigmoid_gating_delta_rule_update(
         cu_seqlens,
         is_kda,
         lower_bound,
+        beta_scale,
         disable_state_update,
         intermediate_states_buffer,
         intermediate_state_indices,
         0 if cache_steps is None else int(cache_steps),
         retrieve_parent_token,
+        cache_replayssm_inputs,
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta,
     )
     return out
 

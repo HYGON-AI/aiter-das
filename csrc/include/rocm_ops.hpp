@@ -641,11 +641,17 @@ namespace py = pybind11;
           py::arg("cu_seqlens") = std::nullopt,                                                 \
           py::arg("is_kda") = false,                                                            \
           py::arg("lower_bound") = std::nullopt,                                                \
+          py::arg("beta_scale") = 1.0f,                                                         \
           py::arg("disable_state_update") = false,                                              \
           py::arg("intermediate_states_buffer") = std::nullopt,                                 \
           py::arg("intermediate_state_indices") = std::nullopt,                                 \
           py::arg("cache_steps") = 0,                                                           \
-          py::arg("retrieve_parent_token") = std::nullopt);                                     \                                                           
+          py::arg("retrieve_parent_token") = std::nullopt,                                      \
+          py::arg("cache_replayssm_inputs") = false,                                            \
+          py::arg("replayssm_rawv") = std::nullopt,                                             \
+          py::arg("replayssm_rawk") = std::nullopt,                                             \
+          py::arg("replayssm_g") = std::nullopt,                                                \
+          py::arg("replayssm_beta") = std::nullopt);                                            \
                                                                                                 \
     m.def("aiter_fused_recurrent_gated_delta_rule_packed_decode",                               \
           &aiter::native::aiter_fused_recurrent_gated_delta_rule_packed_decode,                 \

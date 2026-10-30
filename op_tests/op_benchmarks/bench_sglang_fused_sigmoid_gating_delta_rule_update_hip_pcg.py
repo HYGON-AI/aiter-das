@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
 """Benchmark the SGLang target-verify GDN shape (H=8, HV=16, K=V=128) vs Triton.
 
 Run from the repository root:
