@@ -501,6 +501,12 @@ def _try_get_triton_default_config(
     if quant_type not in dtype_names:
         return None
     try:
+        if quant_type == MoeQuantType.FP8_W8A8:
+            from .utility import dtypes
+
+            # The uint8 FP8 fallback is not an executable Triton FP8 dtype.
+            if dtypes.fp8 == torch.uint8:
+                return None
         from boltops.fused_moe.triton.moe_config_utils import get_default_config
 
         block_n = block_size if quant_type in (MoeQuantType.W8A8, MoeQuantType.FP8_W8A8) else 0
