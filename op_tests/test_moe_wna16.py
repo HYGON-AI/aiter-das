@@ -179,8 +179,7 @@ def test_fused_moe_wn16(m: int,
         dtype=dtype,
         w1_zp=w1_qzeros,
         w2_zp=w2_qzeros,
-        # w4a16 家族的布局决策固定为 raw（不重排），显式传参避免歧义
-        weight_layout="raw",
+        # w4a16 家族的布局决策固定为 raw（不重排），不传 prepared 即按 raw 放行
     )
     assert torch.isfinite(wna16_out).all(), "wna16 triton-section: non-finite output"
     _ret = checkAllclose(torch_triton_output, wna16_out, rtol=0.01, atol=0.03,
@@ -282,8 +281,7 @@ def test_fused_moe_wn16(m: int,
         dtype=dtype,
         w1_zp=w1_qzeros,
         w2_zp=w2_qzeros,
-        # w4a16 家族的布局决策固定为 raw（不重排），显式传参避免歧义
-        weight_layout="raw",
+        # w4a16 家族的布局决策固定为 raw（不重排），不传 prepared 即按 raw 放行
     )
     assert torch.isfinite(wna16_out).all(), "wna16 asm-section: non-finite output"
 
@@ -386,8 +384,7 @@ def test_fused_moe_wn16(m: int,
         dtype=dtype,
         w1_zp=w1_qzeros,
         w2_zp=w2_qzeros,
-        # w4a16 家族的布局决策固定为 raw（不重排），显式传参避免歧义
-        weight_layout="raw",
+        # w4a16 家族的布局决策固定为 raw（不重排），不传 prepared 即按 raw 放行
     )
     assert torch.isfinite(wna16_out).all(), "wna16 moe_c-section: non-finite output"
     _ret = checkAllclose(torch_moe_c_output, wna16_out, rtol=0.01, atol=0.03,

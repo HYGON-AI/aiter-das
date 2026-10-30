@@ -189,9 +189,10 @@ def test_fused_moe_wn16(m: int,
     # w4a8 channelwise released via triton: real verdict (no zp; boltops w4a8
     # kernel asserts B_zp is None).
     # 加载期一次性准备（w4a8 决策为 raw，不重排）
-    w1_prep, w2_prep, layout = fused_moe_prepare_weights(
+    w1_prep, w2_prep, prepared = fused_moe_prepare_weights(
         w1_qweight, w2_qweight, quant_type=QuantType.per_Token,
-        w1_scale=w1_scales, w2_scale=w2_scales, dtype=dtype, topk=topk,
+        w1_scale=w1_scales, w2_scale=w2_scales, dtype=dtype,
+        topk=topk_ids.shape[1],
         activation=ActivationType.Silu, expert_mask=e_map,
         quant_dtype_a=torch.int8)
     w4a8_out = fused_moe(
@@ -202,9 +203,7 @@ def test_fused_moe_wn16(m: int,
         topk_ids,
         expert_mask=e_map,
         quant_type=QuantType.per_Token,
-        w1_scale=w1_scales,
-        w2_scale=w2_scales,
-        weight_layout=layout,
+        prepared=prepared,
         dtype=dtype,
         quant_dtype_a=torch.int8,
     )

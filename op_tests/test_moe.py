@@ -46,11 +46,11 @@ def fused_moe_test(
     topk_weight,
     topk_ids,
     activation=ActivationType.Silu,
-    weight_layout=None,
+    prepared=None,
 ):
     # No quantization (bf16/fp16 weights); the router inside fused_moe picks the backend
     return fused_moe(hidden_states, w1, w2, topk_weight, topk_ids,
-                     activation=activation, weight_layout=weight_layout)
+                     activation=activation, prepared=prepared)
 
 
 quant_algo = [
@@ -127,19 +127,19 @@ def test_fmoe(
         ref2, avg_c = torch_moe_test(input, w1, w2, topk_weights, topk_ids)
 
         # 加载期一次性准备（决定布局 + 如需重排），前向零重排
-        w1p, w2p, layout = fused_moe_prepare_weights(
-            w1, w2, quant_type=QuantType.No, dtype=dtype, topk=topk,
-            activation=activation)
-        print(f"[layout] quant={quantstr} layout={layout}")
+        w1p, w2p, prepared = fused_moe_prepare_weights(
+            w1, w2, quant_type=QuantType.No, dtype=dtype,
+            topk=topk_ids.shape[1], activation=activation)
+        print(f"[layout] quant={quantstr} layout={prepared.layout}")
 
         # operator under test: fused_moe (router picks the backend)
         out, avg = fused_moe_test(input, w1p, w2p, topk_weights, topk_ids,
-                                  activation=activation, weight_layout=layout)
+                                  activation=activation, prepared=prepared)
 
         # 原始权重对拍：布局为 raw 时两者逐位一致；非 raw 时走各自路径做数值校验
         out_raw, _ = fused_moe_test(input, w1, w2, topk_weights, topk_ids,
-                                    activation=activation, weight_layout="raw")
-        if layout == "raw":
+                                    activation=activation)
+        if prepared.layout == "raw":
             assert torch.equal(out, out_raw), "raw layout must be bit-exact"
 
         msg = f"[perf] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, fused_moe_avg: {avg:>8.2f} us, uplift: {avg_c/avg-1:.1%}"

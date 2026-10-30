@@ -58,7 +58,7 @@ def fused_moe_test(hidden_states: torch.Tensor,
                    dtype=None,
                    quant_type=QuantType.No,
                    activation=ActivationType.Silu,
-                   weight_layout=None):
+                   prepared=None):
     # single fused_moe entry: the router picks the backend; dynamic
     # per-token activation quant is internal (QuantType.per_Token), so
     # no pre-quantized activation input is passed
@@ -73,7 +73,7 @@ def fused_moe_test(hidden_states: torch.Tensor,
                      w1_scale=w1_scale,
                      w2_scale=w2_scale,
                      dtype=dtype,
-                     weight_layout=weight_layout)
+                     prepared=prepared)
 
 
 def test_fused_moe_w8a8(m: int, 
@@ -153,9 +153,10 @@ def test_fused_moe_w8a8(m: int,
     # internal (QuantType.per_Token), so no input pre-quant is needed.
     # fused_moe consumes the prepared layout marker
     # 加载期一次性准备（布局决策 + 如需重排），前向零重排
-    w1_prep, w2_prep, layout = fused_moe_prepare_weights(
+    w1_prep, w2_prep, prepared = fused_moe_prepare_weights(
         w1_qweight, w2_qweight, quant_type=QuantType.per_Token,
-        w1_scale=w1_scales, w2_scale=w2_scales, dtype=dtype, topk=topk,
+        w1_scale=w1_scales, w2_scale=w2_scales, dtype=dtype,
+        topk=topk_ids.shape[1],
         activation=ActivationType.Silu, expert_mask=e_map)
     fused_output, avg_fused = fused_moe_test(
         input,
@@ -163,13 +164,11 @@ def test_fused_moe_w8a8(m: int,
         w2_prep,
         topk_weights,
         topk_ids,
-        w1_scale=w1_scales,
-        w2_scale=w2_scales,
         expert_mask=e_map,
         dtype=dtype,
         quant_type=QuantType.per_Token,
         activation=ActivationType.Silu,
-        weight_layout=layout)
+        prepared=prepared)
 
     msg = f"[FUSED_MOE_perf] {m=}, {k=}, {n=}, {e=}, {topk=}, dtype: {dtype}, torch_avg: {avg_torch:<8.2f} us, fused_moe_avg: {avg_fused:>8.2f} us,uplift: {avg_torch/avg_fused-1:.1%}"
     checkAllclose(torch_output, fused_output, rtol=0.01, atol=5, msg=msg)  # largest measured error: 0.085

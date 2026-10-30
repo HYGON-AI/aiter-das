@@ -140,8 +140,7 @@ def torch_moe_blockscale(
 
 @perftest(num_warmup=5, num_iters=10, testGraph=False)
 def fused_moe_test(hidden_states, w1, w2, topk_weights, topk_ids,
-                   expert_mask=None, w1_scale=None, w2_scale=None,
-                   weight_layout=None):
+                   expert_mask=None, prepared=None):
     # w8a8 blockwise: per_1x128 maps to block_shape (128, 128) internally
     return fused_moe(
         hidden_states,
@@ -152,9 +151,7 @@ def fused_moe_test(hidden_states, w1, w2, topk_weights, topk_ids,
         expert_mask=expert_mask,
         activation=ActivationType.Silu,
         quant_type=QuantType.per_1x128,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        weight_layout=weight_layout,
+        prepared=prepared,
     )
 
 
@@ -276,10 +273,11 @@ def test_fused_moe_w8a8(M: int,
 
     # Single fused_moe (w8a8 blockwise) comparison against the torch reference.
     # 加载期一次性准备（布局决策 + 如需重排），前向零重排。
-    w1_prep, w2_prep, layout = fused_moe_prepare_weights(
+    w1_prep, w2_prep, prepared = fused_moe_prepare_weights(
         w1_qweight, w2_qweight, quant_type=QuantType.per_1x128,
         w1_scale=w1_scales, w2_scale=w2_scales, dtype=dtype,
-        topk=8, activation=ActivationType.Silu, expert_mask=expert_mask)
+        topk=topk_ids.shape[1], activation=ActivationType.Silu,
+        expert_mask=expert_mask)
     fused_output, avg_fused = fused_moe_test(
         input,
         w1_prep,
@@ -287,9 +285,7 @@ def test_fused_moe_w8a8(M: int,
         topk_weights,
         topk_ids,
         expert_mask,
-        w1_scales,
-        w2_scales,
-        weight_layout=layout,
+        prepared,
     )
 
     msg = f"[fused_moe_perf] {M=}, {K=}, {N=}, {E=}, {topk=}, dtype: {dtype}, fused_moe_avg: {avg_fused:>8.2f} us"

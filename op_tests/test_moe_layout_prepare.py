@@ -1,27 +1,40 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""fused_moe 权重布局决策与一次性准备的测试
+"""Tests for fused_moe weight-layout decision and one-shot preparation.
 
-覆盖：
-  1. 双表方向：收益 ≥5% 选 asm_shuffle，<5% 选 raw
-  2. model_dim 不是 64 的倍数：asm 补 K 后执行，数值正确（执行层补 w2_scale）
-  3. moe_c 的 w8a8_fp8 + 非对齐 model_dim：降级 raw（宿主侧补 K 数值错误）
-  4. 决策不会主动选的布局：用 _shared_shuffle_impl 强制 asm_shuffle 后仍正确
-  5. moe_c w8a16：marlin 准备 + 重复准备返回同一对象
-  6. 前向零重排：aiter.ops.shuffle 布局函数调用计数 = 0
-  7. 五类错配：布局与家族不符 / 属性丢失 / activation、topk、expert_mask
-     与准备时不一致
+Covers:
+  1. dual-table direction: gain >= 5% -> asm_shuffle, otherwise raw
+  2. model_dim not a multiple of 64: asm pads K and still matches the reference
+     (w2_scale padded too)
+  3. moe_c w8a8_fp8 with unaligned model_dim: degrade to raw
+  4. moe_c w8a16: marlin prepare and forward parity
+  5. zero live shuffle during forward: aiter.ops.shuffle counters stay 0
+  6. non-raw layout short-circuits to its bound backend
+  7. runtime rules: bare weights run as raw; raw-marked weights without prepared
+     run as raw; shuffled weights without prepared raise; marker vs
+     prepared.layout conflict raises; clone / detach / serialize roundtrip warn
+     once and run with prepared.layout; another layer's weights warn once;
+     warning deduped; prepared plus explicit scales raise; mismatched w1/w2
+     markers raise; wrong arch / cu_num raises; changed topk / activation / EP
+     raise naming the field
+  8. read-only object, prepare cache hit and miss, re-preparing shuffled weights
+     raises
 
-用法（容器内、仓库根）：PYTHONPATH=. python op_tests/test_moe_layout_prepare.py
-退出码 0 = 全部通过。
+Usage (inside the container, repo root):
+    PYTHONPATH=. python op_tests/test_moe_layout_prepare.py
+Exit code 0 = all passed.
 """
+import io
+import logging
+from dataclasses import FrozenInstanceError, replace
+
 import torch
 
 from aiter import ActivationType, QuantType, dtypes, pertoken_quant
 from aiter.fused_moe import fused_moe, fused_topk, torch_moe
-from aiter.fused_moe_layout import (describe_fused_moe_layout,
-                                   fused_moe_prepare_weights, get_weight_layout)
-from aiter.moe import _shared_shuffle_impl
+from aiter.fused_moe_layout import (_WARNED_PREPARED, _build_problem,
+                                    describe_fused_moe_layout,
+                                    fused_moe_prepare_weights, get_weight_layout)
 import aiter.ops.shuffle as SH
 
 torch.set_default_device("cuda")
@@ -64,13 +77,43 @@ def route_of(fn, *a, **k):
 
 
 def expect_value_error(name, needle, fn):
+    needles = (needle,) if isinstance(needle, str) else tuple(needle)
     try:
         fn()
     except ValueError as exc:
-        ok = needle in str(exc)
-        check(name, ok, f"msg={str(exc)[:110]}")
+        msg = str(exc)
+        ok = any(n in msg for n in needles)
+        check(name, ok, f"msg={msg[:110]}")
     except Exception as exc:  # noqa: BLE001
         check(name, False, f"wrong exc {type(exc).__name__}: {exc}")
+
+
+class _WarningCatcher(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.msgs = []
+
+    def emit(self, record):
+        self.msgs.append(record.getMessage())
+
+
+def run_and_capture(fn):
+    """跑一次前向，返回 (结果, 告警文案列表)；期间清空告警去重表。"""
+    box = {}
+    handler = _WarningCatcher()
+    logger = logging.getLogger("aiter.fused_moe_layout")
+    old_level, old_prop = logger.level, logger.propagate
+    logger.setLevel(logging.WARNING)
+    logger.propagate = False
+    logger.addHandler(handler)
+    _WARNED_PREPARED.clear()
+    try:
+        box["ret"] = fn()
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+        logger.propagate = old_prop
+    return box.get("ret"), handler.msgs
 
 
 def build(M, E, N, K, topk, quant="fp8", seed=0):
@@ -93,17 +136,23 @@ def build(M, E, N, K, topk, quant="fp8", seed=0):
                 tw=tw, ti=ti, ref=ref, M=M, E=E, N=N, K=K, topk=topk)
 
 
-def run_case(c, layout, w1=None, w2=None, **over):
+def run_prepared(c, pair, **over):
+    kw = dict(activation=ActivationType.Silu, quant_type=c["qt"], dtype=DT,
+              prepared=pair[2])
+    kw.update(over)
+    return route_of(fused_moe, c["hidden"], pair[0], pair[1], c["tw"], c["ti"], **kw)
+
+
+def run_raw(c, w1=None, w2=None, **over):
     kw = dict(activation=ActivationType.Silu, quant_type=c["qt"],
-              w1_scale=c["s1"], w2_scale=c["s2"], dtype=DT,
-              weight_layout=layout)
+              w1_scale=c["s1"], w2_scale=c["s2"], dtype=DT)
     kw.update(over)
     return route_of(fused_moe, c["hidden"], w1 if w1 is not None else c["w1q"],
                     w2 if w2 is not None else c["w2q"], c["tw"], c["ti"], **kw)
 
 
 # ---------------------------------------------------------------------------
-# 1. 双表方向（只查决策，不执行 kernel）
+# 1. dual-table direction (decision only, no kernel)
 # ---------------------------------------------------------------------------
 low = build(8, 256, 256, 2048, 8, quant="none", seed=1)
 d_low = describe_fused_moe_layout(low["w1q"], low["w2q"], quant_type=low["qt"],
@@ -127,7 +176,7 @@ check("dual-table high gain -> asm_shuffle",
       f"gain={d_high['weighted_gain']}")
 
 # ---------------------------------------------------------------------------
-# 2. K 非 64 倍数：asm 补 K（fp8 / int8）
+# 2. K not a multiple of 64: asm pads K (fp8 / int8) + cache hit
 # ---------------------------------------------------------------------------
 for q in ("fp8", "int8"):
     c = build(16, 256, 128, 7160, 8, quant=q, seed=3)
@@ -137,16 +186,29 @@ for q in ("fp8", "int8"):
     check(f"padk decision {q} -> asm_shuffle/padded 7168",
           d["layout"] == "asm_shuffle" and d["padded_k"] == 7168,
           f"layout={d['layout']} padded_k={d['padded_k']}")
-    p1, p2, lay = fused_moe_prepare_weights(
+    pair = fused_moe_prepare_weights(
         c["w1q"], c["w2q"], quant_type=c["qt"], w1_scale=c["s1"], w2_scale=c["s2"],
         dtype=DT, topk=8, activation="silu")
-    check(f"padk prepared shape {q}", tuple(p1.shape)[2] == 7168 and lay == "asm_shuffle",
-          f"w1={tuple(p1.shape)} layout={lay}")
-    out, land = run_case(c, lay, w1=p1, w2=p2)
+    p1, p2, prep = pair
+    check(f"padk prepared shape {q}",
+          tuple(p1.shape)[2] == 7168 and prep.layout == "asm_shuffle",
+          f"w1={tuple(p1.shape)} layout={prep.layout}")
+    check(f"padk prepared w2_scale padded {q}",
+          prep.w2_scale is not None and prep.w2_scale.shape[1] == 7168,
+          f"w2_scale={getattr(prep.w2_scale, 'shape', None)}")
+    out, land = run_prepared(c, pair)
     cos, rel = cos_rel(out, c["ref"])
     check(f"padk numeric {q}", land == "asm" and cos >= 0.995, f"land={land} cos={cos:.5f}")
+    pair2 = fused_moe_prepare_weights(
+        c["w1q"], c["w2q"], quant_type=c["qt"], w1_scale=c["s1"], w2_scale=c["s2"],
+        dtype=DT, topk=8, activation="silu")
+    check(f"cache hit: same original pair + same params returns the same objects {q}",
+          pair2[0] is p1 and pair2[1] is p2 and pair2[2] is prep)
+    if q == "int8":
+        asm_pair = pair
+        asm_case = c
 
-# 3. moe_c·fp8 非对齐 K -> 降级 raw
+# 3. moe_c fp8 with unaligned K -> raw
 c = build(8, 256, 128, 7160, 8, quant="fp8", seed=4)
 d = describe_fused_moe_layout(c["w1q"], c["w2q"], quant_type=c["qt"],
                              w1_scale=c["s1"], w2_scale=c["s2"],
@@ -154,28 +216,8 @@ d = describe_fused_moe_layout(c["w1q"], c["w2q"], quant_type=c["qt"],
 check("moe_c fp8 non-aligned K degrades to raw (never marlin)",
       "marlin" not in d["feasible_layouts"], f"feasible={d['feasible_layouts']}")
 
-# --- 后续用 w8a8 fp8 对齐形状做 asm/错配用例 ---
-c = build(16, 256, 128, 7168, 8, quant="fp8", seed=5)
-d = describe_fused_moe_layout(c["w1q"], c["w2q"], quant_type=c["qt"],
-                             w1_scale=c["s1"], w2_scale=c["s2"],
-                             dtype=DT, topk=8, activation="silu")
-print(f"w8a8 aligned decision: {d['layout']} gain={d['weighted_gain']} reason={d['reason']}")
-
-# 4. 强制 asm_shuffle（决策可能选 raw）
-p1, p2, _s1, _s2 = _shared_shuffle_impl(
-    c["w1q"], c["w2q"], c["s1"], c["s2"], quant_kind="w8a8_fp8",
-    padded_k=None, layout="asm_shuffle")
-setattr(p1, "weight_layout", "asm_shuffle")
-setattr(p2, "weight_layout", "asm_shuffle")
-check("shared core returns shuffled w2_scale positionally",
-      _s2 is c["s2"] and _s1 is c["s1"], "asm 未补 K 时 scale 原样返回")
-out_f, land_f = run_case(c, "asm_shuffle", w1=p1, w2=p2)
-cos_f, _ = cos_rel(out_f, c["ref"])
-check("forced asm_shuffle runs on asm", land_f == "asm" and cos_f >= 0.995,
-      f"land={land_f} cos={cos_f:.5f}")
-
 # ---------------------------------------------------------------------------
-# 5. moe_c w8a16：marlin 准备 + 重复准备返回同一对象
+# 4. moe_c w8a16: marlin prepare, cache hit, forward parity
 # ---------------------------------------------------------------------------
 E2, N2, K2 = 128, 768, 2048
 w1i = torch.randint(-127, 128, (E2, 2 * N2, K2), dtype=torch.int8)
@@ -185,23 +227,47 @@ s2 = torch.ones((E2, K2, 1), dtype=DT)
 hidden2 = torch.randn((64, K2), dtype=DT) / 10
 tw2, ti2 = fused_topk(hidden2, torch.randn((64, E2), dtype=DT), 8, True)
 ref2 = torch_moe(hidden2, w1i.to(DT) * 0.01, w2i.to(DT) * 0.01, tw2, ti2, s1, s2)
-m1, m2, lay = fused_moe_prepare_weights(
-    w1i, w2i, quant_type=QuantType.No, dtype=DT, topk=8, activation="silu")
-check("w8a16 prepare -> marlin", lay == "marlin" and get_weight_layout(m1, m2) == "marlin",
-      f"layout={lay}")
-m1b, m2b, layb = fused_moe_prepare_weights(
-    m1, m2, quant_type=QuantType.No, dtype=DT, topk=8, activation="silu")
-check("prepare again returns the same tensors",
-      layb == "marlin" and m1b is m1 and m2b is m2)
-out_m, land_m = route_of(fused_moe, hidden2, m1, m2, tw2, ti2,
-                         activation=ActivationType.Silu, quant_type=QuantType.No,
-                         w1_scale=s1, w2_scale=s2, dtype=DT, weight_layout=lay)
+m_pair = fused_moe_prepare_weights(
+    w1i, w2i, quant_type=QuantType.No, w1_scale=s1, w2_scale=s2,
+    dtype=DT, topk=8, activation="silu")
+m1, m2, mprep = m_pair
+check("w8a16 prepare -> marlin",
+      mprep.layout == "marlin" and get_weight_layout(m1, m2) == "marlin",
+      f"layout={mprep.layout}")
+check("marlin passes the scales through untouched",
+      mprep.w1_scale is s1 and mprep.w2_scale is s2, "marlin 不重排 scale")
+out_m, land_m = run_prepared(dict(hidden=hidden2, tw=tw2, ti=ti2, qt=QuantType.No,
+                                 s1=s1, s2=s2, ref=ref2, E=E2, N=N2, K=K2,
+                                 M=64, topk=8, w1q=w1i, w2q=w2i), m_pair)
 cos_m, _ = cos_rel(out_m, ref2)
 check("w8a16 marlin numeric", land_m == "moe_c" and cos_m >= 0.99,
       f"land={land_m} cos={cos_m:.5f}")
 
+# already-shuffled weights are rejected (run before marker edits below)
+expect_value_error("second prepare: already-shuffled asm weights are rejected",
+                   "重排过", lambda: fused_moe_prepare_weights(
+                       asm_pair[0], asm_pair[1], quant_type=asm_case["qt"],
+                       w1_scale=asm_pair[2].w1_scale,
+                       w2_scale=asm_pair[2].w2_scale,
+                       dtype=DT, topk=8, activation="silu"))
+expect_value_error("second prepare: already-shuffled marlin weights are rejected",
+                   "重排过", lambda: fused_moe_prepare_weights(
+                       m1, m2, quant_type=QuantType.No, w1_scale=s1, w2_scale=s2,
+                       dtype=DT, topk=8, activation="silu"))
+
 # ---------------------------------------------------------------------------
-# 6. 前向零重排
+# 4c. cache miss: changed params re-prepare from the originals
+# ---------------------------------------------------------------------------
+rep = fused_moe_prepare_weights(
+    asm_case["w1q"], asm_case["w2q"], quant_type=asm_case["qt"],
+    w1_scale=asm_case["s1"], w2_scale=asm_case["s2"], dtype=DT, topk=4,
+    activation="silu")
+check("cache miss: changed params re-prepare from the originals without error",
+      rep[0] is not None and rep[2].layout in ("raw", "asm_shuffle", "marlin"),
+      f"layout={rep[2].layout}")
+
+# ---------------------------------------------------------------------------
+# 5. zero live shuffle during forward
 # ---------------------------------------------------------------------------
 names = ("asm_shuffle_weight_b8", "moe_layout_shuffle_gemm2",
          "w8a16_marlin_weight_1", "w8a16_marlin_weight_2",
@@ -223,10 +289,10 @@ def wrap(n):
 for n in names:
     setattr(SH, n, wrap(n))
 try:
-    run_case(c, "asm_shuffle", w1=p1, w2=p2)
-    route_of(fused_moe, hidden2, m1, m2, tw2, ti2,
-             activation=ActivationType.Silu, quant_type=QuantType.No,
-             w1_scale=s1, w2_scale=s2, dtype=DT, weight_layout="marlin")
+    run_prepared(asm_case, asm_pair)
+    run_prepared(dict(hidden=hidden2, tw=tw2, ti=ti2, qt=QuantType.No,
+                      s1=s1, s2=s2, ref=ref2, E=E2, N=N2, K=K2,
+                      M=64, topk=8, w1q=w1i, w2q=w2i), m_pair)
 finally:
     for n in names:
         setattr(SH, n, orig[n])
@@ -234,21 +300,20 @@ total = sum(counts.values())
 check("zero live shuffle during forward", total == 0, f"counts={counts}")
 
 # ---------------------------------------------------------------------------
-# 6b. 非 raw 布局短路直连
+# 6. non-raw layout short-circuit
 # ---------------------------------------------------------------------------
-from dataclasses import replace as _replace
-
-from aiter.fused_moe_layout import _build_problem
 from aiter.fused_moe_router import (BACKEND_REGISTRY, _LAYOUT_BACKEND_BINDING,
                                     _layout_directly_usable, plan)
 
-p_raw = _build_problem(c["w1q"], c["w2q"], c["qt"], DT, 8, "silu", None,
-                       w1_scale=c["s1"], w2_scale=c["s2"])
+# probe uses the aligned w8a8 fp8 shape: both bound backends have configs
+al = build(16, 256, 128, 7168, 8, quant="fp8", seed=5)
+p_raw = _build_problem(al["w1q"], al["w2q"], al["qt"], DT, 8, "silu", None,
+                       w1_scale=al["s1"], w2_scale=al["s2"])
 
 
 def _probe(layout):
-    return _replace(p_raw, weight_layout=layout,
-                    use_shuffle=1 if layout == "asm_shuffle" else 0)
+    return replace(p_raw, weight_layout=layout,
+                   use_shuffle=1 if layout == "asm_shuffle" else 0)
 
 
 check("binding table is the single source (marlin->moe_c, asm_shuffle->asm)",
@@ -273,72 +338,206 @@ for layout, bound in _LAYOUT_BACKEND_BINDING.items():
     landed = routed.stage1_backend or routed.chained_backend
     check(f"short-circuit: {layout} -> {bound}", landed == bound, f"landed={landed}")
 
-# raw 布局仍走路由表 / 候选链 / triton 兜底（不短路），且不抛错
+# raw layout still goes through the route table / candidate chain / fallback
 raw_route = plan(_probe("raw"))
 check("raw layout still uses the route table / candidate chain / triton fallback",
       (raw_route.stage1_backend or raw_route.chained_backend) in BACKEND_REGISTRY,
       f"landed={raw_route.stage1_backend or raw_route.chained_backend}")
 
 # ---------------------------------------------------------------------------
-# 7. 错配用例
+# 7. runtime rules: marker, prepared pair, params, device
 # ---------------------------------------------------------------------------
-# 7.1 布局与家族不符：无量化权重（bf16）+ marlin
 nq = build(8, 64, 128, 1024, 8, quant="none", seed=6)
 
+# bare weights without prepared -> raw
+out_r1, land_r1 = run_raw(nq)
+cos_r1, _ = cos_rel(out_r1, nq["ref"])
+check("bare weights without prepared run as raw", cos_r1 >= 0.99,
+      f"land={land_r1} cos={cos_r1:.5f}")
 
-def _family_mismatch():
-    fused_moe(nq["hidden"], nq["w1q"], nq["w2q"], nq["tw"], nq["ti"],
-              activation=ActivationType.Silu, quant_type=QuantType.No,
-              dtype=DT, weight_layout="marlin")
+raw_pair = fused_moe_prepare_weights(nq["w1q"], nq["w2q"], quant_type=QuantType.No,
+                                     dtype=DT, topk=8, activation="silu")
+check("raw decision: unquantized low-gain weights prepare as raw",
+      raw_pair[2].layout == "raw", f"layout={raw_pair[2].layout}")
+# raw-marked weights without prepared -> still raw
+out_r2, land_r2 = run_raw(nq)
+cos_r2, _ = cos_rel(out_r2, nq["ref"])
+check("raw-marked weights without prepared run as raw", cos_r2 >= 0.99,
+      f"land={land_r2} cos={cos_r2:.5f}")
 
+# read-only object
+try:
+    raw_pair[2].layout = "marlin"
+    check("read-only: assigning prepared.layout raises", False)
+except FrozenInstanceError:
+    check("read-only: assigning prepared.layout raises FrozenInstanceError", True)
 
-expect_value_error("mismatch: marlin layout on non-quantized weights",
-                   "not directly usable", _family_mismatch)
-
-# 7.2 属性丢失 + 显式 raw：marlin 权重被当 raw
-def _attr_lost():
-    delattr(m1, "weight_layout")
-    delattr(m2, "weight_layout")
+# shuffled weights without prepared -> raise
+def _r3():
     fused_moe(hidden2, m1, m2, tw2, ti2, activation=ActivationType.Silu,
-              quant_type=QuantType.No, w1_scale=s1, w2_scale=s2,
-              dtype=DT, weight_layout="raw")
+              quant_type=QuantType.No, dtype=DT)
 
 
-expect_value_error("mismatch: prepared marlin weights declared raw",
-                   "conflicts with the tensor marker", _attr_lost)
+expect_value_error("shuffled marlin weights without prepared raise",
+                   "没有传 prepared", _r3)
+
+# normal path: no warning
+(out_land, msgs_r4) = run_and_capture(lambda: run_prepared(
+    dict(hidden=hidden2, tw=tw2, ti=ti2, qt=QuantType.No, s1=s1, s2=s2,
+         ref=ref2, E=E2, N=N2, K=K2, M=64, topk=8, w1q=w1i, w2q=w2i), m_pair))
+out_r4, _land_r4 = out_land
+cos_r4, _ = cos_rel(out_r4, ref2)
+check("prepared pair runs silently (no warning)", cos_r4 >= 0.99 and not msgs_r4,
+      f"warns={len(msgs_r4)} cos={cos_r4:.5f}")
+
+# object marlin, tensors re-marked raw
+def _r5a():
+    setattr(m1, "weight_layout", "raw")
+    setattr(m2, "weight_layout", "raw")
+    fused_moe(hidden2, m1, m2, tw2, ti2, activation=ActivationType.Silu,
+              quant_type=QuantType.No, dtype=DT, prepared=mprep)
+
+
+expect_value_error("object marlin vs marker raw raises", "冲突", _r5a)
 setattr(m1, "weight_layout", "marlin")
 setattr(m2, "weight_layout", "marlin")
 
-# 7.3 activation 不一致：准备用 silu，运行用 situ（asm/triton 拒绝 situ）
-def _act_mismatch():
-    fused_moe(c["hidden"], p1, p2, c["tw"], c["ti"], activation="situ",
-              quant_type=c["qt"], w1_scale=c["s1"], w2_scale=c["s2"],
-              dtype=DT, weight_layout="asm_shuffle")
+# object raw, tensors re-marked marlin
+def _r5b():
+    setattr(raw_pair[0], "weight_layout", "marlin")
+    setattr(raw_pair[1], "weight_layout", "marlin")
+    fused_moe(nq["hidden"], raw_pair[0], raw_pair[1], nq["tw"], nq["ti"],
+              activation=ActivationType.Silu, quant_type=QuantType.No, dtype=DT,
+              prepared=raw_pair[2])
 
 
-expect_value_error("mismatch: activation silu->situ", "feasible layouts", _act_mismatch)
+expect_value_error("object raw vs marker marlin raises", "冲突", _r5b)
+setattr(raw_pair[0], "weight_layout", "raw")
+setattr(raw_pair[1], "weight_layout", "raw")
 
-# 7.4 topk 不一致：准备 topk=8，运行 topk=2（该形状无 topk=2 配置）
-def _topk_mismatch():
-    tw2_, ti2_ = fused_topk(c["hidden"], torch.randn((c["M"], c["E"]), dtype=DT), 2, True)
-    fused_moe(c["hidden"], p1, p2, tw2_, ti2_, activation=ActivationType.Silu,
-              quant_type=c["qt"], w1_scale=c["s1"], w2_scale=c["s2"],
-              dtype=DT, weight_layout="asm_shuffle")
-
-
-expect_value_error("mismatch: topk 8->2", "feasible layouts", _topk_mismatch)
-
-# 7.5 expert_mask 不一致：准备非 EP，运行 EP（EP 只允许 raw）
-def _ep_mismatch():
-    em = torch.ones((c["E"],), dtype=torch.int32)
-    em[c["E"] // 2:] = 0
-    fused_moe(c["hidden"], p1, p2, c["tw"], c["ti"], expert_mask=em,
-              activation=ActivationType.Silu, quant_type=c["qt"],
-              w1_scale=c["s1"], w2_scale=c["s2"], dtype=DT,
-              weight_layout="asm_shuffle")
+# w1/w2 markers disagree
+def _p2():
+    delattr(m1, "weight_layout")
+    fused_moe(hidden2, m1, m2, tw2, ti2, activation=ActivationType.Silu,
+              quant_type=QuantType.No, dtype=DT, prepared=mprep)
 
 
-expect_value_error("mismatch: non-EP prepared, EP runtime", "feasible layouts", _ep_mismatch)
+expect_value_error("mismatched w1/w2 markers raise", "mismatch", _p2)
+setattr(m1, "weight_layout", "marlin")
+
+# clone / detach / serialize roundtrip: warn once, run marlin, parity holds
+def _after_copy(op):
+    w1c, w2c = op(m1), op(m2)
+    return route_of(fused_moe, hidden2, w1c, w2c, tw2, ti2,
+                    activation=ActivationType.Silu, quant_type=QuantType.No,
+                    dtype=DT, prepared=mprep)
+
+
+def _roundtrip(t):
+    buf = io.BytesIO()
+    torch.save(t, buf)
+    buf.seek(0)
+    return torch.load(buf, weights_only=True)
+
+
+for tag, op in (("clone", lambda t: t.clone()), ("detach", lambda t: t.detach()),
+                ("serialize roundtrip", _roundtrip)):
+    (out, land), msgs = run_and_capture(lambda op=op: _after_copy(op))
+    cos, _ = cos_rel(out, ref2)
+    check(f"{tag} after prepare warns once and runs on prepared.layout",
+          land == "moe_c" and cos >= 0.99 and len(msgs) == 1,
+          f"land={land} cos={cos:.5f} warns={len(msgs)}")
+
+# warning dedupe: same object twice -> one warning
+cl1, cl2 = m1.clone(), m2.clone()
+
+
+def _twice():
+    for _ in range(2):
+        route_of(fused_moe, hidden2, cl1, cl2, tw2, ti2,
+                 activation=ActivationType.Silu, quant_type=QuantType.No,
+                 dtype=DT, prepared=mprep)
+
+
+(_, msgs_dedupe) = run_and_capture(_twice)
+check("warning dedupe: the same prepared object warns only once",
+      len(msgs_dedupe) == 1, f"warns={len(msgs_dedupe)}")
+
+# raw object with cloned raw weights (raw layout warns too)
+rc1, rc2 = raw_pair[0].clone(), raw_pair[1].clone()
+(out, land), msgs = run_and_capture(lambda: route_of(
+    fused_moe, nq["hidden"], rc1, rc2, nq["tw"], nq["ti"],
+    activation=ActivationType.Silu, quant_type=QuantType.No, dtype=DT,
+    prepared=raw_pair[2]))
+cos, _ = cos_rel(out, nq["ref"])
+check("cloned raw weights with prepared warn once and run as raw",
+      cos >= 0.99 and len(msgs) == 1, f"land={land} cos={cos:.5f} warns={len(msgs)}")
+
+# layer-1 prepared + layer-2 weights, both marlin
+torch.manual_seed(11)
+w1j = torch.randint(-127, 128, (E2, 2 * N2, K2), dtype=torch.int8)
+w2j = torch.randint(-127, 128, (E2, K2, N2), dtype=torch.int8)
+j_pair = fused_moe_prepare_weights(w1j, w2j, quant_type=QuantType.No,
+                                   w1_scale=s1, w2_scale=s2, dtype=DT, topk=8,
+                                   activation="silu")
+
+
+def _r7():
+    return route_of(fused_moe, hidden2, j_pair[0], j_pair[1], tw2, ti2,
+                    activation=ActivationType.Silu, quant_type=QuantType.No,
+                    dtype=DT, prepared=mprep)
+
+
+(out, land), msgs = run_and_capture(_r7)
+check("another layer's weights (same layout) warn once",
+      land == "moe_c" and len(msgs) == 1, f"land={land} warns={len(msgs)}")
+
+# prepared plus explicit scales
+def _p1():
+    fused_moe(hidden2, m1, m2, tw2, ti2, activation=ActivationType.Silu,
+              quant_type=QuantType.No, w1_scale=s1, dtype=DT, prepared=mprep)
+
+
+expect_value_error("prepared plus w1_scale raise", "不能同时传入", _p1)
+
+# device mismatch (arch / cu_num faked)
+for field, bad in (("arch", "gfx999"), ("cu_num", 9999)):
+    fake = replace(mprep, **{field: bad})
+    def _p3(fake=fake):
+        fused_moe(hidden2, m1, m2, tw2, ti2, activation=ActivationType.Silu,
+                  quant_type=QuantType.No, dtype=DT, prepared=fake)
+    expect_value_error(f"prepared.{field} mismatch raises", "当前设备", _p3)
+
+
+# topk / activation / EP differ from prepare time
+def _p4_topk():
+    tw_, ti_ = fused_topk(hidden2, torch.randn((64, E2), dtype=DT), 4, True)
+    fused_moe(hidden2, m1, m2, tw_, ti_, activation=ActivationType.Silu,
+              quant_type=QuantType.No, dtype=DT, prepared=mprep)
+
+
+expect_value_error("topk 8->4 names the field", "topk：准备时 8，运行时 4",
+                   _p4_topk)
+
+
+def _p4_act():
+    fused_moe(hidden2, m1, m2, tw2, ti2, activation=ActivationType.Gelu,
+              quant_type=QuantType.No, dtype=DT, prepared=mprep)
+
+
+expect_value_error("activation silu->gelu names the field",
+                   "activation：准备时 'silu'，运行时 'gelu'", _p4_act)
+
+
+def _p4_ep():
+    em = torch.ones((E2,), dtype=torch.int32)
+    fused_moe(hidden2, m1, m2, tw2, ti2, expert_mask=em,
+              activation=ActivationType.Silu, quant_type=QuantType.No,
+              dtype=DT, prepared=mprep)
+
+
+expect_value_error("non-EP prepared vs EP runtime names the fields",
+                   ("is_ep", "num_experts"), _p4_ep)
 
 print("MOE_LAYOUT_PREPARE_" + ("PASS" if not FAILS else f"FAIL {FAILS}"))
 raise SystemExit(0 if not FAILS else 1)

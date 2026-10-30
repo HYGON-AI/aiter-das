@@ -238,9 +238,9 @@ def test_fmoe(
     # fused_moe shuffles the weight layout and does the dynamic block
     # activation quant internally, so it takes raw activations
     # 加载期一次性准备，前向零重排
-    w1_prep, w2_prep, layout = fused_moe_prepare_weights(
+    w1_prep, w2_prep, prepared = fused_moe_prepare_weights(
         w1_q, w2_q, quant_type=QuantType.per_1x128, w1_scale=w1_scale_3d,
-        w2_scale=w2_scale_3d, dtype=dtype, topk=topk,
+        w2_scale=w2_scale_3d, dtype=dtype, topk=topk_ids.shape[1],
         activation=ActivationType.Silu)
     out, us = run_perftest(
         fused_moe,
@@ -252,9 +252,7 @@ def test_fmoe(
         expert_mask=None,
         activation=ActivationType.Silu,
         quant_type=QuantType.per_1x128,
-        w1_scale=w1_scale_3d,
-        w2_scale=w2_scale_3d,
-        weight_layout=layout,
+        prepared=prepared,
     )
     msg = f"[perf] a8w8 fused_moe: {us:>8.2f} us ...... {m=}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, dtype: {dtype}"
     # per_1x128 runs on the triton blockwise backend, which re-quantizes the

@@ -162,7 +162,7 @@ aiter_moe(...)
 INT8/E4M3FN smooth 动态量化、active/DropPad、bias 和 SP residual 汇聚。
 两套接口均不包含专家 GEMM 或跨卡通信；具体 dtype、容量、数值和性能范围见对应文档。
 
-### 2\.2\.1 get\_aiter\_moe\_config
+### 2.2.1 get\_aiter\_moe\_config
 
 #### 功能描述
 
@@ -579,14 +579,14 @@ return fused_experts_impl(
 
 ## 2.4 fused\_moe
 
-`aiter/moe.py` 的 `aiter_moe` 需要调用方自己查配置、自己判断是否需要 shuffle、自己调用 shuffle 函数；`aiter/fused_moe.py` 的 `fused_moe` 把这些判断收进库内部：**可选地**在模型初始化期调用一次 `fused_moe_prepare_weights` 决定权重的 layout（是否 shuffle、按哪种方式 shuffle），之后每次前向只传一个 layout 标记，执行阶段不做任何权重 shuffle。两个接口是**相互独立的两个入口**：`fused_moe` 不会调用 `fused_moe_prepare_weights`，是否准备完全由用户决定。
+`aiter/moe.py` 的 `aiter_moe` 需要调用方自己查配置、自己判断是否需要 shuffle、自己调用 shuffle 函数；`aiter/fused_moe.py` 的 `fused_moe` 把这些判断收进库内部：**可选地**在模型初始化期调用一次 `fused_moe_prepare_weights` 决定权重的 layout（是否 shuffle、按哪种方式 shuffle），之后每次前向只传一个只读的**准备对象** `prepared`，执行阶段不做任何权重 shuffle。两个接口是**相互独立的两个入口**：`fused_moe` 不会调用 `fused_moe_prepare_weights`，是否准备完全由用户决定。
 
 两种使用方式：
 
 | 方式    | 做法                                                                                                                                 | 适用场景                 |
 | ----- | ---------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| 不需要 shuffle  | `fused_moe(hidden_states, w1, w2, ...)`，不传 `weight_layout`                                                                         | 权重保持 raw layout，库内按 raw 路由 |
-| 需要 shuffle | 模型初始化期 `w1p, w2p, layout = fused_moe_prepare_weights(w1, w2, ...)`，模型运行期 `fused_moe(hidden_states, w1p, w2p, ..., weight_layout=layout)` | 推荐；可获得 shuffle 加速，且执行期零 shuffle   |
+| 不需要 shuffle  | `fused_moe(hidden_states, w1, w2, ..., quant_type=..., w1_scale=..., ...)`（不传 `prepared`）                                            | 权重按 raw 摆放，库内按 raw 路由 |
+| 需要 shuffle | 模型初始化期 `w1p, w2p, prepared = fused_moe_prepare_weights(w1, w2, ...)`，模型运行期 `fused_moe(hidden_states, w1p, w2p, ..., prepared=prepared)` | 推荐；可获得 shuffle 加速，且执行期零 shuffle   |
 
 layout 与后端的对应关系：
 
@@ -603,10 +603,10 @@ layout 与后端的对应关系：
 └── fused_moe_prepare_weights(w1, w2, ...)        # 由用户调用
     ├── decide_layout(...)                        # 决定 layout：查调优表比较耗时
     └── _shared_shuffle_impl(...)                 # 需要 shuffle 时才执行
-        ↓ 输出 (w1p, w2p, layout)
+        ↓ 输出 (w1p, w2p, prepared)
 模型运行期（每次前向）
-└── fused_moe(hidden_states, w1p, w2p, ..., weight_layout=layout)   # 由用户调用
-    ├── 解析 layout 标记（显式参数与张量属性交叉校验）
+└── fused_moe(hidden_states, w1p, w2p, ..., prepared=prepared)   # 由用户调用
+    ├── 解析 prepared.layout（唯一来源，与张量标记交叉校验）
     ├── layout 可行性复核
     ├── plan(...)                                 # marlin → moe_c；asm_shuffle → asm；raw → 候选链
     └── 执行（零 shuffle）
@@ -620,7 +620,7 @@ layout 与后端的对应关系：
 
 1. **layout 决策**：根据 `quant_kind`、形状、`activation`、`topk` 等信息，用调优表中的实测耗时决定这一层用哪种 layout。两张 asm 表（普通表与 shuffle 表）都覆盖该形状时，比较同档位加权耗时，**收益 ≥5% 才选 shuffle 表**，否则维持普通表。
 2. **一次性 shuffle**：按决策把权重转换成对应 layout（model_dim 非 64 倍数时按 `padded_k` 补齐），返回新的权重张量。
-3. **标记输出**：在权重上写入 `weight_layout` 属性并登记弱引用表，运行期据此校验，不依赖用户透传。
+3. **标记并构造准备对象**：在权重上写入 `weight_layout` 属性标记；返回只读的准备对象 `PreparedMoe`（记录布局、处理后的缩放系数、准备参数签名、决策详情、显卡架构与计算单元数），并对返回的权重只持弱引用。`per_Tensor` 的缩放系数在准备期展开成 per_channel。运行期必须传入 `prepared`：布局与缩放系数都取自它，张量标记只用于交叉校验——标记与 `prepared.layout` 冲突时报错；张量不是准备时那一对（clone / detach / 换设备 / 序列化往返）时告警一次后仍按 `prepared.layout` 执行。
 
 配套的只读接口 `describe_fused_moe_layout(...)` 参数相同但不修改权重，返回 `layout` / `family` / `reason` / `padded_k` / `original_k` / `feasible_layouts` / `weighted_gain` 等诊断信息，用于排查「这一层为什么选了这个 layout」。
 
@@ -642,7 +642,7 @@ layout 与后端的对应关系：
 | `doweight_stage1`                | `bool = False`                  | 第一阶段 GEMM 是否应用路由权重。                                                                     |
 | `splitk`                         | `int = 0`                       | 分裂归约开关。                                                                                 |
 | `quant_type_a` / `quant_dtype_a` | `Optional[...] = None`          | 激活侧量化类型。                                                                                |
-| 返回值                              | `Tuple[Tensor, Tensor, str]`    | `(w1p, w2p, layout)`；`layout` 取值 `raw` / `asm_shuffle` / `marlin`。layout 为 `raw` 时返回原对象，不复制。 |
+| 返回值                              | `Tuple[Tensor, Tensor, PreparedMoe]` | `(w1p, w2p, prepared)`；`prepared.layout` 取值 `raw` / `asm_shuffle` / `marlin`。layout 为 `raw` 时返回原对象，不复制。 |
 
 #### 调用示例
 
@@ -651,18 +651,19 @@ from aiter.fused_moe_layout import fused_moe_prepare_weights
 from aiter import QuantType
 
 # 加载期：每层调用一次
-w1p, w2p, layout = fused_moe_prepare_weights(
+w1p, w2p, prepared = fused_moe_prepare_weights(
     w1, w2, quant_type=QuantType.No, dtype=dtype, topk=topk,
-    activation=activation, max_num_tokens=8192)
-print(f"[layout] layout={layout}")
+    activation=activation, max_num_tokens=8192,
+    w1_scale=w1_scale, w2_scale=w2_scale)
+print(f"[layout] layout={prepared.layout}")
 ```
 
 #### **注意事项**
 
-- **必须在目标设备上执行**：调优表的分组键含显卡型号与计算单元数，跨机准备会失效。
-- **重复调用安全**：传入的权重已带目标布局标记时，直接返回同一对张量，不做第二次重排。这个判断只看标记，不校验形状与 `padded_k`；`topk`、`activation`、`expert_mask`、`dtype`、`model_dim` 等决定布局的参数变了，就要从原始权重重新准备。
-- **`w2_scale` 不随准备返回**：`padded_k` 不为 `None` 时，执行层调用 `_pad_tensor_dim(w2_scale, 1, PADDED_K)` 补齐；已补齐的张量原样返回，用户无需干预。
-- **参数要与运行期一致**：`activation`、`topk`、`expert_mask`、`dtype` 在准备与运行之间改变会触发运行期报错。
+- **必须在目标设备上执行**：调优表的分组键含显卡型号与计算单元数，跨机准备会失效；`prepared` 记录准备时的架构与计算单元数，运行期不一致直接报错。
+- **重复调用安全**：同一对原始权重用同一组参数再次准备命中缓存，原样返回同一组对象（同一对张量、同一个 `prepared`），不做第二次重排；参数变化则从原始权重重新准备。把已重排的权重（带 `marlin` / `asm_shuffle` 标记）再次传给准备函数会报错——重排改变了权重形状（`asm_shuffle` 补齐 K、w8a16 `marlin` 的 uint8 视图），按重排后的形状决策等于描述一个不存在的原始问题。
+- **缩放系数随准备返回**：`prepared.w1_scale` / `prepared.w2_scale` 已按布局处理（`asm_shuffle` 的 `w2_scale` 按补齐后的 K 补零、`per_Tensor` 展开为 per_channel），前向从 `prepared` 取值；传了 `prepared` 就不能再传 `w1_scale` / `w2_scale`。
+- **参数要与运行期一致**：`activation`、`topk`、`expert_mask`（是否专家并行、专家数）、`dtype`、`quant_type` 在准备与运行之间改变会触发运行期报错，并点出具体不一致的字段；`topk` 取运行期 `topk_ids` 的列数（含共享专家时是拼接后的列数）。
 
 ### 2.4.2 fused\_moe
 
@@ -672,7 +673,7 @@ print(f"[layout] layout={layout}")
 
 - layout 为 `marlin` → 直连 moe\_c；layout 为 `asm_shuffle` → 直连 asm；layout 为 `raw` → 走完整路由（路由表推荐 / 候选顺序 / triton 兜底）。
 - 运行期只做 **layout 可行性复核**（当前 layout 是否仍在可行集合内），不做任何权重 shuffle；错配直接报错而不是静默修正。
-- 支持 `torch.compile` 包裹；新增的 `weight_layout` 是字符串常量参数。
+- 支持 `torch.compile` 包裹：`prepared` 只在 Python 外壳中使用，进入已注册的自定义算子前已拆成布局字符串与缩放系数张量，算子签名不含 Python 对象。
 
 与 `aiter_moe` 的分工差异、设计思路、性能数据与遗留问题见 `docs/fused_moe.md`。
 
@@ -693,7 +694,7 @@ print(f"[layout] layout={layout}")
 | `dtype`                                           | `Optional[torch.dtype] = None`         | 输出数据类型，空则用 `hidden_states.dtype`。                     |
 | `splitk`                                          | `int = 0`                              | 分裂归约。                                                 |
 | `output`                                          | `Optional[torch.Tensor] = None`        | 输出缓冲，可由调用方预分配。                                        |
-| `weight_layout`                                   | `Optional[str] = None`                 | 准备函数返回的布局；`None` 时回退读取权重上的标记，两者都在且不一致时抛 `ValueError`。 |
+| `prepared`                                        | `PreparedMoe = None`（仅限关键字，签名末尾） | `fused_moe_prepare_weights` 返回的准备对象。传了它，布局与缩放系数都取自它，且不得再传 `w1_scale` / `w2_scale`；不传表示权重按 raw 摆放（权重带非 raw 标记则报错）。 |
 | 返回值                                               | `torch.Tensor`                         | MoE 输出，形状 `[M, model_dim]`。                           |
 
 #### 调用示例
@@ -701,30 +702,35 @@ print(f"[layout] layout={layout}")
 ```Python
 from aiter.fused_moe import fused_moe
 
-# 方式一：不准备，直接调用（权重视为 raw layout）
+# 方式一：不准备，权重按 raw 处理
 out = fused_moe(hidden_states, w1, w2, topk_weights, topk_ids,
-                activation=activation, quant_type=quant_type)
+                activation=activation, quant_type=quant_type,
+                w1_scale=w1_scale, w2_scale=w2_scale)
 
-# 方式二：准备一次，前向只传 layout（推荐）
-w1p, w2p, layout = fused_moe_prepare_weights(
+# 方式二：准备一次，前向传准备对象（推荐）；准备函数返回三元组
+w1p, w2p, prepared = fused_moe_prepare_weights(
     w1, w2, quant_type=quant_type, dtype=dtype, topk=topk,
-    activation=activation)
+    activation=activation, w1_scale=w1_scale, w2_scale=w2_scale)
 out = fused_moe(hidden_states, w1p, w2p, topk_weights, topk_ids,
                 activation=activation, quant_type=quant_type,
-                weight_layout=layout)
+                prepared=prepared)
 ```
 
 #### **注意事项**
 
-- 显式 `weight_layout` 与权重上的标记冲突时抛 `ValueError`，防止错误布局静默执行。
-- `activation` / `topk` / `expert_mask` / `dtype` 在准备与运行之间必须一致，否则运行期复核报错并列出当前可行布局。
-- 权重被复制导致标记丢失时，可显式传 `weight_layout` 兜底。
+- 张量标记与 `prepared.layout` 冲突时抛 `ValueError`（包括标记为 `raw` 而对象为 `marlin` 这种情形），防止错误布局静默执行；已重排的权重不传 `prepared` 同样报错，提示传入准备函数返回的准备对象。
+- 权重经 `clone` / `detach` / 换设备 / 序列化往返后标记丢失，只要仍传 `prepared`，库会告警一次并按 `prepared.layout` 执行；如果权重或缩放系数与该对象不对应，结果会出错，改动权重后请重新准备。
+- 前向的缩放系数取自 `prepared`：`asm_shuffle` 的 `w2_scale` 已在准备期按补齐后的 K 补零、`per_Tensor` 已展开为 per_channel；传了 `prepared` 又传 `w1_scale` / `w2_scale` 会报错。
+- 同一对原始权重用同一组参数再次准备命中缓存，返回同一组对象；把已重排的权重再次传给准备函数会报错，须从原始权重重新准备。
+- `activation` / `topk` / `expert_mask`（是否专家并行、专家数）/ `dtype` / `quant_type` 在准备与运行之间必须一致，否则运行期前置校验报错并点出不一致的字段（如「topk：准备时 8，运行时 4」）；`topk` 取运行期 `topk_ids` 的列数，含共享专家时是拼接后的列数。
+- `asm_shuffle` 与 triton 后端只支持量化激活（`per_token`）：无量化激活（如 `ActivationType.Situ`）会被拒绝。此前在 asm/triton 上用无量化激活的场景，需先量化激活，或显式声明 `raw` 走 ck/triton 的 raw 路径。
 - w8a8 + fp8 且 `model_dim` 不是 64 的倍数时强制 `raw`（moe\_c 按 `padded_k` 补齐的执行路径计算结果错误，错误在 moe\_c 算子实现层、不在 fused\_moe）。
+- 运行期不再做现场重排：未准备的原始权重在 `raw` 不可行时直接报错并提示调用 `fused_moe_prepare_weights`，不提供执行期兜底重排。
 
 ### 2.4.3 应用示例
 
-- 布局测试：`op_tests/test_moe_layout_prepare.py`（布局决策方向、按 `padded_k` 补齐、降级、重复准备返回同一对象、错配报错、零重排计数）。
-- quant场景测试（均为「模型初始化期准备一次 + 前向传 layout」）：`op_tests/test_moe.py`、`test_moe_2stage.py `、`test_moe_blockscale.py`、`test_moe_ep.py`、`test_moe_w16a16.py`、`test_moe_w4a8.py`、`test_moe_w8a8.py`、`test_moe_w8a8_blockscale.py`、`test_moe_w8a8_blockscale_fp8.py`、`test_moe_w8a8_blockscale_fp8_shuffle.py`、`test_moe_w8a8_ep.py`、`test_moe_w8a8_fp8_perToken.py`、`test_moe_w8a8_fp8_perToken_shuffle.py`、`test_moe_wna16.py`、`test_moe_wna16_ep.py`、`test_moe_w8a8_test_for_moe_c_torch_compile.py`。
+- 布局测试：`op_tests/test_moe_layout_prepare.py`（布局决策方向、按 `padded_k` 补齐、降级、缓存命中与失效、已重排权重二次准备报错、运行期判定与前置校验、只读对象、零重排计数）。
+- quant场景测试（均为「模型初始化期准备一次 + 前向传 `prepared`」）：`op_tests/test_moe.py`、`test_moe_2stage.py `、`test_moe_blockscale.py`、`test_moe_ep.py`、`test_moe_w16a16.py`、`test_moe_w4a8.py`、`test_moe_w8a8.py`、`test_moe_w8a8_blockscale.py`、`test_moe_w8a8_blockscale_fp8.py`、`test_moe_w8a8_blockscale_fp8_shuffle.py`、`test_moe_w8a8_ep.py`、`test_moe_w8a8_fp8_perToken.py`、`test_moe_w8a8_fp8_perToken_shuffle.py`、`test_moe_wna16.py`、`test_moe_wna16_ep.py`、`test_moe_w8a8_test_for_moe_c_torch_compile.py`。
 - 设计思路、性能数据与遗留问题见 `docs/fused_moe.md`。
 
 # 3. Norm
@@ -1048,9 +1054,7 @@ fuse_rms_mrope(
     )
 ```
 
-# 4\. Activation
-
-## 4\.1 SwiGLU
+# 4. Activition
 
 ### 4.1.1 moe\_swiglu\_dynamic\_quant\_wrapper
 
@@ -1127,19 +1131,7 @@ out.float().sum().backward()
 HIP_VISIBLE_DEVICES=1 python -m pytest -q -s op_tests/test_add_swiglu_training.py
 ```
 
-## 4\.2 Softmax
-
-Softmax 是沿指定维度将输入归一化为概率分布的激活函数。
-
-`aiter.softmax(input, dim=-1, *, out=None)` 对二维连续 `[B,D]` 张量逐行归一化，
-返回同 shape、dtype、device 的概率矩阵。支持 FP16/BF16/FP32、`1 <= D <= 524288`；
-内部使用 FP32 计算，支持预分配输出和非零 storage offset。
-`aiter.softmax_out(out, input, dim=-1)` 写入输出并返回 `None`。
-
-该接口仅支持前向；输出不得与输入重叠。完整合同、示例及两架构验证和性能见
-[Softmax 算子说明](docs/softmax.md)。
-
-# 5\. TopK
+# 5. TopK
 
 TopK 系列算子用于按元素值或评分选出指定数量的候选，并按接口返回候选值、索引或其他选择结果。本章按选择功能归类，收录基础 TopK 选择、与 softmax 等操作融合的选择，以及选择后的索引转换等相关算子；后续可在本章增加 `topk_plain`、`topk_softmax` 等接口的独立小节。
 

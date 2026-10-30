@@ -24,7 +24,7 @@ from aiter.fused_moe_router import (
     FusedMoeProblem,
     plan as _route_plan,
 )
-from aiter.fused_moe_layout import resolve_weight_layout
+from aiter.fused_moe_layout import resolve_runtime_weights, resolve_weight_layout
 from aiter.fused_moe_types import GateMode, Stage2ScatterContext, SUPPORTED_ACTIVATIONS
 
 BLOCK_SIZE_M = 32
@@ -206,12 +206,12 @@ def _normalize_problem(
         # activation-side quant type override stays scheduling-level for now
         quant_str = _enum_name(quant_type_a, QuantType)
 
-    # Read the weight layout marker before inferring the quant family.
-    # Unmarked tensors are "raw". w1 and w2 must carry the same marker.
-    # use_shuffle means the weights are already in the asm shuffle layout; the
-    # router then skips backends that cannot use it and _asm_lookup picks the
-    # shuffle CSV. An explicit ``weight_layout`` argument wins over the marker
-    # and is cross-checked against it.
+    # layout is resolved before quant-family inference: the fused_moe shell
+    # already decided it (prepared object or tensor marker); this function only
+    # takes the result. Internal read-only paths (``weight_layout=None``, used by
+    # _build_problem / describe_fused_moe_layout) read the marker, default raw.
+    # use_shuffle marks asm-shuffled weights: the router skips backends that
+    # cannot consume them and _asm_lookup reads the shuffle table.
     weight_layout = resolve_weight_layout(w1, w2, weight_layout)
     # marlin uint8 tensors come in two flavors: w8a16 marlin is a pure reorder
     # (unpacked geometry, w1.shape[1] == 2 * w2.shape[2]) while w4a16/w4a8
@@ -410,14 +410,19 @@ def fused_moe(
     routed_scaling_factor=1.0,
     gemm1_alpha=None,
     gemm1_limit=None,
-    weight_layout=None,
+    *,
+    prepared=None,
 ):
     """Public fused_moe entry. Dispatches to an aiter backend chosen by the
     stage-level router. Unsupported features raise NotImplementedError instead
     of silently degrading.
 
-    ``weight_layout``: 准备函数返回的布局（raw / asm_shuffle / marlin）。
-    为 None 时回退读取张量属性；两者都在时由 resolve_weight_layout 交叉校验。
+    ``prepared``: ``fused_moe_prepare_weights`` 返回的准备对象，仅限关键字、
+    位于签名末尾。生效布局与缩放系数都取自它；传了它就不得再传 w1_scale /
+    w2_scale。不传视为「权重按 raw 摆放」——若权重带 marlin / asm_shuffle 标记
+    则报错（标记表明它已重排过，不能当 raw 用）。张量标记与 prepared.layout
+    冲突报错；张量不是准备时那一对（clone / detach / 换设备 / 序列化往返）
+    告警一次后仍按 prepared.layout 执行。
     """
     if (
         any(
@@ -453,6 +458,22 @@ def fused_moe(
             "fused_moe: swiglu_limit/beta/linear_beta unsupported by the "
             "current backends"
         )
+
+    # resolve scales and layout once: single scale source (prepared or caller),
+    # marker cross-check, device and signature guards. Downstream (_fused_moe_impl)
+    # only receives the plain layout string and never reads markers again.
+    w1_scale, w2_scale, weight_layout = resolve_runtime_weights(
+        w1, w2, prepared, w1_scale, w2_scale,
+        topk=topk_ids.shape[1],
+        activation=activation,
+        quant_type=quant_type,
+        quant_type_a=quant_type_a,
+        quant_dtype_a=quant_dtype_a,
+        dtype=dtype if dtype is not None else hidden_states.dtype,
+        expert_mask=expert_mask,
+        splitk=splitk,
+        block_size_M=block_size_M,
+    )
 
     return fused_moe_(
         hidden_states=hidden_states,
@@ -584,7 +605,7 @@ def fused_moe_fake(
     routed_scaling_factor: float = 1.0,
     gemm1_alpha: float | None = None,
     gemm1_limit: float | None = None,
-    weight_layout: str | None = None,
+    weight_layout: str = "raw",
 ) -> torch.Tensor:
     M, _topk = topk_ids.shape
     out_dtype = dtype if dtype is not None else hidden_states.dtype
@@ -637,7 +658,7 @@ def fused_moe_(
     routed_scaling_factor: float = 1.0,
     gemm1_alpha: float | None = None,
     gemm1_limit: float | None = None,
-    weight_layout: str | None = None,
+    weight_layout: str = "raw",
 ) -> torch.Tensor:
     return _fused_moe_impl(
         hidden_states=hidden_states,
@@ -748,7 +769,7 @@ def _fused_moe_impl(
     routed_scaling_factor=1.0,
     gemm1_alpha=None,
     gemm1_limit=None,
-    weight_layout=None,
+    weight_layout="raw",
 ):
     """Core dispatch: normalize -> route -> execute. Backends are reached
     through BACKEND_REGISTRY entries, so there are no per-backend branches here."""

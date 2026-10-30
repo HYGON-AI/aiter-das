@@ -51,7 +51,7 @@ def fused_moe_test(
     topk_ids,
     expert_mask=None,
     activation=ActivationType.Silu,
-    weight_layout=None,
+    prepared=None,
 ):
     # No quantization (bf16 weights); the router inside fused_moe picks the
     # backend and handles the weight layout
@@ -63,7 +63,7 @@ def fused_moe_test(
         topk_ids,
         expert_mask=expert_mask,
         activation=activation,
-        weight_layout=weight_layout,
+        prepared=prepared,
     )
 
 
@@ -108,8 +108,8 @@ def test_fused_moe(m: int,
     )
 
     # 加载期一次性准备（布局决策 + 如需重排），前向零重排
-    w1_prep, w2_prep, layout = fused_moe_prepare_weights(
-        w1, w2, quant_type=aiter.QuantType.No, dtype=dtype, topk=topk,
+    w1_prep, w2_prep, prepared = fused_moe_prepare_weights(
+        w1, w2, quant_type=aiter.QuantType.No, dtype=dtype, topk=topk_ids.shape[1],
         activation=ActivationType.Silu, expert_mask=expert_mask)
     #fused_moe under test
     out, avg = fused_moe_test(
@@ -120,7 +120,7 @@ def test_fused_moe(m: int,
         topk_ids,
         expert_mask=expert_mask,
         activation=ActivationType.Silu,
-        weight_layout=layout,
+        prepared=prepared,
     )
 
     msg = f"[fused_moe_perf] {m=}, {k=}, {n=}, {e=}, {topk=}, dtype: {dtype}, torch_avg: {avg_torch:<8.2f} us, fused_moe_avg: {avg:>8.2f} us,uplift: {avg_torch/avg-1:.1%}"

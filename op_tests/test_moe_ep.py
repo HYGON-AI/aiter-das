@@ -51,7 +51,7 @@ def fused_moe_test(
     fc2_scale=None,  # [expert, model_dim, 1]
     quant_type=QuantType.No,
     expert_mask=None,
-    weight_layout=None,
+    prepared=None,
 ):
     return fused_moe(
         hidden_states,
@@ -64,7 +64,7 @@ def fused_moe_test(
         quant_type=quant_type,
         w1_scale=fc1_scale,
         w2_scale=fc2_scale,
-        weight_layout=weight_layout,
+        prepared=prepared,
     )
 
 
@@ -178,12 +178,12 @@ def test_fmoe_ep(
         # fused_moe implement (no quant -> triton backend, which converts the
         # 0/1 expert_mask to an expert map internally)
         # 加载期一次性准备（is_ep 场景决策为 raw）
-        w1_prep, w2_prep, layout = fused_moe_prepare_weights(
-            w1, w2, quant_type=QuantType.No, dtype=dtype, topk=topk,
+        w1_prep, w2_prep, prepared = fused_moe_prepare_weights(
+            w1, w2, quant_type=QuantType.No, dtype=dtype, topk=topk_ids.shape[1],
             activation=ActivationType.Silu, expert_mask=expert_mask)
         out_fused, avg_fused = fused_moe_test(
             input, w1_prep, w2_prep, topk_weights, topk_ids,
-            expert_mask=expert_mask, weight_layout=layout
+            expert_mask=expert_mask, prepared=prepared
         )
 
         msg = f"[perf] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, fused_avg: {avg_fused:>8.2f} us, uplift: {avg_c/avg_fused-1:.1%}"
@@ -228,9 +228,9 @@ def test_fmoe_ep(
         # fused_moe implement (w8a8 per token -> triton backend for EP; the
         # backend quantizes activations per token internally)
         # 加载期一次性准备（is_ep 场景决策为 raw）
-        w1_prep, w2_prep, layout = fused_moe_prepare_weights(
+        w1_prep, w2_prep, prepared = fused_moe_prepare_weights(
             w1, w2, quant_type=QuantType.per_Token, w1_scale=fc1_scale,
-            w2_scale=fc2_scale, dtype=dtype, topk=topk,
+            w2_scale=fc2_scale, dtype=dtype, topk=topk_ids.shape[1],
             activation=ActivationType.Silu, expert_mask=expert_mask)
         out_fused, avg_fused = fused_moe_test(
             input,
@@ -238,11 +238,9 @@ def test_fmoe_ep(
             w2_prep,
             topk_weights,
             topk_ids,
-            fc1_scale,
-            fc2_scale,
             quant_type=QuantType.per_Token,
             expert_mask=expert_mask,
-            weight_layout=layout,
+            prepared=prepared,
         )
 
         def calculateTensorsSize(*args):

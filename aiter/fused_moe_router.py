@@ -229,8 +229,6 @@ def _asm_execute(ctx: FusedMoeExecContext):
     shuffle tables, sorting, activation and moe_sum itself, and launches only
     solutions whose block size matches the blob's launch bounds.
     """
-    import torch
-
     from aiter.fused_moe_asm_wna16 import fused_experts_asm_impl
 
     plan, problem = ctx.plan, ctx.problem
@@ -238,11 +236,6 @@ def _asm_execute(ctx: FusedMoeExecContext):
     if "SOL_ID1" not in cfg or "SOL_ID2" not in cfg:
         return None  # no usable solution in the config: do not launch
     out_dtype = ctx.dtype or ctx.hidden_states.dtype
-    if out_dtype == torch.float32:
-        raise ValueError(
-            "fused_moe(asm): fp32 output is unsupported; asm supports only "
-            "fp16 and bf16 output"
-        )
     is_w8a8 = problem.quant_kind in ("w8a8", "w8a8_block")
     use_shuffle = int(cfg.get("USE_SHUFFLE", problem.use_shuffle) or 0)
     padded_k = cfg.get("PADDED_K")
@@ -251,7 +244,7 @@ def _asm_execute(ctx: FusedMoeExecContext):
         raise AssertionError(
             "fused_moe: asm solution requires the asm_shuffle layout but got "
             f"{problem.weight_layout!r}; call fused_moe_prepare_weights and pass "
-            "the returned layout")
+            "the returned prepared")
     # w2_scale 的第 1 维必须与补 K 后的权重一致（与 aiter_moe 的行为一致）。
     # 这是形状修正，不是重排，因此不放进准备函数（调用方不需要换 scale）。
     w2_scale = ctx.w2_scale
@@ -357,12 +350,6 @@ def _moe_c_execute(ctx: FusedMoeExecContext):
     from aiter.fused_moe_c import moe_c_fused_experts
 
     problem, plan = ctx.problem, ctx.plan
-    out_dtype = ctx.dtype or ctx.hidden_states.dtype
-    if out_dtype != ctx.hidden_states.dtype:
-        raise ValueError(
-            "fused_moe(moe_c): dtype must equal activation dtype; "
-            f"got dtype={out_dtype}, activation dtype={ctx.hidden_states.dtype}"
-        )
     w1, w2 = ctx.w1, ctx.w2
     # moe_c 只接受准备函数给出的 marlin 权重；raw 权重在这里必须报错，
     # 绝不现场重排：raw 直接进 marlin 内核会静默算错。
@@ -371,7 +358,7 @@ def _moe_c_execute(ctx: FusedMoeExecContext):
             raise AssertionError(
                 "fused_moe: moe_c requires the marlin layout but got "
                 f"{problem.weight_layout!r}; call fused_moe_prepare_weights and "
-                "pass the returned layout")
+                "pass the returned prepared")
     extra = plan.extra
     w1_zp, w2_zp = ctx.w1_zp, ctx.w2_zp
     # w4a16 在匹配层被拒绝（见 _moe_c_match），其 scale 重排分支不可达；
@@ -657,8 +644,6 @@ def _moe_c_lookup(problem: FusedMoeProblem) -> dict | None:
         _moe_block_size(problem),
         k=problem.model_dim,
         top_k=problem.topk,
-        # Must match the execute-time key str(compute_dtype); without it fp16
-        # problems match bf16 rows and the execute-time lookup asserts.
         indtype=str(_torch_dtype(problem)),
     )
     if cfg is None:
@@ -1513,6 +1498,16 @@ def _no_backend_error(problem: FusedMoeProblem) -> NotImplementedError:
     elif problem.quant_kind in ("w4a16", "w4a8"):
         message += ("\nfused_moe: no tuned triton config for this int4 "
                     "shape and AITER_FMOE_TRITON_FALLBACK=strict is set")
+    if problem.weight_layout == RAW_LAYOUT:
+        try:
+            feasible = feasible_layouts(problem)
+        except NotImplementedError:
+            feasible = frozenset()
+        if any(lay != RAW_LAYOUT for lay in feasible):
+            message += (
+                "\nraw 权重不再有执行期重排兜底：请先调用 "
+                "fused_moe_prepare_weights，由加载期一次性决定布局并完成重排，"
+                "再把返回的 prepared 传给 fused_moe（prepared=...）。")
     if _FALLBACK_STRICT:
         message += (
             "\nAITER_FMOE_TRITON_FALLBACK=warn (the default) would run this "
