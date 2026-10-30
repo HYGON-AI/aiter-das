@@ -1,15 +1,17 @@
 #include <torch/extension.h>
 
 #include "aiter_common.h"
+#include "moe_c_activation.h"
 #include "moe_wna16_utils.h"
 #include "silu_mul_kernels.h"
 
 void moe_c_activation_silu_and_mul(torch::Tensor& out,
                                    torch::Tensor& input,
-                                   int64_t rows_per_block = 1,
-                                   int64_t vec_size = 2) {
+                                   int64_t rows_per_block,
+                                   int64_t vec_size,
+                                   std::optional<double> limit) {
   moe_c::silu_and_mul(out, input, static_cast<int>(rows_per_block),
-                      static_cast<int>(vec_size));
+                      static_cast<int>(vec_size), limit);
 }
 
 void moe_c_activation_gelu_and_mul(torch::Tensor& out,

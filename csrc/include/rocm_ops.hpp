@@ -107,7 +107,7 @@ namespace py = pybind11;
 
 #define ACTIVATION_PYBIND                                                                               \
       m.def("silu_and_mul", &aiter::silu_and_mul, "Activation function used in SwiGLU.",                \
-            py::arg("out"), py::arg("input"));                                                          \
+            py::arg("out"), py::arg("input"), py::arg("limit") = 0.0f);                                 \
       m.def("scaled_silu_and_mul", &aiter::scaled_silu_and_mul, "Activation function used in scaled SwiGLU.",\
             py::arg("out"), py::arg("input"), py::arg("scale"));                                             \
       m.def("gelu_and_mul", &aiter::gelu_and_mul, "Activation function used in GELU.",                       \
@@ -147,12 +147,19 @@ namespace py = pybind11;
       m.def("relu2", &aiter::relu2, "out = relu(x)^2.",                                   \
             py::arg("out"), py::arg("input"));
 
+#define REDUCE_SUM_PYBIND                                                              \
+      m.def("reduce_sum", &aiter::reduce_sum,                                            \
+            "Row-wise reduce-sum along the last dimension.",                             \
+            py::arg("out"), py::arg("input"),                                            \
+            py::arg("waves_per_block") = -1);
+
 #define MOE_C_ACTIVATION_PYBIND                                                        \
       m.def("moe_c_silu_and_mul",                                                      \
             &moe_c_activation_silu_and_mul,                                             \
             py::arg("out"), py::arg("input"),                                          \
             py::arg("rows_per_block") = 1,                                             \
-            py::arg("vec_size") = 2);                                                   \
+            py::arg("vec_size") = 2,                                                   \
+            py::arg("limit") = py::none());                                            \
       m.def("moe_c_gelu_and_mul",                                                      \
             &moe_c_activation_gelu_and_mul,                                             \
             py::arg("out"), py::arg("input"),                                          \

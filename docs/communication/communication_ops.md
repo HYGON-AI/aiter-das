@@ -16,6 +16,8 @@ Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 普通 CAR 的完整 eager/Graph 示例、配置与最新性能统一见 [CustomAllreduce 用法与性能](custom_allreduce.md)；INT8/FP8 AllGather、末维直写及 RCCL 对照见 [Custom AllGather](custom_all_gather.md)。其他后端见 [HIP QuickAR / FlyDSL INT4](quick_all_reduce.md) 和 [Iris 通信](iris_comms.md)。
 
+变长 token 通信的接口合同、vLLM MoE 的 DP/EP 分组及 gfx936/gfx938 两卡/四卡最终性能见 [AllGatherv / ReduceScatterv](all_gatherv_reduce_scatterv.md)。这两个 v 接口使用 PyNccl/RCCL；TP1/DP4/EP 启用时实际为 DP 组通信，不等同于 TP4 custom AG/RS。
+
 ## Hygon AITER comm 算子接入速查
 
 ### 主要接口与兼容性
@@ -181,6 +183,8 @@ ca.custom_reduce_scatter(rs_input, rs_output, dim=1)
 同日追加的 RS 扩展采用真实数值规约：INT8 使用 INT32 累加后模 256 回绕；FP8 使用 FP32 按源 rank 升序累加、最后一次 RNE 转回原格式，非饱和，不接收量化 scale。详情、边界及验证见 [Custom ReduceScatter](custom_reduce_scatter.md)。普通 AR dtype 范围保持不变；公开 RS 对 custom 拒收的 FP8 明确报错，INT8 保留 RCCL 回退，回退后端缺失或禁用时明确报错。
 
 AG/RS 的 Eager 入口保留相同校验、copy-in 与同步，通过直接分派和逐调用原生 Tensor 描述符构造降低提交开销；`torch.compile` 仍使用已注册算子。两份专用说明提供优化后的完整 size 表及 8192 bytes 两阶段对照。
+
+需要各 rank 不同 token 数时使用 `CudaCommunicator.all_gatherv(..., dim=0, sizes=...)`；需要不同输出分片长度时使用其 `reduce_scatterv(..., dim=0, sizes=...)`，后者各 rank 输入仍须是相同完整形状。当前 AITER `GroupCoordinator` 没有这两个同名封装。它们支持 INT8 的 RCCL dtype 映射，不支持 FP8；不要套用上述 custom FP8 合同。完整用法、零长度 rank 与 Graph 约束见 [变长通信说明](all_gatherv_reduce_scatterv.md)。
 
 ## AR + residual + RMSNorm / Gemma
 

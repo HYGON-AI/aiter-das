@@ -611,14 +611,15 @@ def moe_c_topk_softmax(
 # - input: contiguous [..., 2N], last dim split as [gate, up].
 # - out: contiguous [..., N], same dtype as input.
 # - rows_per_block/vec_size optionally override the HIP launch config.
-@compile_ops("module_moe_c_activation")
+@compile_ops("module_moe_c_silu")
 def moe_c_silu_and_mul(
     out: torch.Tensor,
     input: torch.Tensor,
     rows_per_block: int = 1,
     vec_size: int = 2,
+    limit: Optional[float] = None,
 ) -> None:
-    """Compute out = SiLU(gate) * up for input laid out as [gate, up]."""
+    """Compute SiLU(gate) * up, optionally clamping gate/up before activation."""
     pass
 
 

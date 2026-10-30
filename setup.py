@@ -6,7 +6,7 @@ import os
 import shutil
 import sys
 
-from setuptools import Distribution, setup
+from setuptools import Distribution, find_namespace_packages, setup
 
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
@@ -233,12 +233,25 @@ class NinjaBuildExtension(BuildExtension):
         super().__init__(*args, **kwargs)
 
 
+AITER_FIXED_VERSION = os.environ.get("AITER_FIXED_VERSION", "0.1.7")
+AITER_USE_SCM_VERSION = int(os.environ.get("AITER_USE_SCM_VERSION", 0))
+version_kwargs = {"use_scm_version": True} if AITER_USE_SCM_VERSION else {"version": AITER_FIXED_VERSION}
+
+# setup_requires is checked against the active environment in
+# --no-build-isolation builds, and a mismatch triggers a download that fails
+# offline. setuptools_scm is only used for SCM versioning.
 setup_requires = [
     "packaging",
     "psutil",
-    "ninja==1.11.1",
-    "setuptools_scm==10.2.1",
+    # ninja is intentionally not checked here: the kernel prebuild above runs
+    # before setup() processes setup_requires, and JIT builds invoke the
+    # `ninja` executable on PATH, which a fetched setup_requires egg does not
+    # provide. The pin stays in pyproject.toml, requirements.txt and
+    # install_requires.
+    # "ninja==1.11.1",
 ]
+if AITER_USE_SCM_VERSION:
+    setup_requires.append("setuptools_scm==10.2.1")
 if PREBUILD_KERNELS == 1:
     setup_requires.append("pandas")
 
@@ -248,19 +261,31 @@ class ForcePlatlibDistribution(Distribution):
         return True
 
 
-AITER_FIXED_VERSION = os.environ.get("AITER_FIXED_VERSION", "0.1.7")
-AITER_USE_SCM_VERSION = int(os.environ.get("AITER_USE_SCM_VERSION", 0))
-version_kwargs = {"use_scm_version": True} if AITER_USE_SCM_VERSION else {"version": AITER_FIXED_VERSION}
+# Include implicit namespaces such as configs and ops, not just packages with
+# __init__.py. Keep generated sources exclusive to non-editable distributions.
+# Package discovery must not reintroduce JIT build trees pruned by MANIFEST.in.
+package_roots = ["aiter"] if IS_DEVELOP_MODE else ["aiter", "aiter_meta"]
+packages = find_namespace_packages(
+    include=[pattern for root in package_roots for pattern in (root, f"{root}.*")],
+    exclude=[
+        "aiter.jit.build",
+        "aiter.jit.build.*",
+        "aiter.jit.jit.build",
+        "aiter.jit.jit.build.*",
+        "*.__pycache__",
+        "*.__pycache__.*",
+    ],
+)
 
 setup(
     name=PACKAGE_NAME,
     **version_kwargs,
-    packages=["aiter"] if IS_DEVELOP_MODE else ["aiter_meta", "aiter"],
+    packages=packages,
     include_package_data=True,
     license_files=["LICENSE", "THIRD_PARTY_NOTICES.md", "LICENSE.Apache-2.0"],
-    package_data={
-        "": ["*"],
-    },
+    # Keep explicit globs at the original roots; nested resources come from
+    # MANIFEST.in, including its exclusions, rather than a glob per subpackage.
+    package_data={root: ["*"] for root in package_roots},
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",

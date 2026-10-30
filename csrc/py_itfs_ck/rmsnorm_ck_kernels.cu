@@ -27,6 +27,31 @@ bool is_dense_last_dim(const torch::Tensor& tensor)
     return tensor.dim() >= 1 && tensor.stride(-1) == 1 && tensor.is_contiguous();
 }
 
+void check_dynamicquant_args(const torch::Tensor& out,
+                            const torch::Tensor& input,
+                            const torch::Tensor& yscale,
+                            const torch::Tensor& weight)
+{
+    TORCH_CHECK(input.dim() == 2 && input.size(0) > 0 && input.size(1) > 0 &&
+                    input.size(1) <= 8192,
+                "rmsnorm dynamicquant expects nonempty 2D input with 1 <= N <= 8192");
+    TORCH_CHECK(is_dense_row_major_2d(input) && is_dense_row_major_2d(out) &&
+                    input.sizes() == out.sizes(),
+                "rmsnorm dynamicquant expects dense row-major input/out of the same shape");
+    TORCH_CHECK(out.scalar_type() == at::kChar || out.scalar_type() == at::kFloat8_e4m3fn,
+                "rmsnorm dynamicquant output must be INT8 or FP8 E4M3FN");
+    TORCH_CHECK(weight.dim() == 1 && weight.numel() == input.size(1) &&
+                    weight.is_contiguous() && weight.dtype() == input.dtype(),
+                "rmsnorm dynamicquant weight must be contiguous [N] with input dtype");
+    TORCH_CHECK(yscale.scalar_type() == at::kFloat && yscale.is_contiguous() &&
+                    ((yscale.dim() == 1 && yscale.size(0) == input.size(0)) ||
+                     (yscale.dim() == 2 && yscale.size(0) == input.size(0) && yscale.size(1) == 1)),
+                "rmsnorm dynamicquant scales must be contiguous FP32 [M] or [M,1]");
+    TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                    yscale.device() == input.device() && weight.device() == input.device(),
+                "rmsnorm dynamicquant tensors must be on the same GPU");
+}
+
 } // namespace
 
 void rmsnorm2d(
@@ -281,6 +306,7 @@ void rmsnorm2d_with_dynamicquant(
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
                 "ck rmsnorm2d only support fp16 and bf16 data type");
+    check_dynamicquant_args(out, input, yscale, weight);
 
     std::string dtype_str        = torchDTypeToStr(input.dtype());
     std::string out_dtype_str    = torchDTypeToStr(out.dtype());
@@ -295,7 +321,7 @@ void rmsnorm2d_with_dynamicquant(
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    rmsnorm2d_fwd({dtype_str,        // input precision
+    const float status = rmsnorm2d_fwd({dtype_str,        // input precision
                    out_dtype_str,    // output precision
                    dtype_str,        // x-scale, used for [1*N] input smooth quant
                    yscale_dtype_str, // y-scale, used for [M*1] output for next layer
@@ -321,6 +347,7 @@ void rmsnorm2d_with_dynamicquant(
                    y_stride,
                    yr_stride},
                   {stream});
+    TORCH_CHECK(status >= 0, "rmsnorm dynamicquant: no supported CK instance for this configuration");
 }
 
 void rmsnorm2d_with_add_dynamicquant(
@@ -335,6 +362,12 @@ void rmsnorm2d_with_add_dynamicquant(
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
                 "ck rmsnorm2d only support fp16 and bf16 data type");
+    check_dynamicquant_args(out, input, yscale, weight);
+    TORCH_CHECK(residual_in.sizes() == input.sizes() && residual_out.sizes() == input.sizes() &&
+                    is_dense_row_major_2d(residual_in) && is_dense_row_major_2d(residual_out) &&
+                    residual_in.dtype() == dtype && residual_out.dtype() == dtype &&
+                    residual_in.device() == input.device() && residual_out.device() == input.device(),
+                "rmsnorm dynamicquant residuals must match input shape, dtype, device and layout");
 
     std::string dtype_str        = torchDTypeToStr(input.dtype());
     std::string out_dtype_str    = torchDTypeToStr(out.dtype());
@@ -349,7 +382,7 @@ void rmsnorm2d_with_add_dynamicquant(
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    rmsnorm2d_fwd({dtype_str,        // input precision
+    const float status = rmsnorm2d_fwd({dtype_str,        // input precision
                    out_dtype_str,    // output precision
                    dtype_str,        // x-scale, used for [1*N] input smooth quant
                    yscale_dtype_str, // y-scale, used for [M*1] output for next layer
@@ -375,6 +408,7 @@ void rmsnorm2d_with_add_dynamicquant(
                    y_stride,
                    yr_stride},
                   {stream});
+    TORCH_CHECK(status >= 0, "rmsnorm dynamicquant: no supported CK instance for this configuration");
 }
 
 // ============================================================================

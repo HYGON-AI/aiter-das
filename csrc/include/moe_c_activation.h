@@ -2,6 +2,7 @@
 #pragma once
 
 #include <torch/extension.h>
+#include <optional>
 #include "aiter_common.h"
 
 // Fused MoE activation kernels. input is contiguous [..., 2N] laid out as
@@ -10,7 +11,8 @@
 void moe_c_activation_silu_and_mul(torch::Tensor& out,
                                    torch::Tensor& input,
                                    int64_t rows_per_block,
-                                   int64_t vec_size);
+                                   int64_t vec_size,
+                                   std::optional<double> limit = std::nullopt);
 
 void moe_c_activation_gelu_and_mul(torch::Tensor& out,
                                    torch::Tensor& input,

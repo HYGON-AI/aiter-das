@@ -76,6 +76,7 @@ def runtime_info(device):
         visible_devices={key: os.environ.get(key) for key in ('HIP_VISIBLE_DEVICES', 'CUDA_VISIBLE_DEVICES', 'ROCR_VISIBLE_DEVICES')},
         aiter=str(Path(aiter.__file__).resolve()), dependencies=_DEPENDENCIES, **bolt_info,
         asm_config_dir=str(aiter_root / "aiter/configs"),
+        route_config_dir=str(aiter_root / "aiter/configs"),  # backend route table
         sources=sources)
 
 
@@ -119,7 +120,11 @@ def replay(spec, backend, workdir, options, runtime):
     results, hits = [], []
     expected_pair = []
     with ExitStack() as stack:
-        if backend == "asm":
+        if backend == "moe_c":
+            # moe_c has no artifact file or config lookup to verify; only the
+            # accuracy and timing checks below apply.
+            from unified_tune.backends.moe_c_backend import _adapt_scales
+        elif backend == "asm":
             import aiter.fused_moe_asm_wna16 as asm
             path = workdir / spec.asm_filename()
             asm._cached_data_by_quant.clear(); asm.get_moe_asm_solution.cache_clear()
@@ -131,7 +136,10 @@ def replay(spec, backend, workdir, options, runtime):
             hits, expected_pair = check_triton_configs(spec, workdir, runtime)
         for m in spec.tokens:
             log_shape_progress(spec, m, backend, options.get("progress"), stage="VALIDATE")
-            data = make_data(spec, m); ref = reference(spec, data)
+            data = make_data(spec, m)
+            if backend == "moe_c":
+                data = _adapt_scales(spec, data)
+            ref = reference(spec, data)
             cfg = get_config(spec, m, backend)
             if backend == "asm":
                 import csv
@@ -177,7 +185,76 @@ def replay(spec, backend, workdir, options, runtime):
             print(f"REPLAY PASS backend={backend} M={m} error_ratio={accuracy['error_ratio']}", flush=True)
             del data, ref, graph, graph_output, call
             torch.cuda.empty_cache()
-    return dict(status="passed", hits=hits, cases=results)
+    extra = {}
+    if options.get("fused_moe_readback") and backend in ("asm", "triton"):
+        # Also run the public fused_moe entry against the same tables.
+        extra["fused_moe_readback"] = fused_moe_readback(spec, runtime, options)
+    return dict(status="passed", hits=hits, cases=results, **extra)
+
+
+def fused_moe_readback(spec, runtime, options):
+    """Check that the public fused_moe entry uses this run's tuned tables.
+
+    Builds the routing problem from the spec, routes it with plan(), runs it
+    through fused_moe and checks accuracy. If the route table has a row for
+    (arch, quant, shape, token), also asserts plan() picks that backend.
+    """
+    import torch
+    from unified_tune.backends.common import (make_data, reference, check,
+                                              torch_dtype)
+    from aiter import fused_moe_router as R
+    from aiter import QuantType
+    from aiter.fused_moe import fused_moe
+    quant_map = {"no_quant": QuantType.No, "int8_w8a8_channel": QuantType.per_Token,
+                 "f8_w8a8_channel": QuantType.per_Token,
+                 "int8_w8a16": QuantType.No,
+                 "int8_w8a8_block": QuantType.per_1x128, "f8_w8a8_block": QuantType.per_1x128}
+    if spec.quant_type not in quant_map:
+        return dict(status="skipped", reason=f"no fused_moe contract for {spec.quant_type}")
+    results = []
+    for m in spec.tokens:
+        data = make_data(spec, m)
+        ref = reference(spec, data)
+        if spec.quant_type == "int8_w8a16":
+            data = {**data, "s1": (data["s1"].to(torch_dtype(spec))
+                                   if data["s1"] is not None else None),
+                    "s2": (data["s2"].to(torch_dtype(spec))
+                           if data["s2"] is not None else None)}
+        out = fused_moe(data["x"], data["w1"], data["w2"], data["weights"], data["ids"],
+                        quant_type=quant_map[spec.quant_type],
+                        w1_scale=data["s1"], w2_scale=data["s2"],
+                        dtype=torch_dtype(spec))
+        accuracy = check(out, ref)
+        problem = _norm_problem_like_runtime(spec, m, runtime)
+        pl = R.plan(problem)
+        landing = pl.chained_backend or (pl.stage1_backend or "")
+        row = R._lookup_route_table(problem)
+        if row is not None and landing != row[0]:
+            raise RuntimeError(f"fused_moe_readback M={m}: landing={landing} "
+                               f"differs from installed route row={row}")
+        print(f"REPLAY PASS backend=fused_moe_readback M={m} landing={landing} "
+              f"error_ratio={accuracy['error_ratio']}", flush=True)
+        results.append(dict(token=m, landing=landing, accuracy=accuracy,
+                            route_row=(None if row is None else list(row))))
+        del data, ref, out, pl
+    return dict(status="passed", cases=results)
+
+
+def _norm_problem_like_runtime(spec, m, runtime):
+    """Same problem the runtime would build for this spec (no marker -> raw)."""
+    import aiter.fused_moe_router as R
+    kind = {"no_quant": "none", "int8_w8a16": "w8a16",
+            "int8_w8a8_channel": "w8a8", "f8_w8a8_channel": "w8a8",
+            "int8_w8a8_block": "w8a8_block", "f8_w8a8_block": "w8a8_block"}[spec.quant_type]
+    qa = ("fp8" if "f8" in spec.quant_type else
+          ("int8" if kind in ("w8a8", "w8a8_block") else "none"))
+    qw = ("none" if kind == "none" else
+          ("int8" if kind in ("w8a16", "w8a8", "w8a8_block") and qa == "int8" else
+           ("fp8" if qa == "fp8" else "int8")))
+    return R.FusedMoeProblem(arch=runtime["arch"], M=m, topk=spec.topk, E=spec.experts,
+                             model_dim=spec.model_dim, inter_dim=spec.inter_dim,
+                             dtype=spec.dtype, q_dtype_a=qa, q_dtype_w=qw,
+                             quant_kind=kind, block_shape=spec.block_shape)
 
 
 def main():

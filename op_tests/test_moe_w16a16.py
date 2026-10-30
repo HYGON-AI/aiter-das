@@ -1,16 +1,8 @@
-import pytest
 import torch
 import itertools
-from typing import Optional, List  # Add this import at the top
-
-from op_tests.utility.utils import torch_moe as torch_score_moe
-from aiter.ops.triton.moe_op import fused_moe
-from aiter.fused_moe import fused_topk, torch_moe
+from aiter.fused_moe import fused_topk, fused_moe, torch_moe
 from aiter import ActivationType, dtypes
-from aiter.test_common import checkAllclose, perftest,benchmark
-from aiter.ops.triton.fused_moe import fused_experts_impl
-from aiter.fused_moe_asm_wna16 import fused_experts_asm_impl
-from aiter.ops.shuffle import asm_shuffle_weight_b8
+from aiter.test_common import checkAllclose, perftest, benchmark
 import pandas as pd
 import aiter
 import os
@@ -31,6 +23,7 @@ def torch_moe_test(
     w2_scale=None,  # [expert, model_dim, 1]
     fc1_smooth_scale=None,  # [expert, 1, model_dim]
     fc2_smooth_scale=None,  # [expert, 1, inter_dim]
+    expert_mask=None,  # EP: 0/1 mask over global experts
     activation=ActivationType.Silu,
 ):
     return torch_moe(
@@ -43,132 +36,33 @@ def torch_moe_test(
         w2_scale,
         fc1_smooth_scale,
         fc2_smooth_scale,
-        None,
+        expert_mask,
         activation,
     )
 
-@perftest(num_warmup=2, num_iters=10,testGraph=False)
-def asm_fused_experts_impl(hidden_states: torch.Tensor,
-                       w1: torch.Tensor,
-                       w2: torch.Tensor,
-                       topk_weights: torch.Tensor,
-                       topk_ids: torch.Tensor,
-                       dtype,
-                       inplace: bool = False,
-                       activation: str = "silu",
-                       is_gated: Optional[bool] = None,
-                       use_fp8_w8a8: bool = False,
-                       use_int8_w8a8: bool = False,
-                       use_int8_w4a8: bool = False,
-                       use_int8_w8a16: bool = False,
-                       use_int4_w4a16: bool = False,
-                       per_channel_quant: bool = False,
-                       global_num_experts: int = -1,
-                       expert_map: Optional[torch.Tensor] = None,
-                       w1_scale: Optional[torch.Tensor] = None,
-                       w2_scale: Optional[torch.Tensor] = None,
-                       w1_zp: Optional[torch.Tensor] = None,
-                       w2_zp: Optional[torch.Tensor] = None,
-                       a1_scale: Optional[torch.Tensor] = None,
-                       a2_scale: Optional[torch.Tensor] = None,
-                       block_shape: Optional[List[int]] = None,
-                       use_shuffle: Optional[int] = 0):
 
-    return fused_experts_asm_impl(
+@perftest(num_warmup=2, num_iters=10, testGraph=False)
+def fused_moe_test(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights,
+    topk_ids,
+    expert_mask=None,
+    activation=ActivationType.Silu,
+):
+    # No quantization (bf16 weights); the router inside fused_moe picks the
+    # backend and handles the weight layout
+    return fused_moe(
         hidden_states,
         w1,
         w2,
         topk_weights,
         topk_ids,
-        dtype,
-        inplace,
-        activation,
-        is_gated,
-        use_fp8_w8a8,
-        use_int8_w8a8,
-        use_int8_w4a8,
-        use_int8_w8a16,
-        use_int4_w4a16,
-        per_channel_quant,
-        global_num_experts,
-        expert_map,
-        w1_scale,
-        w2_scale,
-        w1_zp,
-        w2_zp,
-        a1_scale,
-        a2_scale,
-        block_shape,
-        use_shuffle = use_shuffle
-        #solution_id="10002+20000"
+        expert_mask=expert_mask,
+        activation=activation,
     )
 
-@perftest(num_warmup=2, num_iters=10,testGraph=False)
-def triton_fused_experts_impl(hidden_states: torch.Tensor,
-                       w1: torch.Tensor,
-                       w2: torch.Tensor,
-                       topk_weights: torch.Tensor,
-                       topk_ids: torch.Tensor,
-                       odtype,
-                       inplace: bool = False,
-                       activation: str = "silu",
-                       is_gated: Optional[bool] = None,
-                       b1: Optional[torch.Tensor] = None,
-                       b2: Optional[torch.Tensor] = None,
-                       apply_router_weight_on_input: bool = False,
-                       use_fp8_w8a8: bool = False,
-                       use_int8_w8a8: bool = False,
-                       use_int8_w8a16: bool = False,
-                       use_int4_w4a16: bool = False,
-                       use_int4_w4a8: bool = False,
-                       per_channel_quant: bool = False,
-                       global_num_experts: int = -1,
-                       expert_map: Optional[torch.Tensor] = None,
-                       w1_scale: Optional[torch.Tensor] = None,
-                       w2_scale: Optional[torch.Tensor] = None,
-                       w1_zp: Optional[torch.Tensor] = None,
-                       w2_zp: Optional[torch.Tensor] = None,
-                       a1_scale: Optional[torch.Tensor] = None,
-                       a2_scale: Optional[torch.Tensor] = None,
-                       block_shape: Optional[List[int]] = None,
-                       no_combine: bool = False,
-                       routed_scaling_factor: Optional[float] = 1.0,
-                       gemm1_alpha: Optional[float] = None,
-                       gemm1_limit: Optional[float] = None):
-
-    return fused_experts_impl(
-        hidden_states,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-        odtype,
-        inplace,
-        activation,
-        is_gated,
-        b1,
-        b2,
-        apply_router_weight_on_input,
-                use_fp8_w8a8,
-        use_int8_w8a8,
-        use_int8_w8a16,
-        use_int4_w4a16,
-        use_int4_w4a8,
-        per_channel_quant,
-        global_num_experts,
-        expert_map,
-        w1_scale,
-        w2_scale,
-        w1_zp,
-        w2_zp,
-        a1_scale,
-        a2_scale,
-        block_shape,
-        no_combine,
-        routed_scaling_factor,
-        gemm1_alpha,
-        gemm1_limit,
-    )
 
 @benchmark()
 def test_fused_moe(m: int,
@@ -183,8 +77,6 @@ def test_fused_moe(m: int,
     input = torch.randn((m, k), device="cuda", dtype=dtype) / 10
     w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype)
     w2 = torch.randn((e, k, n), device="cuda", dtype=dtype)
-    w1_shuffle = asm_shuffle_weight_b8(w1, stage=1)
-    w2_shuffle = asm_shuffle_weight_b8(w2, stage=2)
     score = torch.randn((m, e), device="cuda", dtype=dtype)
 
     if ep_size > 1:
@@ -193,87 +85,43 @@ def test_fused_moe(m: int,
                               e, (local_e, ),
                               device="cuda",
                               dtype=torch.int32)
-        e_map = torch.full((e, ), -1, device="cuda", dtype=torch.int32)
-        e_map[e_ids] = torch.arange(local_e, device="cuda", dtype=torch.int32)
+        # sorted so local id i == the i-th enabled global expert, matching the
+        # expert_mask (0/1 over global experts) contract of fused_moe/torch_moe
+        e_ids, _ = torch.sort(e_ids)
+        expert_mask = torch.zeros((e, ), device="cuda", dtype=torch.int32)
+        expert_mask[e_ids] = 1
         w1 = w1[e_ids]
         w2 = w2[e_ids]
     else:
-        e_map = None
+        expert_mask = None
 
 
     ## 1. including token topk score calc
 
     ## 2. without token topk score calc
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
-    torch_output, avg_torch = torch_moe_test(input, w1, w2, topk_weights, topk_ids)
+    torch_output, avg_torch = torch_moe_test(
+        input, w1, w2, topk_weights, topk_ids, expert_mask=expert_mask
+    )
 
-
-    #Triton Solution
-    triton_output, avg_triton = triton_fused_experts_impl(
+    #fused_moe under test
+    out, avg = fused_moe_test(
         input,
         w1,
         w2,
         topk_weights,
         topk_ids,
-        dtype,
-        inplace=False,
-        activation="silu",
-        use_fp8_w8a8=False,
-        use_int8_w8a8=False,
-        use_int8_w8a16=False,
-        use_int4_w4a16=False,
-        use_int4_w4a8=False,
-        per_channel_quant=False,
-        global_num_experts=e,
-        expert_map=e_map,
-        w1_scale=None,
-        w2_scale=None,
-        w1_zp=None,
-        w2_zp=None,
-        a1_scale=None,
-        a2_scale=None,
-        block_shape=None)
+        expert_mask=expert_mask,
+        activation=ActivationType.Silu,
+    )
 
-    asm_output, avg_asm = asm_fused_experts_impl(
-        input,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-        dtype,
-        False,
-        activation="silu",
-        global_num_experts=e,
-        expert_map=e_map)
-
-    asm_output_shuffle, avg_asm_shuffle = asm_fused_experts_impl(
-        input,
-        w1_shuffle,
-        w2_shuffle,
-        topk_weights,
-        topk_ids,
-        dtype,
-        False,
-        activation="silu",
-        global_num_experts=e,
-        expert_map=e_map,
-        use_shuffle=1)
-
-    msg = f"[TRITON_perf] {m=}, {k=}, {n=}, {e=}, {topk=}, dtype: {dtype}, torch_avg: {avg_torch:<8.2f} us, triton_avg: {avg_triton:>8.2f} us,uplift: {avg_torch/avg_triton-1:.1%}"
-    checkAllclose(torch_output, triton_output, rtol=0.01, atol=1, msg=msg)
+    msg = f"[fused_moe_perf] {m=}, {k=}, {n=}, {e=}, {topk=}, dtype: {dtype}, torch_avg: {avg_torch:<8.2f} us, fused_moe_avg: {avg:>8.2f} us,uplift: {avg_torch/avg-1:.1%}"
+    checkAllclose(torch_output, out, rtol=0.01, atol=1, msg=msg)
     #torch.set_printoptions(threshold=10_000)
-    #print("golden",triton_output)
-    #print("out", asm_output)
-    # torch.testing.assert_close(triton_output, torch_output, atol=2e-2, rtol=0)
-    msg = f"[ASM_perf] {m=}, {k=}, {n=}, {e=}, {topk=}, dtype: {dtype}, torch_avg: {avg_torch:<8.2f} us, asm_avg: {avg_asm:>8.2f} us,uplift: {avg_torch/avg_asm-1:.1%}"
-    checkAllclose(triton_output, asm_output, rtol=0.01, atol=0.01, msg=msg)
-    msg = f"[ASM_shuffle_perf] {m=}, {k=}, {n=}, {e=}, {topk=}, dtype: {dtype}, asm_avg: {avg_asm:<8.2f} us, asm_shuffle_avg: {avg_asm_shuffle:>8.2f} us,uplift: {avg_asm/avg_asm_shuffle-1:.1%}"
-    checkAllclose(asm_output_shuffle, asm_output, rtol=0.01, atol=0.01, msg=msg)
+    #print("golden",out)
+    #print("out", out)
     return{
-        "triton_us": avg_triton,
-        "asm_us": avg_asm,
-        "asm_shuffle_us": avg_asm_shuffle,
-        "shuffle_uplift": f"{avg_asm/avg_asm_shuffle-1:.1%}"
+        "fused_moe_us": avg,
     }
 
 df = []

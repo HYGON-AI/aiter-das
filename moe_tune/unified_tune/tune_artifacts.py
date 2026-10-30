@@ -110,33 +110,79 @@ def resume_valid(manifest, fingerprint):
     return bool(hashes) and all(Path(path).is_file() and file_hash(path) == sha for path, sha in hashes.items())
 
 
+def _check_runtime_key_conflicts(rows, new_keys):
+    """The runtime ASM loader groups rows by (arch, inter_dim, model_dim, expert,
+    topk, quant_type) and ignores indtype and q_size_*. Rows that differ only in
+    those columns but pick different solutions for the same token are therefore
+    ambiguous at runtime. Refuse conflicts involving newly tuned rows; only warn
+    about conflicts that already exist in the installed table."""
+    by_runtime = {}
+    for key in rows:
+        by_runtime.setdefault((key[0][:6], key[1]), []).append(key)
+    new_conflicts, old_conflicts = [], 0
+    for runtime_key, keys in by_runtime.items():
+        if len({rows[k].get("sol_id") for k in keys}) < 2:
+            continue
+        if any(k in new_keys for k in keys):
+            new_conflicts.append((runtime_key, keys))
+        else:
+            old_conflicts += 1
+    if new_conflicts:
+        (shape, token), keys = new_conflicts[0]
+        variants = ", ".join(f"indtype={k[0][6]} q_size=({k[0][7]},{k[0][8]}) "
+                             f"sol_id={rows[k].get('sol_id')}" for k in keys)
+        raise ValueError(
+            f"{len(new_conflicts)} tuned row(s) conflict with existing rows: the runtime "
+            f"cannot tell indtype/q_size apart, so the same shape and token would pick "
+            f"an arbitrary solution. First conflict: {shape} token={token}: {variants}")
+    if old_conflicts:
+        print(f"[moe_tune] merge_csv: warning: {old_conflicts} existing shape/token "
+              f"point(s) have different solutions per indtype/q_size; the runtime "
+              f"picks one arbitrarily", flush=True)
+
+
 def merge_csv(old_bytes, new_bytes):
     old = list(csv.DictReader(io.StringIO(old_bytes.decode("utf-8-sig")))) if old_bytes else []
     new_reader = csv.DictReader(io.StringIO(new_bytes.decode("utf-8-sig")))
     new = list(new_reader)
     columns = list(new_reader.fieldnames)
-    group = ("arch", "inter_dim", "model_dim", "expert", "topk", "quant_type")
+    # The key includes indtype and q_size_*: ASM CSVs can hold fp16 and bf16
+    # rows (and different group sizes) for the same shape and token.
+    group = ("arch", "inter_dim", "model_dim", "expert", "topk", "quant_type",
+             "indtype", "q_size_n", "q_size_k")
     def group_key(row):
-        return tuple(str(row[name]) for name in group)
-    identities = {group_key(r): (r["indtype"], r["q_size_n"], r["q_size_k"]) for r in new}
+        return tuple(str(row.get(name) or "0") if name.startswith("q_size")
+                     else str(row[name]) for name in group)
     for row in old:
-        key = group_key(row)
-        if key in identities and identities[key] != (row.get("indtype"), row.get("q_size_n", "0"), row.get("q_size_k", "0")):
-            raise ValueError("ASM native key cannot distinguish existing dtype/group size; refuse collision")
         for name in row:
             if name not in columns:
                 columns.append(name)
     rows = {}
+    dropped = 0
     for row in old:
         key = (group_key(row), int(row["token"]))
         if key in rows:
-            raise ValueError("existing ASM CSV contains duplicate runtime keys; resolve them before installation")
+            # The existing CSV may contain duplicate keys; keep the fastest
+            # row (the first one on a tie) instead of refusing to merge.
+            dropped += 1
+            try:
+                if float(row["time_us"]) < float(rows[key]["time_us"]):
+                    rows[key] = row
+            except (KeyError, TypeError, ValueError):
+                pass
+            continue
         rows[key] = row
+    if dropped:
+        print(f"[moe_tune] merge_csv: deduplicated {dropped} duplicate legacy "
+              f"asm rows (kept fastest per key)", flush=True)
+    new_keys = set()
     for row in new:
         key = (group_key(row), int(row["token"]))
+        new_keys.add(key)
         rows[key] = dict(rows.get(key, {}), **row)
+    _check_runtime_key_conflicts(rows, new_keys)
     output = io.StringIO(newline="")
-    writer = csv.DictWriter(output, fieldnames=columns)
+    writer = csv.DictWriter(output, fieldnames=columns, lineterminator="\n")
     writer.writeheader()
     writer.writerows(rows[k] for k in sorted(rows))
     return output.getvalue().encode("utf-8")

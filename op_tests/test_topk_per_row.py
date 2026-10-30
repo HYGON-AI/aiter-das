@@ -12,7 +12,13 @@ import sys
 import pandas as pd
 import torch
 
-from aiter.ops.topk_per_row import TOPK, topk_per_row_decode, topk_per_row_prefill
+from aiter.ops.topk_per_row import (
+    TOPK,
+    top_k_per_row_decode,
+    top_k_per_row_prefill,
+    topk_per_row_decode,
+    topk_per_row_prefill,
+)
 from aiter.test_common import run_perftest
 
 PERF_ITERS = 50
@@ -67,6 +73,7 @@ def _assert_index_sets_equal(
     valid = min(length, TOPK)
     got_valid = got[got >= 0]
     assert got_valid.numel() == valid, f"row={row}: expected {valid} indices, got {got_valid.numel()}"
+    assert torch.unique(got_valid).numel() == valid, f"row={row}: duplicate indices"
     assert int(got_valid.min()) >= 0 and int(got_valid.max()) < length, (
         f"row={row}: index out of range"
     )
@@ -90,6 +97,68 @@ def _gbps(nbytes: int, us: float) -> float:
 def _torch_topk(logits: torch.Tensor) -> None:
     k = min(TOPK, logits.size(-1))
     torch.topk(logits, k, dim=-1, largest=True, sorted=False)
+
+
+@torch.inference_mode()
+def test_tied_candidates() -> None:
+    """Equal final candidates must occupy distinct slots, including after replay."""
+    for num_rows, seq_len, next_n in [(1, 2049, 1), (32, 8192, 2), (16, 65536, 4)]:
+        if seq_len == 2049:
+            # K-2 larger values plus two equal candidates that must both survive.
+            row = torch.zeros(seq_len, dtype=torch.float32, device="cuda")
+            row[: TOPK - 2] = 2
+            row[TOPK - 2 : TOPK] = 1
+        else:
+            # A permuted finite input with exact pairs of equal FP32 values.
+            columns = torch.arange(seq_len, dtype=torch.int64, device="cuda")
+            row = (((columns * 4051) & (seq_len - 1)) // 2).float() / seq_len - 0.25
+        logits = row.expand(num_rows, -1).clone()
+        starts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
+        ends = torch.full((num_rows,), seq_len, dtype=torch.int32, device="cuda")
+        seq_lens = torch.full(
+            (num_rows // next_n,), seq_len, dtype=torch.int32, device="cuda"
+        )
+
+        for mode in ("prefill", "decode"):
+            indices = torch.empty((num_rows, TOPK), dtype=torch.int32, device="cuda")
+
+            def invoke():
+                if mode == "prefill":
+                    top_k_per_row_prefill(
+                        logits, starts, ends, indices, num_rows, seq_len, 1
+                    )
+                else:
+                    top_k_per_row_decode(
+                        logits, next_n, seq_lens, indices, num_rows, seq_len, 1
+                    )
+
+            # Build and warm the actual public operator before capture.
+            invoke()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                invoke()
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                invoke()
+
+            for _ in range(3):
+                logits.neg_()
+                ref = (
+                    _ref_prefill(logits, starts, ends)
+                    if mode == "prefill"
+                    else _ref_decode(logits, next_n, seq_lens)
+                )
+                for run in (invoke, graph.replay):
+                    indices.fill_(-1)
+                    run()
+                    torch.cuda.synchronize()
+                    for i in range(num_rows):
+                        length = seq_len if mode == "prefill" else seq_len - next_n + i % next_n + 1
+                        _assert_index_sets_equal(logits[i], ref[i], indices[i], length, i)
+            del graph
+            print(f"PASS tied_candidates {mode} rows={num_rows} seq_len={seq_len}")
 
 
 @torch.inference_mode()
@@ -257,6 +326,7 @@ def _print_summary(rows: list[dict]) -> None:
 
 
 def main() -> int:
+    test_tied_candidates()
     rows = [
         test_prefill(return_values=False),
         test_prefill(return_values=True),

@@ -94,7 +94,7 @@ def biased_grouped_topk(
             num_expert_group,
             topk_group,
             need_renorm,
-            1.0,
+            routed_scaling_factor,
         )
     else:
         topk = topk_ids.shape[1]

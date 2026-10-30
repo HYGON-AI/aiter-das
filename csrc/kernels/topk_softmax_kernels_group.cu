@@ -1056,8 +1056,11 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             if(need_renorm)
             {
                 sum    = multithread_reduce(topk_v, [&](auto x_, auto y_) { return x_ + y_; }, 8);
-                // Note: routed_scaling_factor for fused_shared_experts. Now, only unfunsed version supported.
                 topk_v = topk_v *  routed_scaling_factor * __builtin_amdgcn_rcpf(sum);
+            }
+            else if(routed_scaling_factor != 1.0f)
+            {
+                topk_v *= routed_scaling_factor;
             }
             topk_weights[token_idx * stride_tk + threadIdx.x] = topk_v;
             topk_ids[token_idx * stride_tk + threadIdx.x]     = topk_i;
@@ -1087,6 +1090,10 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             {
                 sum    = multithread_reduce(topk_v, [&](auto x_, auto y_) { return x_ + y_; }, 8);
                 topk_v = topk_v *  routed_scaling_factor * __builtin_amdgcn_rcpf(sum);
+            }
+            else if(routed_scaling_factor != 1.0f)
+            {
+                topk_v *= routed_scaling_factor;
             }
             topk_weights[token_idx * stride_tk + threadIdx.x] = topk_v;
             topk_ids[token_idx * stride_tk + threadIdx.x]     = topk_i;

@@ -8,7 +8,7 @@
 
 namespace aiter {
 
-void silu_and_mul(torch::Tensor &out, torch::Tensor &input);
+void silu_and_mul(torch::Tensor &out, torch::Tensor &input, float limit = 0.0f);
 void scaled_silu_and_mul(torch::Tensor &out, torch::Tensor &input, torch::Tensor &scale);
 void gelu_and_mul(torch::Tensor &out, torch::Tensor &input);
 void gelu_tanh_and_mul(torch::Tensor &out, torch::Tensor &input);

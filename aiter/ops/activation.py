@@ -12,7 +12,15 @@ MD_NAME = "module_activation"
 
 
 @compile_ops("module_activation")
-def silu_and_mul(out: Tensor, input: Tensor) -> None: ...
+def silu_and_mul(out: Tensor, input: Tensor, limit: float = 0.0) -> None:
+    """Write gated SiLU for contiguous FP16/BF16 input ``[..., 2*K]``.
+
+    ``out`` is contiguous ``[..., K]`` on the same device and dtype, with no
+    overlap with input. Zero limit disables clipping. A positive limit caps
+    the first half from above and clips the second half to [-limit, limit].
+    The capped first half is rounded to input dtype before FP32 SiLU/multiply.
+    """
+    ...
 
 
 @compile_ops("module_activation")
@@ -21,6 +29,20 @@ def scaled_silu_and_mul(out: Tensor, input: Tensor, scale: Tensor) -> None: ...
 
 @compile_ops("module_activation")
 def gelu_and_mul(out: Tensor, input: Tensor) -> None: ...
+
+
+@compile_ops("module_activation_eager")
+def gelu_and_mul_eager(out: Tensor, input: Tensor) -> None:
+    """Compute ``F.gelu(x, approximate="none") * gate`` with eager rounding.
+
+    ``input`` is contiguous FP16/BF16 with shape ``[..., 2 * d]``, split
+    into ``x`` and ``gate``. ``out`` has shape ``[..., d]`` on the same
+    device and with the same dtype; it must be contiguous and not overlap
+    ``input``. GELU rounds to the input dtype before FP32 multiplication.
+    NaN payloads and bitwise equality across toolchain versions are not
+    part of the contract. See ``docs/gelu_and_mul_eager.md``.
+    """
+    ...
 
 
 @compile_ops("module_activation")

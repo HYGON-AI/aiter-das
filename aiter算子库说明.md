@@ -161,6 +161,12 @@ aiter_moe(...)
 
 ## 2\.2 moe算子介绍
 
+本卡路由还提供两套独立接口：[EP Scatter/Gather 算子族](docs/ep_scatter_family.md)
+保留 atomic 行布局及旧六接口，支持 K1…30、E_local≤1200；
+[MoE routing 前端](docs/moe_routing.md) 在 GPU 生成稳定元数据，支持原样重排、
+INT8/E4M3FN smooth 动态量化、active/DropPad、bias 和 SP residual 汇聚。
+两套接口均不包含专家 GEMM 或跨卡通信；具体 dtype、容量、数值和性能范围见对应文档。
+
 ### 2\.2\.1 get\_aiter\_moe\_config
 
 #### 功能描述
@@ -914,7 +920,9 @@ fuse_rms_mrope(
     )
 ```
 
-# 4\. Activition
+# 4\. Activation
+
+## 4\.1 SwiGLU
 
 ### 4\.1\.1 moe_swiglu_dynamic_quant_wrapper
 
@@ -989,6 +997,18 @@ out.float().sum().backward()
 ```Bash
 HIP_VISIBLE_DEVICES=1 python -m pytest -q -s op_tests/test_add_swiglu_training.py
 ```
+
+## 4\.2 Softmax
+
+Softmax 是沿指定维度将输入归一化为概率分布的激活函数。
+
+`aiter.softmax(input, dim=-1, *, out=None)` 对二维连续 `[B,D]` 张量逐行归一化，
+返回同 shape、dtype、device 的概率矩阵。支持 FP16/BF16/FP32、`1 <= D <= 524288`；
+内部使用 FP32 计算，支持预分配输出和非零 storage offset。
+`aiter.softmax_out(out, input, dim=-1)` 写入输出并返回 `None`。
+
+该接口仅支持前向；输出不得与输入重叠。完整合同、示例及两架构验证和性能见
+[Softmax 算子说明](docs/softmax.md)。
 
 # 5\. TopK
 

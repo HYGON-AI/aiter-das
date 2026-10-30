@@ -3,11 +3,8 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 import torch
 from aiter.test_common import checkAllclose, perftest
-from aiter.fused_moe import torch_moe, fused_topk
-from aiter.fused_moe_bf16_asm import asm_moe
-from aiter.ops.shuffle import shuffle_weight
-from aiter import pertoken_quant, ck_moe
-from aiter import dtypes
+from aiter.fused_moe import fused_moe, fused_topk, torch_moe
+from aiter import ActivationType, QuantType, pertoken_quant, dtypes
 
 BLOCK_SIZE_M = 32
 MAX_TOKENS = 4096 * 4
@@ -42,70 +39,38 @@ def torch_moe_test(
 
 
 @perftest(num_warmup=5, num_iters=20)
-def asm_moe_test(
+def fused_moe_test(
     hidden_states,
     w1,
     w2,
     topk_weight,
     topk_ids,
-    # following for int8 quant
+    # following for w8a8 quant
     fc1_scale=None,  # [expert, inter_dim, 1]
     fc2_scale=None,  # [expert, model_dim, 1]
-    fc1_smooth_scale=None,  # [expert, 1, model_dim]
-    fc2_smooth_scale=None,  # [expert, 1, inter_dim]
-    a16=False,
+    quant_type=QuantType.No,
     expert_mask=None,
 ):
-
-    return asm_moe(
+    return fused_moe(
         hidden_states,
         w1,
         w2,
         topk_weight,
         topk_ids,
-        fc1_scale,
-        fc2_scale,
-        fc1_smooth_scale,
-        fc2_smooth_scale,
-        a16,
         expert_mask=expert_mask,
-    )
-
-
-@perftest()
-def ck_moe_test(
-    hidden_states,
-    w1,
-    w2,
-    topk_weight,
-    topk_ids,
-    # following for int8 quant
-    fc1_scale=None,  # [expert, inter_dim, 1]
-    fc2_scale=None,  # [expert, model_dim, 1]
-    fc1_smooth_scale=None,  # [expert, 1, model_dim]
-    fc2_smooth_scale=None,  # [expert, 1, inter_dim]
-    expert_mask=None,
-):
-    return ck_moe(
-        hidden_states,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-        fc1_scale,
-        fc2_scale,
-        fc1_smooth_scale,
-        fc2_smooth_scale,
-        expert_mask=expert_mask,
+        activation=ActivationType.Silu,
+        quant_type=quant_type,
+        w1_scale=fc1_scale,
+        w2_scale=fc2_scale,
     )
 
 
 quant_algo = [
-    "No",  # g1u0/ck(g1ux) support
-    "int8quant",  # g1u1 support
-    "fp8quant",  # g1u1 support
-    "int8smoothquant",  # g1u1/g1u0 support
-    "fp8smoothquant",  # g1u1 support
+    "No",  # no quant -> triton backend
+    "int8quant",  # w8a8 per token -> triton backend (EP)
+    "fp8quant",  # w8a8 per token -> triton backend (EP)
+    "int8smoothquant",  # w8a8 per token, smooth folded into weights
+    "fp8smoothquant",  # w8a8 per token, smooth folded into weights
 ]
 
 
@@ -207,34 +172,18 @@ def test_fmoe_ep(
             input, w1, w2, topk_weights, topk_ids, expert_mask=expert_mask
         )
 
-        # b implement
-        w1b = shuffle_weight(w1)
-        w2b = shuffle_weight(w2)
-
-        if use_g1u1:
-            out_b = ref2
-            avg_b = 9999
-            print("asm g1u1 only support quant/smoothquant Now")
-        else:
-            out_b, avg_b = asm_moe_test(
-                input, w1b, w2b, topk_weights, topk_ids, expert_mask=expert_mask
-            )
-
-        # test ck moe
-        out_ck, avg_ck = ck_moe_test(
-            input, w1b, w2b, topk_weights, topk_ids, None, None, None, None, expert_mask
+        # fused_moe implement (no quant -> triton backend, which converts the
+        # 0/1 expert_mask to an expert map internally)
+        out_fused, avg_fused = fused_moe_test(
+            input, w1, w2, topk_weights, topk_ids, expert_mask=expert_mask
         )
 
-        msg = f"[perf] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us, ck_avg: {avg_ck:>8.2f} us, uplift: {avg_c/avg_b-1:.1%}"
-        checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
-        checkAllclose(ref2, out_ck, rtol=0.01, atol=10, msg="ck check")
+        msg = f"[perf] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, fused_avg: {avg_fused:>8.2f} us, uplift: {avg_c/avg_fused-1:.1%}"
+        checkAllclose(ref2, out_fused, rtol=0.01, atol=10, msg=msg)
 
     else:
-        w1, fc1_scale = pertoken_quant(w1, quant_dtype=quant_dtype)
-        w2, fc2_scale = pertoken_quant(w2, quant_dtype=quant_dtype)
-
-        sp1 = (E + shared_E, inter_dim)
-        sp2 = (E + shared_E, model_dim)
+        sp1 = (E + shared_E, 1, inter_dim)
+        sp2 = (E + shared_E, 1, model_dim)
 
         if not use_smooth:
             fc1_smooth_scale = None
@@ -245,6 +194,17 @@ def test_fmoe_ep(
             # [expert, 1, inter_dim]
             fc2_smooth_scale = torch.randn(sp1, dtype=dtypes.fp32, device="cuda")
 
+            # fused_moe has no argument for per-expert smooth
+            # scales; fold them into the weights before quantization (standard
+            # smoothquant deployment) so ref and fused_moe see the same math.
+            fc1_smooth_scale = fc1_smooth_scale[: w1.shape[0]]
+            fc2_smooth_scale = fc2_smooth_scale[: w2.shape[0]]
+            w1 = w1 * fc1_smooth_scale
+            w2 = w2 * fc2_smooth_scale
+
+        w1, fc1_scale = pertoken_quant(w1, quant_dtype=quant_dtype)
+        w2, fc2_scale = pertoken_quant(w2, quant_dtype=quant_dtype)
+
         # ref2 implement
         ref2, avg_c = torch_moe_test(
             input,
@@ -254,24 +214,20 @@ def test_fmoe_ep(
             topk_ids,
             fc1_scale,
             fc2_scale,
-            fc1_smooth_scale,
-            fc2_smooth_scale,
-            expert_mask,
+            expert_mask=expert_mask,
         )
 
-        # b implement
-        w1b = shuffle_weight(w1)
-        w2b = shuffle_weight(w2)
-        out_b, avg_b = asm_moe_test(
+        # fused_moe implement (w8a8 per token -> triton backend for EP; the
+        # backend quantizes activations per token internally)
+        out_fused, avg_fused = fused_moe_test(
             input,
-            w1b,
-            w2b,
+            w1,
+            w2,
             topk_weights,
             topk_ids,
             fc1_scale,
             fc2_scale,
-            fc1_smooth_scale,
-            fc2_smooth_scale,
+            quant_type=QuantType.per_Token,
             expert_mask=expert_mask,
         )
 
@@ -285,58 +241,20 @@ def test_fmoe_ep(
         num_tb = calculateTensorsSize(
             input,
             input,
-            w1b,
-            w2b,
+            w1,
+            w2,
             topk_weights,
             topk_ids,
             fc1_scale,
             fc2_scale,
-            fc1_smooth_scale,
-            fc2_smooth_scale,
         ) / (1024 * 1024 * 1024 * 1024.0)
-        bw = num_tb * 1e6 / avg_b
+        bw = num_tb * 1e6 / avg_fused
         print(
-            f"[BW  ] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, asm_bandwidth: {bw:>8.2f}TB/s"
+            f"[BW  ] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, fused_bandwidth: {bw:>8.2f}TB/s"
         )
 
-        if use_smooth and (
-            (
-                (inter_dim % 512 == 0 or inter_dim % 320 == 0)
-                and (w1b.dtype == dtypes.fp8 and inter_dim * 2 == w1b.shape[1])
-            )
-            or (
-                (inter_dim % 320 == 0)
-                and (w1b.dtype == dtypes.i8 and inter_dim * 2 == w1b.shape[1])
-            )
-            or (
-                (inter_dim % 512 == 0)
-                and (w1b.dtype == dtypes.i8 and inter_dim == w1b.shape[1])
-            )
-        ):
-            out_b2, avg_b2 = asm_moe_test(
-                input,
-                w1b,
-                w2b,
-                topk_weights,
-                topk_ids,
-                fc1_scale,
-                fc2_scale,
-                fc1_smooth_scale,
-                fc2_smooth_scale,
-                a16=True,
-                expert_mask=expert_mask,
-            )
-            msg = f"[perf] a8w8 asm: {avg_b:>8.2f} vs a16w8 asm: {avg_b2:>8.2f} ......"
-            checkAllclose(out_b, out_b2, atol=10, msg=msg)
-
-        # # test ck moe, not support now
-        # out_ck, avg_ck = ck_moe_test(input, w1b, w2b, topk_weights, topk_ids,
-        #                              fc1_scale, fc2_scale,
-        #                              fc1_smooth_scale, fc2_smooth_scale)
-
-        msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
-        checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
-        # checkAllclose(ref2, avg_ck, rtol=0.01, atol=10)
+        msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, fused_avg: {avg_fused:>8.2f} us ...... uplift: {avg_c/avg_fused-1:.1%}"
+        checkAllclose(ref2, out_fused, rtol=0.01, atol=10, msg=msg)
 
 
 print("test test_fmoe 16 bit")

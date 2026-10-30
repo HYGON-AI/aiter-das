@@ -835,6 +835,14 @@ def build_module(
             ]
         archs = validate_and_update_archs()
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
+        # gfx946 builds require its HIP multi-die SDK. Compile both launch paths;
+        # the selected device's runtime topology decides which one to use.
+        if md_name == "module_norm" and "gfx946" in archs:
+            flags_hip.append("-DCK_TILE_LAYERNORM_ENABLE_MULTIDIE=1")
+        if md_name == "module_rmsnorm" and "gfx946" in archs:
+            flags_hip.append("-DCK_TILE_RMSNORM_ENABLE_MULTIDIE=1")
+        if md_name == "module_activation" and "gfx946" in archs:
+            flags_hip.append("-DAITER_SILU_ENABLE_MULTIDIE=1")
         parallel_jobs = os.getenv("AITER_HIP_PARALLEL_JOBS")
         if parallel_jobs is not None:
             if not parallel_jobs.isdigit() or int(parallel_jobs) < 1:
@@ -853,7 +861,7 @@ def build_module(
                 code_object_version,
                 md_name,
             )
-        fp8_archs = {"gfx938", "gfx92a"}
+        fp8_archs = {"gfx938", "gfx92a", "gfx946"}
         enable_fp8 = (
             int(os.getenv("AITER_ENABLE_FP8", "0")) > 0
             or any(arch in fp8_archs for arch in archs)
@@ -878,6 +886,9 @@ def build_module(
 
         def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
             if blob_gen_cmd:
+                # Instance generation and host/device macros share one FP8 policy.
+                if md_name == "module_rmsnorm" and enable_fp8:
+                    blob_gen_cmd += " --enable-fp8"
                 blob_dir = f"{op_dir}/blob"
                 os.makedirs(blob_dir, exist_ok=True)
                 if AITER_LOG_MORE:
