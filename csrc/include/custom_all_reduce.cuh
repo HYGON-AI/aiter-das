@@ -33,6 +33,12 @@
 #include <unordered_map>
 #include <vector>
 
+// Set by the CAR build only when its resolved targets include gfx92a. A device
+// architecture macro cannot guard these host-side HIP API calls.
+#ifndef AITER_CAR_ENABLE_GFX92A_STAGING_PUBLISH
+#define AITER_CAR_ENABLE_GFX92A_STAGING_PUBLISH 0
+#endif
+
 #if defined(DTK_ENV) && defined(AITER_DTK_VERSION_MAJOR) &&                              \
     defined(AITER_DTK_VERSION_MINOR) &&                                                  \
     ((AITER_DTK_VERSION_MAJOR > 26) ||                                                   \
@@ -613,7 +619,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
 
         buf = next_buf;
     }
-#if defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
     // Finish peer reads before a following copy overwrites the staging input.
     end_sync<ngpus, true>(sg, self_sg, rank);
 #endif
@@ -1436,8 +1442,23 @@ DINLINE opus::vector_t<opus::fp8_t, pack_size> packQuant(opus::vector_t<T, pack_
         {
             tmp[j] = upcast_s(inp_pack[i * 4 + j]);
         }
+#if defined(__gfx92a__)
+        // gfx92a supports the HCU packed conversion, but the shared Opus
+        // conversion helper does not yet select it for this architecture.
+        tmp = tmp / upcast_s(scale_functor);
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            if(!isnan(tmp[j]))
+                tmp[j] = fminf(fmaxf(tmp[j], -448.0f), 448.0f);
+        int packed = 0;
+        packed = __builtin_hcu_cvt_pk_fp8_f32(tmp[0], tmp[1], packed, false);
+        packed = __builtin_hcu_cvt_pk_fp8_f32(tmp[2], tmp[3], packed, true);
+        *(reinterpret_cast<opus::fp8x4_t*>(&ret_val) + i) =
+            __builtin_bit_cast(opus::fp8x4_t, packed);
+#else
         *(reinterpret_cast<opus::fp8x4_t*>(&ret_val) + i) =
             opus::cast<opus::fp8_t>(tmp / upcast_s(scale_functor));
+#endif
     }
 #endif
     return ret_val;
@@ -3735,9 +3756,12 @@ class CustomAllreduce
 #endif
 
 #ifdef DTK_ENV
-    // DTK (Hygon HCU) memory-ordering helpers: an event to sequence the
-    // pre-allreduce D2H flush, and a small pinned host buffer it reads into.
-    hipEvent_t event_;
+    // Instance-owned system-release event. gfx92a needs a publication boundary
+    // after staging copy-in, including an explicit event node during capture.
+    hipEvent_t event_ = nullptr;
+#if AITER_CAR_ENABLE_GFX92A_STAGING_PUBLISH
+    bool publish_staging_input_ = false;
+#endif
     void*  buffer_ptr_;
     size_t buffer_size_;
 #endif
@@ -3839,11 +3863,34 @@ class CustomAllreduce
             sg_.signals[i] = rank_sg;
         }
 #ifdef DTK_ENV
-        hipEventCreateWithFlags(&event_, hipEventReleaseToSystem | hipEventDisableTiming);
+        HIP_CALL(hipEventCreateWithFlags(&event_, hipEventReleaseToSystem | hipEventDisableTiming));
         buffer_size_ = 4;
         hipHostMalloc(&buffer_ptr_, buffer_size_, hipHostMallocDefault);
+#if AITER_CAR_ENABLE_GFX92A_STAGING_PUBLISH
+        int device;
+        hipDeviceProp_t prop;
+        HIP_CALL(hipGetDevice(&device));
+        HIP_CALL(hipGetDeviceProperties(&prop, device));
+        publish_staging_input_ = transport_ == ARTransport::IPC &&
+                                 std::strncmp(prop.gcnArchName, "gfx92a", 6) == 0;
+#endif
 #endif
     }
+
+#if defined(DTK_ENV) && AITER_CAR_ENABLE_GFX92A_STAGING_PUBLISH
+    void publish_staging_input(hipStream_t stream)
+    {
+        // Multi-target builds share host code; select the actual device here.
+        if(!publish_staging_input_) return;
+        hipStreamCaptureStatus status;
+        HIP_CALL(hipStreamIsCapturing(stream, &status));
+        // Ordinary captured records can disappear from the graph. External
+        // records retain the system-release operation on every replay.
+        HIP_CALL(hipEventRecordWithFlags(
+            event_, stream, status == hipStreamCaptureStatusActive
+                                ? hipEventRecordExternal : hipEventRecordDefault));
+    }
+#endif
 
     char* open_ipc_handle(const void* ipc_handle)
     {

@@ -835,6 +835,12 @@ def build_module(
             ]
         archs = validate_and_update_archs()
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
+        if md_name == "module_custom_all_reduce" and "gfx92a" in archs:
+            # Publication uses host HIP APIs, where __gfx92a__ is not defined.
+            # Keep the host/device class layout consistent, including fat builds.
+            publish_flag = "-DAITER_CAR_ENABLE_GFX92A_STAGING_PUBLISH=1"
+            flags_cc.append(publish_flag)
+            flags_hip.append(publish_flag)
         # gfx946 builds require its HIP multi-die SDK. Compile both launch paths;
         # the selected device's runtime topology decides which one to use.
         if "gfx946" in archs:

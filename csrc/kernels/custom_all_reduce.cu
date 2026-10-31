@@ -592,6 +592,11 @@ void all_reduce(fptr_t _fa,
         HIP_CALL(hipMemcpyAsync((void*)reg_inp_ptr, actual_inp, data_bytes,
                                 hipMemcpyDeviceToDevice, stream));
         actual_inp = (void*)reg_inp_ptr;
+
+// 不能仅使用__gfx92a__判断，此处为host端代码
+#if defined(DTK_ENV) && AITER_CAR_ENABLE_GFX92A_STAGING_PUBLISH
+        reinterpret_cast<aiter::CustomAllreduce*>(_fa)->publish_staging_input(stream);
+#endif
     }
 
     _all_reduce(_fa, actual_inp, actual_out, numel, dtype,

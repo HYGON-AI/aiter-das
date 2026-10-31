@@ -137,11 +137,17 @@ sglang_fused_sigmoid_gating_delta_rule_update(
     const std::optional<torch::Tensor>& cu_seqlens,
     bool is_kda,
     const std::optional<float>& lower_bound,
+    float beta_scale,
     bool disable_state_update,
     const std::optional<torch::Tensor>& intermediate_states_buffer,
     const std::optional<torch::Tensor>& intermediate_state_indices,
     int64_t cache_steps,
-    const std::optional<torch::Tensor>& retrieve_parent_token)
+    const std::optional<torch::Tensor>& retrieve_parent_token,
+    bool cache_replayssm_inputs,
+    const std::optional<torch::Tensor>& replayssm_rawv,
+    const std::optional<torch::Tensor>& replayssm_rawk,
+    const std::optional<torch::Tensor>& replayssm_g,
+    const std::optional<torch::Tensor>& replayssm_beta)
 {
     return ::sglang_fused_sigmoid_gating_delta_rule_update(
         A_log,
@@ -160,11 +166,17 @@ sglang_fused_sigmoid_gating_delta_rule_update(
         cu_seqlens,
         is_kda,
         lower_bound,
+        beta_scale,
         disable_state_update,
         intermediate_states_buffer,
         intermediate_state_indices,
         cache_steps,
-        retrieve_parent_token);
+        retrieve_parent_token,
+        cache_replayssm_inputs,
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta);
 }
 
 AITER_CPP_TORCH_API std::vector<torch::Tensor>

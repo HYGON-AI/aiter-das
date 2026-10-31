@@ -285,11 +285,17 @@ sglang_fused_sigmoid_gating_delta_rule_update(
     std::optional<at::Tensor> const &cu_seqlens,
     bool is_kda,
     std::optional<float> const &lower_bound,
+    float beta_scale,
     bool disable_state_update,
     std::optional<at::Tensor> const &intermediate_states_buffer,
     std::optional<at::Tensor> const &intermediate_state_indices,
     int64_t cache_steps,
-    std::optional<at::Tensor> const &retrieve_parent_token);
+    std::optional<at::Tensor> const &retrieve_parent_token,
+    bool cache_replayssm_inputs,
+    std::optional<at::Tensor> const &replayssm_rawv,
+    std::optional<at::Tensor> const &replayssm_rawk,
+    std::optional<at::Tensor> const &replayssm_g,
+    std::optional<at::Tensor> const &replayssm_beta);
 
 std::vector<at::Tensor>
 aiter_fused_recurrent_gated_delta_rule_packed_decode(

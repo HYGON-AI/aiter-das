@@ -350,8 +350,9 @@ def _try_get_asm_config(
             if block_size == 32:
                 if top_k > 8 or n != 256 or k != 7168:
                     return None
-                else:
-                    return decode_sol_w4a16_gw32()
+                if arch == "gfx92a":
+                    return None
+                return decode_sol_w4a16_gw32()
 
             solution = get_moe_asm_solution(
                 arch=arch,
@@ -479,6 +480,54 @@ def _try_get_triton_config(
         return None
 
 
+def _try_get_triton_default_config(
+    quant_type: str,
+    m: int,
+    e: int,
+    n: int,
+    block_size: int,
+    k: int,
+    top_k: int,
+) -> Optional[Dict[str, Any]]:
+    # Only enable quant types represented by aiter_moe's Triton execution flags.
+    dtype_names = {
+        MoeQuantType.W16A16: None,
+        MoeQuantType.W4A16: "int4_w4a16",
+        MoeQuantType.W4A8: "int4_w4a8",
+        MoeQuantType.W8A8: "int8_w8a8",
+        MoeQuantType.FP8_W8A8: "fp8_w8a8",
+        MoeQuantType.INT8_W8A16: "int8_w8a16",
+    }
+    if quant_type not in dtype_names:
+        return None
+    try:
+        if quant_type == MoeQuantType.FP8_W8A8:
+            from .utility import dtypes
+
+            # The uint8 FP8 fallback is not an executable Triton FP8 dtype.
+            if dtypes.fp8 == torch.uint8:
+                return None
+        from boltops.fused_moe.triton.moe_config_utils import get_default_config
+
+        block_n = block_size if quant_type in (MoeQuantType.W8A8, MoeQuantType.FP8_W8A8) else 0
+        config = get_default_config(
+            m, e, n, k, top_k, dtype_names[quant_type],
+            is_marlin=False,
+            block_shape=[block_n, block_size] if block_size else None,
+        )
+        if not config:
+            return None
+        logger.info(
+            "No tuned MoE config found; using default untuned Triton config for MoE execution: "
+            "quant_type=%s, M=%s, E=%s, N=%s, K=%s, top_k=%s, block_size=%s, config=%s",
+            quant_type, m, e, n, k, top_k, block_size, config,
+        )
+        return config
+    except Exception as exc:
+        logger.debug("Triton default config lookup failed for %s: %s", quant_type, exc)
+        return None
+
+
 def _try_get_ck_config(
     quant_type: str,
     m: int,
@@ -553,6 +602,10 @@ def get_aiter_moe_config(
     - ``int8_w8a16``: moe_c > triton (ASM kernel not available)
     - ``fp8_w8a16``: not yet implemented (raises NotImplementedError)
 
+    If all candidates lack a tuned config, try an untuned Triton default.
+    An explicit backend request stays restricted to that backend; explicit
+    Triton requests can also use its default config.
+
     For non-gated MOE (e.g. Nemotron with ReLU² activation), pass
     ``gated=False`` (or let it auto-detect from ``activation="relu2"``)
     and set ``N1 = intermediate_size`` (not ``2 * intermediate_size``).
@@ -579,6 +632,8 @@ def get_aiter_moe_config(
             config = _try_get_asm_config(quant_type, M, E, n, K, top_k, block_size, use_shuffle)
         elif spec_sol_type == MoeSolutionType.TRITON:
             config = _try_get_triton_config(quant_type, M, E, n, block_size, K, top_k)
+            if config is None:
+                config = _try_get_triton_default_config(quant_type, M, E, n, block_size, K, top_k)
         elif spec_sol_type == MoeSolutionType.CK:
             config = _try_get_ck_config(quant_type, M, E, n, K, top_k, block_shape)
         else:
@@ -673,6 +728,14 @@ def get_aiter_moe_config(
                 dtype=config_dtype,
             )
 
+    config = _try_get_triton_default_config(quant_type, M, E, n, block_size, K, top_k)
+    if config is not None:
+        return True, AiterMoeConfig(
+            quant_type=quant_type,
+            solution_type=MoeSolutionType.TRITON,
+            config=config,
+            dtype=config_dtype,
+        )
     return False, AiterMoeConfig(quant_type=quant_type)
 
 
