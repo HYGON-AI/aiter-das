@@ -1022,171 +1022,6 @@ def aiter_moe(
     raise ValueError(f"Unknown solution_type: {moe_config.solution_type}")
 
 
-# ---------------------------------------------------------------------------
-# 共享重排核心
-#
-#   * aiter_moe_shfl_weight / aiter_moe_shfl_scale 是它的薄封装（aiter_moe 调用方零改动）
-#   * fused_moe_prepare_weights 也调用它，保证两条路径逐位一致
-# 布局词汇：raw / asm_shuffle / marlin；量化家族词汇见 _shuffle_quant_kind。
-# ---------------------------------------------------------------------------
-
-RAW_LAYOUT = "raw"
-MARLIN_LAYOUT = "marlin"
-ASM_SHUFFLE_LAYOUT = "asm_shuffle"
-
-_MOE_QUANT_TO_KIND = {
-    MoeQuantType.W8A8: "w8a8_int8",
-    MoeQuantType.FP8_W8A8: "w8a8_fp8",
-    MoeQuantType.INT8_W8A16: "w8a16",
-    MoeQuantType.W4A16: "w4a16",
-    MoeQuantType.W4A8: "w4a8",
-    MoeQuantType.WFP4A16: "wfp4a16",
-    MoeQuantType.WFP4A8: "wfp4a8",
-    MoeQuantType.W16A16: "w16a16",
-}
-
-
-def _shuffle_quant_kind(quant_type) -> Optional[str]:
-    """aiter.moe.MoeQuantType -> 共享核心使用的家族词汇。"""
-    return _MOE_QUANT_TO_KIND.get(quant_type)
-
-
-def _shared_shuffle_impl(w1, w2, scale1=None, scale2=None, *,
-                         quant_kind, layout=MARLIN_LAYOUT, padded_k=None,
-                         block_shape=None):
-    """唯一重排实现：权重 + scale + 补 K 都只在这里做一次。返回四元组。
-
-    Args:
-        quant_kind: ``w8a8_int8`` / ``w8a8_fp8`` / ``w8a16`` / ``w4a16`` /
-            ``w4a8`` / ``wfp4a16`` / ``wfp4a8`` / ``w16a16`` / ``none``。
-        layout: ``raw`` / ``asm_shuffle`` / ``marlin``。
-        padded_k: 补到的 model_dim 长度（asm 与 moe_c 的 w8a8_fp8 需要；None 表示不补）。
-        block_shape: fp4 家族区分 channelwise / groupwise32 的依据。
-
-    Returns:
-        ``(shuffled_w1, shuffled_w2, shuffled_scale1, shuffled_scale2)``；
-        对应输入为 ``None`` 时该项仍为 ``None``。
-
-    scale 规则：
-      * ``asm_shuffle``：``w2_scale`` 第 1 维按 ``padded_k`` 补零（与 aiter_moe
-        的行为一致），``w1_scale`` 原样；
-      * ``marlin``：只有 w4a16 / wfp4a16 需要 marlin / e8m0 重排，其余透传；
-      * ``raw``：权重与 scale 都不动。
-    """
-    from .ops.shuffle import (
-        asm_shuffle_weight_b8,
-        moe_layout_shuffle_gemm2,
-        w4a16_marlin_scale,
-        w4a16_marlin_weight_1,
-        w4a16_marlin_weight_2,
-        w4a8_moe_layout_shuffle,
-        w4a8_moe_repack_shuffle,
-        w8a16_marlin_weight_1,
-        w8a16_marlin_weight_2,
-        w16a16_marlin_weight,
-        w16a16_marlin_weight_k_n,
-        wfp4a16_e8m0_scale,
-        wfp4a8_moe_layout_shuffle,
-    )
-
-    if layout == RAW_LAYOUT:
-        return w1, w2, scale1, scale2
-
-    if layout == ASM_SHUFFLE_LAYOUT:
-        # asm 只服务 none / w8a8 / w8a8_block；其它家族不该走到这里
-        def _pad(x, dim):
-            return _pad_tensor_dim(x, dim, padded_k)
-
-        s1 = asm_shuffle_weight_b8(_pad(w1, 2), stage=1) if w1 is not None else None
-        s2 = asm_shuffle_weight_b8(_pad(w2, 1), stage=2) if w2 is not None else None
-        if padded_k is not None and scale2 is not None:
-            scale2 = _pad_tensor_dim(scale2, 1, int(padded_k))
-        return s1, s2, scale1, scale2
-
-    # ---- marlin（moe_c）----
-    if quant_kind in ("w8a8_int8", "w8a8_fp8"):
-        if quant_kind == "w8a8_fp8" and padded_k is not None:
-            k1 = int(padded_k)
-            o1 = moe_layout_shuffle_gemm2(_pad_tensor_dim(w1, 2, k1)) \
-                .contiguous().view(w1.shape[0], w1.shape[1], k1)
-            o2 = moe_layout_shuffle_gemm2(_pad_tensor_dim(w2, 1, k1)) \
-                .contiguous().view(w2.shape[0], k1, w2.shape[2])
-        else:
-            o1 = moe_layout_shuffle_gemm2(w1).contiguous().view(*w1.shape) \
-                if w1 is not None else None
-            o2 = moe_layout_shuffle_gemm2(w2).contiguous().view(*w2.shape) \
-                if w2 is not None else None
-        return o1, o2, scale1, scale2
-
-    if quant_kind == "w8a16":
-        o1 = w8a16_marlin_weight_1(w1).contiguous() if w1 is not None else None
-        o2 = w8a16_marlin_weight_2(w2).contiguous() if w2 is not None else None
-        return o1, o2, scale1, scale2
-
-    if quant_kind == "w4a16":
-        o1 = w4a16_marlin_weight_1(w1).view(-1).view(torch.uint8).view(*w1.shape) \
-            if w1 is not None else None
-        o2 = w4a16_marlin_weight_2(w2).view(-1).view(torch.uint8).view(*w2.shape) \
-            if w2 is not None else None
-        if scale1 is not None:
-            scale1 = w4a16_marlin_scale(scale1)
-        if scale2 is not None:
-            scale2 = w4a16_marlin_scale(scale2)
-        return o1, o2, scale1, scale2
-
-    if quant_kind == "w4a8":
-        def _repack(x):
-            if x is None:
-                return None
-            out = w4a8_moe_repack_shuffle(x).contiguous()
-            # moe_c 的 w4a8 marlin op 需要 signed char 容器
-            return out.view(torch.int8) if out.dtype == torch.uint8 else out
-
-        return _repack(w1), _repack(w2), scale1, scale2
-
-    if quant_kind == "wfp4a8":
-        fn = wfp4a8_moe_layout_shuffle if block_shape else w4a8_moe_layout_shuffle
-
-        def _fp4(x):
-            if x is None:
-                return None
-            return torch.stack([fn(x[i]) for i in range(x.shape[0])]) \
-                .contiguous().view(*x.shape)
-
-        return _fp4(w1), _fp4(w2), scale1, scale2
-
-    if quant_kind == "wfp4a16":
-        # fp4x2 权重按产出格式原样消费；e8m0 scale 需要重排
-        if scale1 is not None:
-            scale1 = wfp4a16_e8m0_scale(scale1)
-        if scale2 is not None:
-            scale2 = wfp4a16_e8m0_scale(scale2)
-        return w1, w2, scale1, scale2
-
-    if quant_kind == "w16a16":
-        # 目前没有可达路由（moe_c 缺 is_bottom=True 的配置），保留实现供未来放行
-        if _w16a16_moec_weight_layout(w1, w2) == "canonical":
-            o1 = _shuffle_w16a16_moec_weight(
-                w1, w16a16_marlin_weight, pad_dim=2, padded_k=padded_k)
-            o2 = _shuffle_w16a16_moec_weight(
-                w2, w16a16_marlin_weight, pad_dim=1, padded_k=padded_k)
-            return o1, o2, scale1, scale2
-        o1 = _shuffle_w16a16_moec_weight(
-            w1, w16a16_marlin_weight_k_n, pad_dim=1,
-            padded_k=padded_k, transpose_output=True)
-        o2 = _shuffle_w16a16_moec_weight(
-            w2, w16a16_marlin_weight_k_n, pad_dim=2,
-            padded_k=padded_k, transpose_output=True)
-        return o1, o2, scale1, scale2
-
-    if quant_kind == "none":
-        raise ValueError(
-            "shared shuffle: layout=marlin is not valid for the non-quantized "
-            "family (moe_c has no W16A16 stage-2 configs)")
-
-    raise ValueError(f"shared shuffle: unsupported quant kind {quant_kind!r}")
-
-
 def aiter_moe_shfl_weight(
     w1: Optional[torch.Tensor],
     w2: Optional[torch.Tensor],
@@ -1212,36 +1047,123 @@ def aiter_moe_shfl_weight(
         Tuple of ``(shuffled_w1, shuffled_w2)`` ready for :func:`aiter_moe`.
         Corresponding entry is ``None`` when input is ``None``.
     """
+    from .ops.shuffle import (
+        moe_layout_shuffle_gemm1,
+        moe_layout_shuffle_gemm2,
+        w4a8_moe_layout_shuffle,
+        w4a8_moe_repack_shuffle,
+        wfp4a8_moe_layout_shuffle,
+        w4a16_marlin_weight_1,
+        w4a16_marlin_weight_2,
+        w16a16_marlin_weight,
+        w16a16_marlin_weight_k_n,
+        w8a16_marlin_weight_1,
+        w8a16_marlin_weight_2,
+        asm_shuffle_weight_b8,
+        ck_shuffle_weight,
+        ck_shuffle_weight_down,
+    )
+
     quant_type = moe_config.quant_type
     sol_type = moe_config.solution_type
 
-    # 共享核心（唯一重排实现）：fused_moe 准备函数与本函数都走这里。
+    def _apply_shfl(fn1, fn2):
+        s1 = fn1(w1) if w1 is not None else None
+        s2 = fn2(w2) if w2 is not None else None
+        return s1, s2
+
     if sol_type == MoeSolutionType.MOE_C:
-        kind = _shuffle_quant_kind(quant_type)
-        if kind is None:
+        if quant_type in (MoeQuantType.W8A8, MoeQuantType.FP8_W8A8):
+            if quant_type == MoeQuantType.FP8_W8A8:
+                padded_k = (moe_config.config or {}).get("PADDED_K")
+                padded_k = int(padded_k) if padded_k is not None else None
+                return _apply_shfl(
+                    lambda x: moe_layout_shuffle_gemm2(
+                        _pad_tensor_dim(x, 2, padded_k)
+                    ).contiguous().view(x.shape[0], x.shape[1], padded_k or x.shape[2]),
+                    lambda x: moe_layout_shuffle_gemm2(
+                        _pad_tensor_dim(x, 1, padded_k)
+                    ).contiguous().view(x.shape[0], padded_k or x.shape[1], x.shape[2]),
+                )
+            return _apply_shfl(
+                lambda x: moe_layout_shuffle_gemm2(x).contiguous().view(*x.shape),
+                lambda x: moe_layout_shuffle_gemm2(x).contiguous().view(*x.shape),
+            )
+        elif quant_type == MoeQuantType.W4A8:
+            return _apply_shfl(
+                w4a8_moe_repack_shuffle,
+                w4a8_moe_repack_shuffle,
+            )
+        elif quant_type == MoeQuantType.WFP4A8:
+            if block_shape is None:
+                return _apply_shfl(
+                    lambda x: torch.stack([w4a8_moe_layout_shuffle(x[i]) for i in range(x.shape[0])]).contiguous().view(*x.shape),
+                    lambda x: torch.stack([w4a8_moe_layout_shuffle(x[i]) for i in range(x.shape[0])]).contiguous().view(*x.shape),
+                )
+            return _apply_shfl(
+                lambda x: torch.stack([wfp4a8_moe_layout_shuffle(x[i]) for i in range(x.shape[0])]).contiguous().view(*x.shape),
+                lambda x: torch.stack([wfp4a8_moe_layout_shuffle(x[i]) for i in range(x.shape[0])]).contiguous().view(*x.shape),
+            )
+        elif quant_type == MoeQuantType.W4A16:
+            return _apply_shfl(
+                lambda x: w4a16_marlin_weight_1(x).view(-1).view(torch.uint8).view(*x.shape),
+                lambda x: w4a16_marlin_weight_2(x).view(-1).view(torch.uint8).view(*x.shape),
+            )
+        elif quant_type == MoeQuantType.WFP4A16:
+            return w1, w2
+        elif quant_type == MoeQuantType.INT8_W8A16:
+            return _apply_shfl(w8a16_marlin_weight_1, w8a16_marlin_weight_2)
+        elif quant_type == MoeQuantType.W16A16:
+            padded_k = (moe_config.config or {}).get("PADDED_K")
+            padded_k = int(padded_k) if padded_k is not None else None
+
+            if _w16a16_moec_weight_layout(w1, w2) == "canonical":
+                return _apply_shfl(
+                    lambda x: _shuffle_w16a16_moec_weight(
+                        x, w16a16_marlin_weight, pad_dim=2, padded_k=padded_k
+                    ),
+                    lambda x: _shuffle_w16a16_moec_weight(
+                        x, w16a16_marlin_weight, pad_dim=1, padded_k=padded_k
+                    ),
+                )
+
+            return _apply_shfl(
+                lambda x: _shuffle_w16a16_moec_weight(
+                    x,
+                    w16a16_marlin_weight_k_n,
+                    pad_dim=1,
+                    padded_k=padded_k,
+                    transpose_output=True,
+                ),
+                lambda x: _shuffle_w16a16_moec_weight(
+                    x,
+                    w16a16_marlin_weight_k_n,
+                    pad_dim=2,
+                    padded_k=padded_k,
+                    transpose_output=True,
+                ),
+            )
+        else:
             raise ValueError(
                 f"Shuffle not supported for quant_type={quant_type} "
-                f"with solution_type={sol_type}")
-        padded_k = (moe_config.config or {}).get("PADDED_K")
-        padded_k = int(padded_k) if padded_k is not None else None
-        o1, o2, _s1, _s2 = _shared_shuffle_impl(
-            w1, w2, quant_kind=kind, padded_k=padded_k, block_shape=block_shape,
-            layout=MARLIN_LAYOUT)
-        return o1, o2
+                f"with solution_type={sol_type}"
+            )
 
     if sol_type == MoeSolutionType.ASM:
         padded_k = (moe_config.config or {}).get("PADDED_K")
         padded_k = int(padded_k) if padded_k is not None else None
-        o1, o2, _s1, _s2 = _shared_shuffle_impl(
-            w1, w2, quant_kind="none", padded_k=padded_k,
-            block_shape=block_shape, layout=ASM_SHUFFLE_LAYOUT)
-        return o1, o2
+        if padded_k is not None:
+            return _apply_shfl(
+                lambda x: asm_shuffle_weight_b8(_pad_tensor_dim(x, 2, padded_k), stage=1),
+                lambda x: asm_shuffle_weight_b8(_pad_tensor_dim(x, 1, padded_k), stage=2),
+            )
+        return _apply_shfl(
+            lambda x: asm_shuffle_weight_b8(x, stage=1),
+            lambda x: asm_shuffle_weight_b8(x, stage=2),
+        )
 
     if sol_type == MoeSolutionType.CK:
-        from .ops.shuffle import ck_shuffle_weight, ck_shuffle_weight_down
-        s1 = ck_shuffle_weight(w1) if w1 is not None else None
-        s2 = ck_shuffle_weight_down(w2) if w2 is not None else None
-        return s1, s2
+        return _apply_shfl(ck_shuffle_weight, ck_shuffle_weight_down)
 
     if sol_type == MoeSolutionType.TRITON:
         return w1, w2
@@ -1271,19 +1193,35 @@ def aiter_moe_shfl_scale(
         Tuple of ``(shuffled_scale1, shuffled_scale2)`` ready for :func:`aiter_moe`.
         Corresponding entry is ``None`` when input is ``None``.
     """
+    from .ops.shuffle import (
+        w4a16_marlin_scale,
+        wfp4a16_e8m0_scale,
+    )
+
     quant_type = moe_config.quant_type
     sol_type = moe_config.solution_type
 
+    def _apply_shfl(fn1, fn2):
+        s1 = fn1(scale1) if scale1 is not None else None
+        s2 = fn2(scale2) if scale2 is not None else None
+        return s1, s2
+
     if sol_type == MoeSolutionType.MOE_C:
-        kind = _shuffle_quant_kind(quant_type)
-        if kind not in ("w4a16", "wfp4a16"):
+        if quant_type == MoeQuantType.W4A16:
+            return _apply_shfl(
+                lambda x: w4a16_marlin_scale(x),
+                lambda x: w4a16_marlin_scale(x),
+            )
+        if quant_type == MoeQuantType.WFP4A16:
+            return _apply_shfl(
+                lambda x: wfp4a16_e8m0_scale(x),
+                lambda x: wfp4a16_e8m0_scale(x),
+            )
+        else:
             raise ValueError(
                 f"Shuffle scale not supported for quant_type={quant_type} "
                 f"with solution_type={sol_type}"
             )
-        _w1, _w2, s1, s2 = _shared_shuffle_impl(
-            None, None, scale1, scale2, quant_kind=kind, layout=MARLIN_LAYOUT)
-        return s1, s2
 
     raise ValueError(f"Shuffle scale Unknown solution_type: {sol_type}")
 

@@ -156,12 +156,6 @@ aiter_moe(...)
 
 ## 2.2 moe算子介绍
 
-本卡路由还提供两套独立接口：[EP Scatter/Gather 算子族](docs/ep_scatter_family.md)
-保留 atomic 行布局及旧六接口，支持 K1…30、E_local≤1200；
-[MoE routing 前端](docs/moe_routing.md) 在 GPU 生成稳定元数据，支持原样重排、
-INT8/E4M3FN smooth 动态量化、active/DropPad、bias 和 SP residual 汇聚。
-两套接口均不包含专家 GEMM 或跨卡通信；具体 dtype、容量、数值和性能范围见对应文档。
-
 ### 2.2.1 get\_aiter\_moe\_config
 
 #### 功能描述
@@ -602,7 +596,7 @@ layout 与后端的对应关系：
 模型初始化期（每层一次，可选）
 └── fused_moe_prepare_weights(w1, w2, ...)        # 由用户调用
     ├── decide_layout(...)                        # 决定 layout：查调优表比较耗时
-    └── _shared_shuffle_impl(...)                 # 需要 shuffle 时才执行
+    └── _prepare_shuffle(...)                     # 需要 shuffle 时才执行（fused_moe 自用实现）
         ↓ 输出 (w1p, w2p, prepared)
 模型运行期（每次前向）
 └── fused_moe(hidden_states, w1p, w2p, ..., prepared=prepared)   # 由用户调用

@@ -19,6 +19,9 @@ Covers:
      raise naming the field
   8. read-only object, prepare cache hit and miss, re-preparing shuffled weights
      raises
+  9. parity: fused_moe's own _prepare_shuffle is bit-exact with
+     aiter.moe.aiter_moe_shfl_weight on every reachable family, and the
+     unreachable marlin families raise
 
 Usage (inside the container, repo root):
     PYTHONPATH=. python op_tests/test_moe_layout_prepare.py
@@ -33,6 +36,7 @@ import torch
 from aiter import ActivationType, QuantType, dtypes, pertoken_quant
 from aiter.fused_moe import fused_moe, fused_topk, torch_moe
 from aiter.fused_moe_layout import (_WARNED_PREPARED, _build_problem,
+                                    _prepare_shuffle,
                                     describe_fused_moe_layout,
                                     fused_moe_prepare_weights, get_weight_layout)
 import aiter.ops.shuffle as SH
@@ -538,6 +542,75 @@ def _p4_ep():
 
 expect_value_error("non-EP prepared vs EP runtime names the fields",
                    ("is_ep", "num_experts"), _p4_ep)
+
+# ---------------------------------------------------------------------------
+# 9. parity with aiter.moe's shuffle wrappers (independent implementations)
+# ---------------------------------------------------------------------------
+from aiter.moe import (AiterMoeConfig, MoeQuantType, MoeSolutionType,
+                       aiter_moe_shfl_weight)
+
+
+def parity(tag, w1, w2, *, kind, layout, moe_quant, sol_type,
+           padded_k=None, block_shape=None, cfg=None):
+    """fused_moe 自用重排与 aiter.moe 的封装逐位一致（各自在独立副本上跑）。"""
+    own = _prepare_shuffle(w1.clone(), w2.clone(), None, None, layout=layout,
+                           quant_kind=kind, padded_k=padded_k,
+                           block_shape=block_shape)[:2]
+    ref_cfg = AiterMoeConfig(quant_type=moe_quant, solution_type=sol_type,
+                             config=dict(cfg or {}))
+    ref = aiter_moe_shfl_weight(w1.clone(), w2.clone(), ref_cfg,
+                                block_shape=block_shape)
+    check(f"parity {tag}: fused_moe shuffle == aiter_moe shuffle",
+          torch.equal(own[0], ref[0]) and torch.equal(own[1], ref[1]),
+          f"shape={tuple(own[0].shape)}")
+
+
+torch.manual_seed(21)
+# asm_shuffle：无量化 bf16（K 对齐）与 int8（K 未对齐、按 padded_k 补零）
+w1n = torch.randn((2, 256, 1024), dtype=DT) / 10
+w2n = torch.randn((2, 1024, 128), dtype=DT) / 10
+parity("asm_shuffle/none", w1n, w2n, kind="none", layout="asm_shuffle",
+       moe_quant=MoeQuantType.W16A16, sol_type=MoeSolutionType.ASM)
+
+w1aq = torch.randint(-127, 128, (2, 256, 7160), dtype=torch.int8)
+w2aq = torch.randint(-127, 128, (2, 7160, 128), dtype=torch.int8)
+parity("asm_shuffle/w8a8 padded", w1aq, w2aq, kind="w8a8",
+       layout="asm_shuffle", moe_quant=MoeQuantType.W8A8,
+       sol_type=MoeSolutionType.ASM, padded_k=7168, cfg={"PADDED_K": 7168})
+
+# marlin：w8a8 / w8a16 / wfp4a8（w4a16、w4a8、wfp4a16 在 fused_moe 侧不可达）
+w1m = torch.randint(-127, 128, (2, 256, 2048), dtype=torch.int8)
+w2m = torch.randint(-127, 128, (2, 2048, 128), dtype=torch.int8)
+parity("marlin/w8a8", w1m, w2m, kind="w8a8", layout="marlin",
+       moe_quant=MoeQuantType.W8A8, sol_type=MoeSolutionType.MOE_C)
+parity("marlin/w8a8_block", w1m, w2m, kind="w8a8_block", layout="marlin",
+       moe_quant=MoeQuantType.W8A8, sol_type=MoeSolutionType.MOE_C)
+parity("marlin/w8a16", w1m, w2m, kind="w8a16", layout="marlin",
+       moe_quant=MoeQuantType.INT8_W8A16, sol_type=MoeSolutionType.MOE_C)
+
+w1fp4 = torch.randint(0, 256, (2, 256, 128), dtype=torch.int32).to(torch.uint8)
+w2fp4 = torch.randint(0, 256, (2, 256, 64), dtype=torch.int32).to(torch.uint8)
+parity("marlin/wfp4a8", w1fp4, w2fp4, kind="wfp4a8", layout="marlin",
+       moe_quant=MoeQuantType.WFP4A8, sol_type=MoeSolutionType.MOE_C,
+       block_shape=(0, 32))
+
+# 不可达家族必须响亮失败，不静默算错
+for bad in ("w4a16", "w4a8", "wfp4a16", "none"):
+    try:
+        _prepare_shuffle(w1m.clone(), w2m.clone(), None, None, layout="marlin",
+                         quant_kind=bad)
+        check(f"marlin/{bad} raises", False, "did not raise")
+    except ValueError as exc:
+        check(f"marlin/{bad} raises", "不可达" in str(exc), f"msg={str(exc)[:80]}")
+
+# marlin 不做补 K（补 K 只属于 asm_shuffle）
+try:
+    _prepare_shuffle(w1m.clone(), w2m.clone(), None, None, layout="marlin",
+                     quant_kind="w8a8", padded_k=2112)
+    check("marlin with padded_k raises", False, "did not raise")
+except ValueError as exc:
+    check("marlin with padded_k raises", "补 K" in str(exc),
+          f"msg={str(exc)[:80]}")
 
 print("MOE_LAYOUT_PREPARE_" + ("PASS" if not FAILS else f"FAIL {FAILS}"))
 raise SystemExit(0 if not FAILS else 1)

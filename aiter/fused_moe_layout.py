@@ -23,6 +23,12 @@
 #   describes a non-existent original problem. Same pair plus same params hit a
 #   weakref-only cache.
 #
+#   Shuffle execution is owned by this module (``_prepare_shuffle``) and is
+#   deliberately independent of aiter.moe's aiter_moe_shfl_weight /
+#   aiter_moe_shfl_scale: fused_moe only implements the families its router can
+#   actually reach. The two implementations are kept aligned by a bitwise
+#   parity test (op_tests/test_moe_layout_prepare.py), not by shared code.
+#
 #   No module-level import of fused_moe / fused_moe_router (circular import);
 #   import them inside functions when needed.
 """Weight layout markers, offline layout query, and one-shot preparation API."""
@@ -33,6 +39,8 @@ import weakref
 from dataclasses import dataclass
 
 import torch
+
+from aiter.ops import shuffle as _shuffle
 
 WEIGHT_LAYOUT_ATTR = "weight_layout"
 
@@ -418,16 +426,82 @@ def _build_problem(w1, w2, quant_type, dtype, topk, activation, expert_mask,
     )
 
 
-def _shuffle_kind(problem):
-    """Map FusedMoeProblem to the family vocabulary of ``_shared_shuffle_impl``."""
-    kind = problem.quant_kind
-    if kind == "w8a8":
-        return "w8a8_fp8" if problem.q_dtype_a == "fp8" else "w8a8_int8"
-    if kind == "w8a8_block":
-        return "w8a8_fp8" if problem.q_dtype_a == "fp8" else "w8a8_int8"
-    if kind == "none":
-        return "none"
-    return kind
+# marlin 布局下 fused_moe 路由可达的家族（其余家族决策恒为 raw，见
+# fused_moe_router.decide_layout / _moe_c_usable）。
+_MARLIN_KINDS = ("w8a8", "w8a8_block", "w8a16", "wfp4a8")
+
+
+def _prepare_shuffle(w1, w2, scale1, scale2, *, layout, quant_kind,
+                     padded_k=None, block_shape=None):
+    """fused_moe 自用的重排实现，独立于 aiter.moe 的重排封装。
+
+    只实现路由实际可达的组合（不追求与 aiter.moe 的能力全集一致）：
+
+      * ``asm_shuffle``：none / w8a8 / w8a8_block —— asm b8 两段重排；有
+        ``padded_k`` 时先补零，``w2_scale`` 第 1 维同步补零；
+      * ``marlin``：w8a8（int8 / fp8，不补 K）、w8a16、wfp4a8；缩放系数
+        原样透传（w4a16 / wfp4a16 决策恒为 raw，其缩放系数重排分支不可达）；
+      * ``raw``：权重与缩放系数原样返回。
+
+    w4a16 / w4a8 / wfp4a16 的 marlin 分支、w16a16 的 marlin 分支在
+    fused_moe 侧不可达，出现即报错（宁可响亮失败，不静默算错）。
+
+    一律通过 ``_shuffle.fn`` 取用底层重排函数，便于测试统计前向重排次数。
+
+    Returns:
+        ``(w1p, w2p, scale1p, scale2p)``；输入为 ``None`` 时对应项为 ``None``。
+    """
+    if layout == RAW:
+        return w1, w2, scale1, scale2
+
+    if layout == ASM_SHUFFLE:
+        from aiter.moe import _pad_tensor_dim
+
+        w1p = (_shuffle.asm_shuffle_weight_b8(_pad_tensor_dim(w1, 2, padded_k), stage=1)
+               if w1 is not None else None)
+        w2p = (_shuffle.asm_shuffle_weight_b8(_pad_tensor_dim(w2, 1, padded_k), stage=2)
+               if w2 is not None else None)
+        if padded_k is not None and scale2 is not None:
+            scale2 = _pad_tensor_dim(scale2, 1, int(padded_k))
+        return w1p, w2p, scale1, scale2
+
+    if layout != MARLIN:
+        raise ValueError(f"fused_moe prepare: unknown layout {layout!r}")
+
+    if padded_k is not None:
+        raise ValueError(
+            "fused_moe prepare: 补 K 只由 asm_shuffle 使用；marlin 不应带 "
+            f"padded_k={padded_k}（w8a8 fp8 在决策阶段应已降级为 raw）")
+
+    if quant_kind in ("w8a8", "w8a8_block"):
+        w1p = (_shuffle.moe_layout_shuffle_gemm2(w1).contiguous().view(*w1.shape)
+               if w1 is not None else None)
+        w2p = (_shuffle.moe_layout_shuffle_gemm2(w2).contiguous().view(*w2.shape)
+               if w2 is not None else None)
+        return w1p, w2p, scale1, scale2
+
+    if quant_kind == "w8a16":
+        w1p = (_shuffle.w8a16_marlin_weight_1(w1).contiguous()
+               if w1 is not None else None)
+        w2p = (_shuffle.w8a16_marlin_weight_2(w2).contiguous()
+               if w2 is not None else None)
+        return w1p, w2p, scale1, scale2
+
+    if quant_kind == "wfp4a8":
+        fn = (_shuffle.wfp4a8_moe_layout_shuffle if block_shape
+              else _shuffle.w4a8_moe_layout_shuffle)
+
+        def _fp4(x):
+            if x is None:
+                return None
+            return torch.stack([fn(x[i]) for i in range(x.shape[0])]) \
+                .contiguous().view(*x.shape)
+
+        return _fp4(w1), _fp4(w2), scale1, scale2
+
+    raise ValueError(
+        f"fused_moe prepare: quant_kind={quant_kind!r} 在 marlin 布局下不可达"
+        f"（支持 {_MARLIN_KINDS}）；决策层若放行了新家族，需在此补实现")
 
 
 def _prepared_scales(w1, w2, problem, w1_scale, w2_scale):
@@ -531,8 +605,8 @@ def fused_moe_prepare_weights(
     the same objects (no second shuffle); changed params re-prepare from the
     originals. Already-shuffled weights (marlin / asm_shuffle marker) raise:
     shuffle changes shapes, so deciding again describes a non-existent original
-    problem. No forced-layout entry; tests that need it call
-    ``aiter.moe._shared_shuffle_impl`` directly.
+    problem. No forced-layout entry; tests that need a specific layout call
+    ``_prepare_shuffle`` directly.
     """
     from aiter.fused_moe_router import decide_layout
     from aiter.jit.utils.chip_info import get_cu_num
@@ -573,12 +647,9 @@ def fused_moe_prepare_weights(
     if layout == RAW:
         o1, o2 = w1, w2
     else:
-        from aiter.moe import _shared_shuffle_impl
-
-        o1, o2, s1, s2 = _shared_shuffle_impl(
-            w1, w2, s1, s2,
-            quant_kind=_shuffle_kind(problem), padded_k=dec.padded_k,
-            block_shape=problem.block_shape, layout=layout)
+        o1, o2, s1, s2 = _prepare_shuffle(
+            w1, w2, s1, s2, layout=layout, quant_kind=problem.quant_kind,
+            padded_k=dec.padded_k, block_shape=problem.block_shape)
 
     _mark(o1, o2, layout)
     prepared = PreparedMoe(
