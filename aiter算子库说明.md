@@ -1050,6 +1050,8 @@ fuse_rms_mrope(
 
 # 4. Activition
 
+## 4.1 SwiGLU
+
 ### 4.1.1 moe\_swiglu\_dynamic\_quant\_wrapper
 
 ### 功能描述
@@ -1124,6 +1126,18 @@ out.float().sum().backward()
 ```Bash
 HIP_VISIBLE_DEVICES=1 python -m pytest -q -s op_tests/test_add_swiglu_training.py
 ```
+
+## 4.2 Softmax
+
+Softmax 是沿指定维度将输入归一化为概率分布的激活函数。
+
+`aiter.softmax(input, dim=-1, *, out=None)` 对二维连续 `[B,D]` 张量逐行归一化，
+返回同 shape、dtype、device 的概率矩阵。支持 FP16/BF16/FP32、`1 <= D <= 524288`；
+内部使用 FP32 计算，支持预分配输出和非零 storage offset。
+`aiter.softmax_out(out, input, dim=-1)` 写入输出并返回 `None`。
+
+该接口仅支持前向；输出不得与输入重叠。完整合同、示例及两架构验证和性能见
+[Softmax 算子说明](docs/softmax.md)。
 
 # 5. TopK
 
