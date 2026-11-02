@@ -2,6 +2,8 @@
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <c10/macros/Macros.h>
 #include <torch/extension.h>
+#include "hip_kernel_launch.h"
+#include "kpool_topk.h"
 
 #ifdef USE_ROCM
 #include <hip/hip_fp16.h>
@@ -1127,7 +1129,13 @@ void launch_kpool_topk(
   auto stream = at::cuda::getCurrentCUDAStream(score.get_device());
   constexpr size_t dynamic_smem = 0;
   setup_kernel_smem_once<kpool_topk_kernel<BlockThreads, SortWriteback, PoolSize, GroupTopK>, dynamic_smem>();
-  kpool_topk_kernel<BlockThreads, SortWriteback, PoolSize, GroupTopK><<<grid, block, dynamic_smem, stream>>>(
+  aiter::launch_kernel(
+      aiter::launch_policy::kpool_topk,
+      kpool_topk_kernel<BlockThreads, SortWriteback, PoolSize, GroupTopK>,
+      grid,
+      block,
+      dynamic_smem,
+      stream.stream(),
       score.data_ptr<float>(),
       lengths.data_ptr<int32_t>(),
       out.data_ptr<int32_t>(),

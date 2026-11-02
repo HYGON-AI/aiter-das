@@ -18,6 +18,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include "hip_kernel_launch.h"
+#include "kpool_topk.h"
 
 namespace {
 
@@ -538,7 +540,13 @@ void launch_kpool_topk_transform_kernel(
     dim3 block,
     cudaStream_t stream) {
   setup_kernel_smem_once<kpool_topk_transform_kernel<K>, kSmem>();
-  kpool_topk_transform_kernel<K><<<grid, block, kSmem, stream>>>(
+  aiter::launch_kernel(
+      aiter::launch_policy::kpool_topk,
+      kpool_topk_transform_kernel<K>,
+      grid,
+      block,
+      kSmem,
+      stream,
       params,
       dst_token_indices,
       dst_stride,

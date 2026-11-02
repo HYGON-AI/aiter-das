@@ -46,8 +46,11 @@ inline constexpr LaunchPolicy moe_sum{
 inline constexpr LaunchPolicy normal_gemm{
     "AITER_NORMAL_GEMM_DIE_MODE", "AITER_NORMAL_GEMM_DIE_CHUNK", "AITER_NORMAL_GEMM_DIE_MASK",
     "AITER_NORMAL_GEMM_LOG_LAUNCH", "Normal GEMM", "normal GEMM", false};
+inline constexpr LaunchPolicy kpool_topk{
+    "SGL_KERNEL_KPOOL_TOPK_DIE_MODE", "SGL_KERNEL_KPOOL_TOPK_DIE_CHUNK",
+    "SGL_KERNEL_KPOOL_TOPK_DIE_MASK", "SGL_KERNEL_KPOOL_TOPK_LOG_LAUNCH",
+    "kpool_topk", "kpool_topk", true};
 } // namespace launch_policy
-
 namespace launch_detail {
 inline unsigned int read_unsigned(const char* name, unsigned int fallback)
 {

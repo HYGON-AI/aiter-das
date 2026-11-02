@@ -42,7 +42,7 @@ int main()
         int checks = 0;
         for(const auto& p : {aiter::launch_policy::silu, aiter::launch_policy::quant,
                             aiter::launch_policy::moe_topk, aiter::launch_policy::moe_sum,
-                            aiter::launch_policy::normal_gemm})
+                            aiter::launch_policy::normal_gemm, aiter::launch_policy::kpool_topk})
         {
             auto launch = [&](unsigned groups) {
                 aiter::launch_kernel(p, launch_contract_kernel, dim3(groups), dim3(64),
