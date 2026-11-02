@@ -855,8 +855,12 @@ def build_module(
                     [
                         "-DAITER_QUANT_ENABLE_MULTIDIE=1",
                         "-DAITER_MOE_TOPK_ENABLE_MULTIDIE=1",
+                        "-DAITER_MOE_SUM_ENABLE_MULTIDIE=1",
+                        "-DCK_TILE_MOE_SORTING_ENABLE_MULTIDIE=1",
                     ]
                 )
+            elif md_name == "module_moe_utils":
+                flags_hip.append("-DAITER_MOE_SUM_ENABLE_MULTIDIE=1")
             elif md_name == "module_activation":
                 flags_hip.append("-DAITER_SILU_ENABLE_MULTIDIE=1")
         parallel_jobs = os.getenv("AITER_HIP_PARALLEL_JOBS")
