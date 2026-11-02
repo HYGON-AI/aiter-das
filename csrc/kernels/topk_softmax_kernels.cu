@@ -24,6 +24,7 @@
 #include "hip_compat.h"
 #include "hip_reduce.h"
 #include "moe_topk_launch.h"
+#include "moe_sum_launch.h"
 #include "py_itfs_common.h"
 #include "vec_convert.h"
 #include <ATen/hip/HIPContext.h>
@@ -618,6 +619,24 @@ __global__ void moe_sum_kernel(scalar_t* __restrict__ out,         // [..., d]
     }
 }
 
+// gfx946 fallback for top-k values outside the fixed native specializations.
+// Match torch.sum's FP32 accumulation for FP16/BF16, and preserve strided views.
+template <typename scalar_t>
+__global__ void moe_sum_strided_kernel(scalar_t* out, const scalar_t* input,
+                                      int topk, int hidden,
+                                      int64_t input_s0, int64_t input_s1, int64_t input_s2,
+                                      int64_t output_s0, int64_t output_s1)
+{
+    const int64_t token = blockIdx.x;
+    for(int64_t column = threadIdx.x; column < hidden; column += blockDim.x)
+    {
+        float value = 0.0f;
+        for(int k = 0; k < topk; ++k)
+            value += static_cast<float>(input[token * input_s0 + k * input_s1 + column * input_s2]);
+        out[token * output_s0 + column * output_s1] = static_cast<scalar_t>(value);
+    }
+}
+
 } // namespace moe
 } // namespace vllm
 
@@ -664,9 +683,21 @@ void topk_softmax(torch::Tensor& topk_weights,         // [num_tokens, topk]
 void moe_sum(torch::Tensor& input,  // [num_tokens, topk, hidden_size]
              torch::Tensor& output) // [num_tokens, hidden_size]
 {
-    const int hidden_size = input.size(-1);
-    const int num_tokens  = output.numel() / hidden_size;
+    TORCH_CHECK(input.is_cuda() && output.device() == input.device(),
+                "moe_sum input/output must be on the same HIP device");
+    TORCH_CHECK(input.dim() == 3 && output.dim() == 2,
+                "moe_sum expects input [tokens, topk, hidden] and output [tokens, hidden]");
+    TORCH_CHECK(input.scalar_type() == output.scalar_type(), "moe_sum dtype mismatch");
+    TORCH_CHECK(output.size(0) == input.size(0) && output.size(1) == input.size(2),
+                "moe_sum output shape mismatch");
+    const int hidden_size = input.size(2);
+    const int num_tokens  = input.size(0);
     const int topk        = input.size(1);
+    if(topk == 2 || topk == 4 || topk == 5 || topk == 6 || topk == 8)
+        TORCH_CHECK(input.is_contiguous() && output.is_contiguous(),
+                    "native moe_sum input/output must be contiguous");
+    if(output.numel() == 0)
+        return;
 
     dim3 grid(num_tokens);
     dim3 block(std::min(hidden_size, 1024));
@@ -678,37 +709,59 @@ void moe_sum(torch::Tensor& input,  // [num_tokens, topk, hidden_size]
     {
     case 2:
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-            vllm::moe::moe_sum_kernel<scalar_t, 2><<<grid, block, 0, stream>>>(
+            aiter::moe_sum_detail::launch(vllm::moe::moe_sum_kernel<scalar_t, 2>,
+                grid, block, 0, stream,
                 output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         });
         break;
 
     case 4:
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-            vllm::moe::moe_sum_kernel<scalar_t, 4><<<grid, block, 0, stream>>>(
+            aiter::moe_sum_detail::launch(vllm::moe::moe_sum_kernel<scalar_t, 4>,
+                grid, block, 0, stream,
                 output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         });
         break;
 
     case 5:
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-            vllm::moe::moe_sum_kernel<scalar_t, 5><<<grid, block, 0, stream>>>(
+            aiter::moe_sum_detail::launch(vllm::moe::moe_sum_kernel<scalar_t, 5>,
+                grid, block, 0, stream,
                 output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         });
         break;
     case 6:
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-            vllm::moe::moe_sum_kernel<scalar_t, 6><<<grid, block, 0, stream>>>(
+            aiter::moe_sum_detail::launch(vllm::moe::moe_sum_kernel<scalar_t, 6>,
+                grid, block, 0, stream,
                 output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         });
         break;
     case 8:
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-            vllm::moe::moe_sum_kernel<scalar_t, 8><<<grid, block, 0, stream>>>(
+            aiter::moe_sum_detail::launch(vllm::moe::moe_sum_kernel<scalar_t, 8>,
+                grid, block, 0, stream,
                 output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         });
         break;
-    default: at::sum_out(output, input, 1); break;
+    default:
+#if AITER_MOE_SUM_ENABLE_MULTIDIE
+        if(ck_tile::get_hip_device_info().arch_name == "gfx946" &&
+           (input.scalar_type() == at::ScalarType::Float ||
+            input.scalar_type() == at::ScalarType::Half ||
+            input.scalar_type() == at::ScalarType::BFloat16))
+        {
+            VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_strided_kernel", [&] {
+                aiter::moe_sum_detail::launch(vllm::moe::moe_sum_strided_kernel<scalar_t>,
+                    grid, block, 0, stream, output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
+                    topk, hidden_size, input.stride(0), input.stride(1), input.stride(2),
+                    output.stride(0), output.stride(1));
+            });
+            break;
+        }
+#endif
+        at::sum_out(output, input, 1);
+        break;
     }
 }
 

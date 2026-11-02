@@ -20,7 +20,17 @@ def topk_softmax(
 
 
 @compile_ops("module_moe_utils")
-def moe_sum(input: Tensor, output: Tensor)->None: ...
+def moe_sum(input: Tensor, output: Tensor) -> None:
+    """Sum input [tokens, topk, hidden] into output [tokens, hidden].
+
+    Input/output have the same dtype and HIP device. Native topk=2/4/5/6/8
+    kernels require contiguous tensors and accumulate in the input dtype;
+    other topk values use torch.sum (a strided FP32-accumulating HIP kernel on
+    gfx946 for FP16/BF16/FP32).
+    Native gfx946 launches select the multi-die path from runtime HIP topology.
+    Work uses the current stream; empty output is a no-op.
+    """
+    ...
 
 @compile_ops("module_moe_sum")
 def asm_moe_sum(input: Tensor, output: Tensor, sorted_ids: Tensor)->None: ...
