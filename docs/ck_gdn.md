@@ -84,6 +84,9 @@ out, final_state = aiter.ck_gdn_decode(
 )
 ```
 
+上面是稠密的 `initial_state`（第一维 = 序列数）。框架用 block table 管 state 时不需要
+gather/scatter，直接把池和表一起传，见 4.3。
+
 ## 3. 参数速查
 
 ### ck_gdn_prefill
@@ -116,7 +119,8 @@ out, final_state = aiter.ck_gdn_decode(
 | `beta` | `[tokens, h_v]` | 必填；**已做 sigmoid**（decode 没有 in-kernel sigmoid 开关） |
 | `gk`、`gv` | `[tokens, h_v]` | 可选 |
 | `a_log`、`dt_bias` | `[h_v]` | `gate_in_kernel=True` 时需要 `a_log` |
-| `initial_state` | `[sequences, h_v, 128, 128]` fp32 | 可选；CK 不会原地改写它 |
+| `initial_state` | `[sequences, h_v, 128, 128]` fp32 | 可选；不给索引时是稠密布局，CK 不改写它 |
+| `initial_state_indices` | `[sequences]` int32/int64 | 可选；给了就按 state pool 寻址，`initial_state` 变成 `[slots, h_v, 128, 128]` 且原地更新（见 4.3） |
 | `cu_seqlens` | `[sequences + 1]` int64 | 缺省时整段视为一条序列 |
 | `scale` | `float` | `None` 或 0 → `1/sqrt(128)` |
 
@@ -124,6 +128,8 @@ out, final_state = aiter.ck_gdn_decode(
 `beta_headwise=True`、`use_qk_l2norm=False`、`use_exp2=False`、
 `transpose_state=False`、`gate_in_kernel=False`、`has_dt_bias=False`、
 `store_final_state=True`、`validate_varlen=True`。
+
+paged 模式的完整契约（NULL id、槽间距、原地写回、不校验索引范围）见 4.3。
 
 ### 三条通用约定
 
@@ -167,32 +173,44 @@ out, final_state = aiter.ck_gdn_prefill(
 - 有 `cu_seqlens` 时 `initial_state` / `final_state` 的第一维是序列数
   （这里是 2），不是 1。
 
-### 4.3 packed decode：与 state pool 的 gather / scatter
+### 4.3 packed decode：state pool（block table）直通
 
-CK 没有 state pool 索引参数，需要调用方自己搬：
+框架把 state 放在 slot 池里、每条序列用 block table 指定槽位时，把池和表一起传进去，
+槽位由 kernel 在 CTA 内解析，调用前后没有 gather / scatter：
 
 ```python
-slots = torch.tensor([3, 1, 7], dtype=torch.int64, device=dev)   # 框架给出的 pool slot
-init = state_pool.index_select(0, slots).clone()                 # gather
+pool_size = 16
+slots = torch.tensor([3, 1, 7], dtype=torch.int64, device=dev)   # 框架给出的 block table
+state_pool = torch.randn(pool_size, HV, 128, 128, dtype=torch.float32, device=dev) * 0.02
 
 out, final_state = aiter.ck_gdn_decode(
     q, k, v, a, torch.sigmoid(b),
     a_log=A_log, dt_bias=dt_bias,
-    initial_state=init,
+    initial_state=state_pool,        # 被当作 [slots, h_v, 128, 128] 的池
+    initial_state_indices=slots,     # [sequences] int32/int64
     cu_seqlens=torch.arange(B + 1, dtype=torch.int64, device=dev),
     scale=scale, use_g=True, gate_in_kernel=True, has_dt_bias=True,
-    transpose_state=True,
+    transpose_state=True, store_final_state=True,
 )
-
-state_pool.index_copy_(0, slots, final_state)                    # scatter
+# out          [tokens, h_v, 128]
+# final_state  就是 state_pool 本身（原地更新），第一维是 slots 而不是 sequences
 ```
 
 要点：
 
-- `initial_state` 是只读输入，CK 返回**新的** `final_state` 张量，要自己写回 pool；
-- `transpose_state=True` 时 CK 的稠密 state 与 HIPC/Triton 的 pool 布局逐元素一致，
-  可以直接 gather/scatter（仓库测试与基准就是这么用的）；
-- 定长多 batch 用等长分段表达：`cu_seqlens = arange(0, B*T_per_seq + 1, T_per_seq)`。
+- **原地写回**：paged 模式下 `final_state` 返回的就是传进去的池（`data_ptr()` 相同），
+  不需要再 `index_copy_`；也正因为如此，必须 `store_final_state=True`，否则直接报错；
+- **`id <= 0` 是 NULL_BLOCK_ID**：该行从零 state 起跑且不回写，所以 CUDA-graph 的 padding
+  行不会污染 block 0。**推论：block 0 不能当真实槽位用**，如果框架确实会用 0，传入前统一 +1；
+- **池只要求内三维 dense**：槽间距取 `stride(0)`，允许 padding 或切片；`indices` 给 int32 或
+  int64 都行（int32 每次调用会转一份 int64，热路径建议直接给 int64）；
+- **索引范围不做校验**：越界 id 会直接读写越界内存。校验意味着一次 D2H 同步，取舍与 4.7 一致，
+  责任在调用方；
+- 池固定 fp32，形状 `[slots, h_v, 128, 128]`，其中 `h_v` 必须与本次调用的 `v` 对齐。
+
+没有 block table 的场景（单序列，或调用方自己维护稠密初态）仍用稠密入口：
+`initial_state=[sequences, h_v, 128, 128]`，CK 不改写入参，而是返回**新的** `final_state`。
+定长多 batch 用等长分段表达：`cu_seqlens = arange(0, B*T_per_seq + 1, T_per_seq)`。
 
 ### 4.4 多 token 的序列更新
 
@@ -204,11 +222,12 @@ T = num_reqs * seq_len
 cu = torch.arange(0, T + 1, seq_len, dtype=torch.int64, device=dev)
 
 # q/k/v reshape 成 [T, HQK/HV, 128]；g=a、beta=sigmoid(b) 同样 reshape 成 [T, HV]
-init = base_pool.index_select(0, first_slots).clone()   # 每条序列取一个初始 slot
 out, final_state = aiter.ck_gdn_decode(
     q2, k2, v2, a2, beta2,
     a_log=A_log, dt_bias=dt_bias,
-    initial_state=init, cu_seqlens=cu, scale=scale,
+    initial_state=base_pool,                 # 池原地更新，每条序列的槽位由 first_slots 指定
+    initial_state_indices=first_slots,
+    cu_seqlens=cu, scale=scale,
     gate_in_kernel=True, has_dt_bias=True,
     transpose_state=True, store_final_state=True,
 )
@@ -278,7 +297,7 @@ HIPC 入口在 `aiter/ops/fla.py`（`module_cpp_api`），CK 入口在 `aiter/op
 | 粒度 | 分阶段算子：KKT/solve、w/u 递推、output 分开；`w`/`u` 要调用方（或 Triton 侧）先准备好 | 整算子：prefill 从原始 q/k/v/g/beta 一路算完 |
 | 输入组织 | packed decode 收拼接好的 `mixed_qkv` | 收分离的 `q`/`k`/`v`（各自 packed） |
 | gate / beta | 收 raw `a`、`b`，配 `A_log`/`dt_bias` 在 kernel 内完成；`threshold`、`beta` 是算子参数 | `g` 是衰减（`gate_in_kernel=True` 时才是 raw gate）；beta 默认要自己 sigmoid |
-| state | 用 `ssm_state_indices` 索引 state pool，**原地更新** | 无索引；稠密 `[sequences, h_v, 128, 128]`，gather/scatter 自己做，返回新张量 |
+| state | 用 `ssm_state_indices` 索引 state pool，**原地更新** | 两种：`initial_state_indices` 索引池、**原地更新**（与 HIPC 同形）；不给索引则收稠密 `[sequences, h_v, 128, 128]` 并返回新张量 |
 | 输出 | packed decode 需要预分配 `out` | 内部创建并返回 `output` |
 | 中间量 | 可返回 `h`/`v_new`（`save_new_value` 控制） | 不返回，全部留在 workspace 里（`v_new` 恒定物化） |
 | workspace | 没有 | prefill 需要，按 shape+flags 计算 |
@@ -309,22 +328,21 @@ aiter.aiter_fused_recurrent_gated_delta_rule_packed_decode(
     ssm_state_indices=indices, use_qk_l2norm_in_kernel=False,
 )                                  # pool 已被写回；out_hipc[:, 0] 是输出
 
-# --- CK：beta 先 sigmoid，state 手工 gather/scatter ---
-slots = indices.to(torch.int64)
-ck_state = pool.index_select(0, slots).clone()
+# --- CK：beta 先 sigmoid，state pool 直通（原地更新，不用搬） ---
 ck_out, ck_final = aiter.ck_gdn_decode(
     q, k, v, a, torch.sigmoid(b),
     a_log=A_log, dt_bias=dt_bias,
-    initial_state=ck_state,
+    initial_state=pool,
+    initial_state_indices=indices.to(torch.int64),
     cu_seqlens=torch.arange(B + 1, dtype=torch.int64, device=dev),
     scale=scale, use_g=True, gate_in_kernel=True, has_dt_bias=True,
     transpose_state=True, store_final_state=True,
 )
-pool.index_copy_(0, slots, ck_final)
 ```
 
 两者的 `out` 形状不同：HIPC packed decode 是 `[B, 1, HV, V]`，CK 是 `[B, HV, V]`。
-`transpose_state=True` 保证 CK 的 state 与 pool 可以逐元素对齐。
+state 侧现在两边都是原地更新（`ck_final is pool`），`transpose_state=True` 保证两边的
+state 布局逐元素一致。
 
 ### 5.4 从 HIPC 切换到 CK：步骤、示例与验收
 
@@ -334,7 +352,7 @@ CK 不是 drop-in 替代，切换是有明确映射的改写。按下面五步�
 
 | 你原来用的是 | 现在换成 | 改造量 |
 |---|---|---|
-| `aiter_fused_recurrent_gated_delta_rule_packed_decode`（1 token/序列） | `ck_gdn_decode` | 小：改 beta/gate/state 三处契约 |
+| `aiter_fused_recurrent_gated_delta_rule_packed_decode`（1 token/序列） | `ck_gdn_decode` | 小：改 beta/gate 两处契约，state 直传池 + block table（不用搬） |
 | `vllm_fused_sigmoid_gating_delta_rule_update`（框架 update，含投机解码） | `ck_gdn_decode` | 中：额外要处理 `num_accepted_tokens` 片段语义 |
 | `chunk_gated_delta_rule_fwd_*` + `chunk_fwd_o_*`（分阶段 prefill） | `ck_gdn_prefill` 单算子 | 大：框架侧前处理要删掉，并新增 workspace 管理 |
 
@@ -344,7 +362,7 @@ CK 不是 drop-in 替代，切换是有明确映射的改写。按下面五步�
 |---|---|---|
 | `beta` | raw `b` | `torch.sigmoid(b)`（decode）；prefill 可用 `beta_sigmoid_in_kernel=True` 传原始值 |
 | gate | raw `a` + `A_log`/`dt_bias` | `g=a` 且 `gate_in_kernel=True`，有 bias 再 `has_dt_bias=True` |
-| state | `initial_state` 池 + `ssm_state_indices`，原地更新 | `index_select` gather 成稠密 `[sequences, hv, 128, 128]`；`transpose_state=True` 与池布局对齐；调用后 `index_copy_` 写回 |
+| state | `initial_state` 池 + `ssm_state_indices`，原地更新 | 同一份池 + `initial_state_indices=ssm_state_indices`（配 `transpose_state=True`），池原地更新；不用 paged 入口时才自己 `index_select` / `index_copy_` |
 | `cu_seqlens` | int32 或 int64 | **int64** |
 | q/k/v | `mixed_qkv` 拼接张量，或 `[B, T, H, D]` | 分离的 `q`/`k`/`v`，`[tokens, heads, 128]` 连续（由 `mixed_qkv` 切出来需要一次 `.contiguous()`） |
 | 输出 | 预分配 `out=[B,1,hv,V]` | CK 返回 `[tokens,hv,V]` 与新的 `final_state`；形状少一维 |
@@ -366,18 +384,17 @@ aiter.aiter_fused_recurrent_gated_delta_rule_packed_decode(
     ssm_state_indices=indices, use_qk_l2norm_in_kernel=False,
 )
 
-# after: CK
-slots = indices.to(torch.int64)
+# after: CK（paged 入口，池原地更新，没有 gather/scatter）
 out, new_state = aiter.ck_gdn_decode(
     q, k, v, a, torch.sigmoid(b),
     a_log=A_log, dt_bias=dt_bias,
-    initial_state=pool.index_select(0, slots).clone(),
+    initial_state=pool,
+    initial_state_indices=indices.to(torch.int64),
     cu_seqlens=torch.arange(B + 1, dtype=torch.int64, device=dev),
     scale=scale, use_g=True, gate_in_kernel=True, has_dt_bias=True,
     transpose_state=True, store_final_state=True,
     validate_varlen=False,
-)
-pool.index_copy_(0, slots, new_state)
+)   # new_state is pool
 ```
 
 **框架 update（`vllm_fused_sigmoid_gating_delta_rule_update`）**：改写同上，但要注意
@@ -443,6 +460,7 @@ bash bench_gdn.sh ck-decode-doc
 |---|---|---|
 | gate | raw `a` + `A_log`/`dt_bias`，kernel 内算 | `g=a`、`gate_in_kernel=True`（有 bias 再加 `has_dt_bias=True`） |
 | state 布局 | pool `[P, hv, V, K]` | `transpose_state=True` 后逐元素一致 |
+| state 索引 | `ssm_state_indices`，池原地更新 | `initial_state_indices`，池同样原地更新（4.3） |
 | varlen | `cu_seqlens` int32 或 int64 | `cu_seqlens`，**必须是 int64** |
 | `scale` | 缺省 `1/sqrt(D)` | 省略或传 0 → 同一默认值 |
 | 返回 | `(out, final_state)` | 同 |
@@ -453,7 +471,6 @@ bash bench_gdn.sh ck-decode-doc
 |---|---|---|
 | 输入组织 | HIPC 收拼接好的 `mixed_qkv` | `mixed_qkv` 的切片可以 `view` 出 q/k/v 形状（零拷贝），但切片**不连续**（`stride[0]` 仍是整行宽度），不满足 CK 的连续性校验，需要一次 `.contiguous()` 拷贝；上游直接给分离张量时没有这份开销 |
 | beta | HIPC 收 raw `b`，kernel 内 sigmoid | 调用方 `torch.sigmoid(b)`（多一个 elementwise kernel） |
-| state pool | HIPC 用 `ssm_state_indices` 且原地更新 | 封装 gather → 调用 → scatter（见 4.3） |
 | 输出缓冲 | HIPC 由调用方预分配 `out` | 目前只能让 CK 内部创建；要复用缓冲需要 C++ 侧支持 |
 
 **C. 结构性差异，封装无法消除**
@@ -467,8 +484,9 @@ bash bench_gdn.sh ck-decode-doc
 | prefill 的 host 读取 | CK prefill 需要 `cu_seqlens` 的 host 值算 `num_chunks`（决定 workspace 大小），没有关闭开关；decode 侧已可用 `validate_varlen=False` 消除 |
 
 也就是说：**从 HIPC 迁到 CK 是一次有明确映射的改写（5.3 / 5.4），CK 不是 HIPC 的 drop-in 替代。**
-要真正做到"用法完全对齐"，需要给适配器补三件事：raw-beta launcher 接线、`out=` 输出复用、
-`ssm_state_indices` / `num_chunks` 直传（或接受 CPU 侧 `cu_seqlens`）。三项都不难，但都会改动
+要真正做到"用法完全对齐"，还剩两件事：raw-beta launcher 接线、`out=` 输出复用。
+`ssm_state_indices` 直传已经可用（paged 入口，见 4.3），`num_chunks` 仍不在 API 面上
+（prefill 只能自己算 workspace，或者接受 CPU 侧的 `cu_seqlens`）。这些都不难，但都会改动
 C++/pybind 的 API 面，需要单独排期。
 
 ## 6. 验证与基准
@@ -593,6 +611,10 @@ B=8/H2/HV8、B=32/H16/HV64 与 prefill t=9008 三个点，结果全部复现（�
 关掉 varlen 校验后，公开 API 也不再被适配器的 D2H 拖累（对比修复前同 shape
 的 `--validate` 默认值：B=32/2/8 从 113.6 降到 ~80，B=128/16/64 从 1468 降到 1408）。
 
+表 2 / 表 4 的 CK 列走的是**稠密入口 + 调用方 gather/scatter**。paged 直通（4.3）省掉这两趟
+搬运：state pool 场景（B=32、h_v=48）从 1129 us 降到 181 us，同一组参数下 kernel 本身的时间
+不变。所以这两张表作为 kernel 对比仍然成立，但不再是 state pool 场景的端到端耗时。
+
 **prefill（2026-10-23 补充，bf16、单序列、无 varlen、event 计时 20 次平均）**：
 
 CK 是单个算子，HIPC 只有分段入口，所以给两个口径。**组装链** =
@@ -631,7 +653,10 @@ t=9008、H16/HV64 → **3621.3 us**（当时 HIPC 侧缺少同粒度入口，未
 - `head_dim == 128`、chunk size 固定 64，输入必须 packed、连续、同 dtype；
 - 只有 bf16 / fp16 输入；decode 的 `g`/`beta` 可以单独是 fp32；
 - prefill 需要 workspace，且必须与 shape+flags 绑定；
-- decode 没有 state pool 索引，gather/scatter 由调用方负责；
+- decode 可以用 `initial_state_indices` 直接索引 state pool（池原地更新）；不给索引时是稠密
+  `[sequences, h_v, 128, 128]` 入参、返回新的 `final_state`；
+- paged 模式下 `id <= 0` 视为 NULL（该行零初态、不回写），因此 **block 0 不能当真实槽位**；
+  索引范围不做校验，越界由调用方负责；
 - CK 不是 HIPC 的 drop-in 替代：迁移按 5.4，能/不能对齐的边界见 5.5；
 - `use_gk`（per-key 路径）与 `cp_context` 互斥，且该路径以功能正确性为目标；
 - `cp_context` 是 CK 侧的单进程功能模拟（不建真实进程、不调 RCCL），仅用于验证
