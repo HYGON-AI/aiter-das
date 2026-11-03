@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Self-contained normal GEMM correctness and timing harness.
 
 Run from an installed AITER checkout; no generated input or helper is required:
