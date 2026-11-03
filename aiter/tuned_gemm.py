@@ -109,13 +109,25 @@ class TunedGemm:
             self.apply_skinny,
         ]
 
-    @functools.lru_cache(maxsize=1024)
-    def query_sol(self, m, n, k, bias, dtype, otype, scaleAB=False):
-        if dtype == dtypes.fp16 and k % 8 == 0:
+    def query_skinny(self, m, n, k, dtype, scaleAB=False):
+        # HCU supports typed FP16/BF16 loads, small N and a guarded K tail.
+        # All supported HCU shapes use the topology-aware wvSpltK path.
+        if self.arch in ("gfx936", "gfx938", "gfx946"):
+            if dtype in (dtypes.fp16, dtypes.bf16) and not scaleAB:
+                return (3, 0) if 0 < m <= 4 and n > 0 and k > 0 and k % 8 == 0 else None
+            return None
+        if dtype == dtypes.fp16 and k % 8 == 0 and not scaleAB:
             if n > 8 and 0 < m <= 4:
                 return 3, 0
             elif n % 4 == 0 and m == 1 and k <= 8192:
                 return 3, 1
+        return None
+
+    @functools.lru_cache(maxsize=1024)
+    def query_sol(self, m, n, k, bias, dtype, otype, scaleAB=False):
+        skinny = self.query_skinny(m, n, k, dtype, scaleAB)
+        if skinny is not None:
+            return skinny
         soltype, solidx = self.solids.get(
             (m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
         )
@@ -149,6 +161,8 @@ class TunedGemm:
             ops.LLMM1(weights, inp, out, 4)
         if bias is not None:
             out += bias
+        if otype is not None:
+            out = out.to(otype)
         return out
 
     def apply_hipb_mm(
@@ -302,12 +316,6 @@ class TunedGemm:
         # F.Linear can take a 3 dimensional input. vllm
         # uses this for linear units. However, sampler
         # will use torch.matmul with 2 dimensions only
-        if self.extensions_created == False:
-            rocb_create_extension()
-            hipb_create_extension()
-            self.extensions_created = True
-            self.load_best_sols()
-            self.create_ds()
         if inp.dim() >= 3:
             try:
                 inp_view = inp.view(-1, inp.size(-1))
@@ -323,16 +331,28 @@ class TunedGemm:
         effective_otype = (
             dtypes.i32 if inp.dtype == dtypes.i8 and otype is None else otype
         )
-        soltype, solidx = self.query_sol(
-            m=m,
-            n=n,
-            k=k,
-            bias=use_bias,
-            dtype=inp.dtype,
-            otype=effective_otype if effective_otype is not None else inp.dtype,
-            scaleAB=scale_a is not None or scale_b is not None,
-        )
-        out = self.solfuncs[soltype](
+        scaleAB = scale_a is not None or scale_b is not None or scale_c is not None
+        skinny = self.query_skinny(m, n, k, inp.dtype, scaleAB)
+        if skinny is not None:
+            # This route owns its HIP kernel and does not consume any BLAS
+            # handle or tuned library solution. Do not initialize/validate
+            # unrelated libraries before executing it.
+            soltype, solidx = skinny
+            solfunc = self.apply_skinny
+        else:
+            if not self.extensions_created:
+                rocb_create_extension()
+                hipb_create_extension()
+                self.load_best_sols()
+                self.create_ds()
+                self.extensions_created = True
+            soltype, solidx = self.query_sol(
+                m=m, n=n, k=k, bias=use_bias, dtype=inp.dtype,
+                otype=effective_otype if effective_otype is not None else inp.dtype,
+                scaleAB=scaleAB,
+            )
+            solfunc = self.solfuncs[soltype]
+        out = solfunc(
             inp_view,
             weights,
             solidx,

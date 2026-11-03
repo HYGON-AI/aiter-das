@@ -6,6 +6,11 @@
 #include <stdexcept>
 #include <algorithm>
 #include "hip_compat.h"
+// module_custom enables DTK_ENV for HCU targets even when the SDK is under /opt/rocm.
+#ifdef DTK_ENV
+#include "normal_gemm_launch.h"
+#include <hip/hip_bfloat16.h>
+#endif
 
 #if defined(__HIPCC__) && (defined(__gfx90a__) || defined(__gfx940__) || \
                            defined(__gfx941__) || defined(__gfx942__))
@@ -1436,6 +1441,58 @@ __global__ void wvSpltK_hf_big_(const int K, const int N, const DTYPE *B,
 }
 #endif // defined(__HIP__MI300_MI250__) TODO: Add NAVI support
 
+#ifdef DTK_ENV
+// The framework also calls wvSpltK with BF16 and K%8==0. Keep the existing
+// aligned FP16 kernel, and provide typed loads with a guarded K tail here.
+template <typename T>
+__global__ __launch_bounds__(512) void HGEMV_HCU_Tail(
+    int rows, int k, const T* weights, const T* input, T* output)
+{
+  for (int row = blockIdx.x * 8 + threadIdx.y; row < rows; row += gridDim.x * 8)
+  {
+    float sum = 0.0f;
+    for (int base = threadIdx.x; base < k; base += 512)
+    {
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+      {
+        const int col = base + i * 64;
+        if (col < k)
+          sum = fmaf(static_cast<float>(weights[row * k + col]),
+                     static_cast<float>(input[col]), sum);
+      }
+    }
+#pragma unroll
+    for (int delta = 32; delta > 0; delta /= 2)
+      sum += __shfl_down(sum, delta, 64);
+    if (threadIdx.x == 0)
+      output[row] = static_cast<T>(sum);
+  }
+}
+
+template <typename T>
+void wv_hcu_typed(void* weight, void* input, void* output, int rows, int k,
+                  int batch, cudaStream_t stream, int cu_count)
+{
+  const int groups = std::min((rows + 7) / 8, cu_count);
+  for (int m = 0; m < batch; ++m)
+    aiter::normal_gemm_detail::launch(
+        HGEMV_HCU_Tail<T>, dim3(groups), dim3(64, 8), stream, rows, k,
+        static_cast<const T*>(weight), static_cast<const T*>(input) + m * k,
+        static_cast<T*>(output) + m * rows);
+}
+#endif
+
+void wvSpltK_bf16_(void* weight, void* input, void* output, int rows, int k,
+                   int batch, cudaStream_t stream, int cu_count)
+{
+#ifdef DTK_ENV
+  wv_hcu_typed<hip_bfloat16>(weight, input, output, rows, k, batch, stream, cu_count);
+#else
+  throw std::runtime_error("wvSpltK BF16 requires an HCU build");
+#endif
+}
+
 void wvSpltK_(void *in_a, void *in_b, void *out_c, const int M_in,
               const int K_in, const int N_in, cudaStream_t stream,
               const int CuCount = 0)
@@ -1453,13 +1510,19 @@ void wvSpltK_(void *in_a, void *in_b, void *out_c, const int M_in,
   // complete 64-lane input tile.
   if (K_in % (64 * 8) != 0)
   {
-    throw std::runtime_error("DTK wvSpltK requires K to be a multiple of 512: " +
-                             std::to_string(K_in));
+    wv_hcu_typed<_Float16>(in_a, in_b, out_c, M_in, K_in, N_in, stream, CuCount);
+    return;
   }
   for (int n = 0; n < N_in; ++n)
   {
-    LLGemmZZ(af4, const_cast<half *>(bf4 + n * K_in), c + n * M_in, M_in,
-             K_in, stream, 2);
+    // Eight wave64 rows per TG. Do not launch thousands of empty TGs for a
+    // small output. The kernel's grid-stride loop retains larger-N coverage.
+    const int groups = std::min((M_in + 7) / 8, CuCount);
+    aiter::normal_gemm_detail::launch(
+        HGEMV_WFPerRow<64, 512, 1, 8>, dim3(groups), dim3(64, 8), stream,
+        M_in, K_in, reinterpret_cast<const _Float16 *>(in_a), K_in,
+        reinterpret_cast<const _Float16 *>(bf4 + n * K_in),
+        reinterpret_cast<_Float16 *>(c + n * M_in));
   }
   return;
 #endif
