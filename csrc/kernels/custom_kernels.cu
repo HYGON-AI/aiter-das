@@ -8,7 +8,7 @@
 #include "hip_compat.h"
 // module_custom enables DTK_ENV for HCU targets even when the SDK is under /opt/rocm.
 #ifdef DTK_ENV
-#include "normal_gemm_launch.h"
+#include "hip_kernel_launch.h"
 #include <hip/hip_bfloat16.h>
 #endif
 
@@ -1476,7 +1476,7 @@ void wv_hcu_typed(void* weight, void* input, void* output, int rows, int k,
 {
   const int groups = std::min((rows + 7) / 8, cu_count);
   for (int m = 0; m < batch; ++m)
-    aiter::normal_gemm_detail::launch(
+    aiter::launch_kernel(aiter::launch_policy::normal_gemm,
         HGEMV_HCU_Tail<T>, dim3(groups), dim3(64, 8), stream, rows, k,
         static_cast<const T*>(weight), static_cast<const T*>(input) + m * k,
         static_cast<T*>(output) + m * rows);
@@ -1518,7 +1518,7 @@ void wvSpltK_(void *in_a, void *in_b, void *out_c, const int M_in,
     // Eight wave64 rows per TG. Do not launch thousands of empty TGs for a
     // small output. The kernel's grid-stride loop retains larger-N coverage.
     const int groups = std::min((M_in + 7) / 8, CuCount);
-    aiter::normal_gemm_detail::launch(
+    aiter::launch_kernel(aiter::launch_policy::normal_gemm,
         HGEMV_WFPerRow<64, 512, 1, 8>, dim3(groups), dim3(64, 8), stream,
         M_in, K_in, reinterpret_cast<const _Float16 *>(in_a), K_in,
         reinterpret_cast<const _Float16 *>(bf4 + n * K_in),

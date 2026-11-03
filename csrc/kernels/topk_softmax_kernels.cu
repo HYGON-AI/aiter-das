@@ -23,8 +23,7 @@
 #include "dispatch_utils.h"
 #include "hip_compat.h"
 #include "hip_reduce.h"
-#include "moe_topk_launch.h"
-#include "moe_sum_launch.h"
+#include "hip_kernel_launch.h"
 #include "py_itfs_common.h"
 #include "vec_convert.h"
 #include <ATen/hip/HIPContext.h>
@@ -504,7 +503,7 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
     dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
     if(need_renorm)
     {
-        aiter::moe_topk_detail::launch(
+        aiter::launch_kernel(aiter::launch_policy::moe_topk,
             topkGatingSoftmax<DTYPE, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, true>,
             dim3(num_blocks), block_dim, 0, stream, input,
                                                    finished,
@@ -520,7 +519,7 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
     }
     else
     {
-        aiter::moe_topk_detail::launch(
+        aiter::launch_kernel(aiter::launch_policy::moe_topk,
             topkGatingSoftmax<DTYPE, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, false>,
             dim3(num_blocks), block_dim, 0, stream, input,
                                                    finished,
@@ -583,10 +582,10 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
             softmax_workspace != nullptr,
             "softmax_workspace must be provided for num_experts that are not a power of 2.");
         static constexpr int TPB = 256;
-        aiter::moe_topk_detail::launch(moeSoftmax<DTYPE, TPB>,
+        aiter::launch_kernel(aiter::launch_policy::moe_topk, moeSoftmax<DTYPE, TPB>,
             dim3(num_tokens), dim3(TPB), 0, stream,
             gating_output, nullptr, softmax_workspace, num_experts);
-        aiter::moe_topk_detail::launch(moeTopK<TPB>,
+        aiter::launch_kernel(aiter::launch_policy::moe_topk, moeTopK<TPB>,
             dim3(num_tokens), dim3(TPB), 0, stream, softmax_workspace,
                                                      nullptr,
                                                      topk_weights,
@@ -709,7 +708,7 @@ void moe_sum(torch::Tensor& input,  // [num_tokens, topk, hidden_size]
     {
     case 2:
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-            aiter::moe_sum_detail::launch(vllm::moe::moe_sum_kernel<scalar_t, 2>,
+            aiter::launch_kernel(aiter::launch_policy::moe_sum, vllm::moe::moe_sum_kernel<scalar_t, 2>,
                 grid, block, 0, stream,
                 output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         });
@@ -717,7 +716,7 @@ void moe_sum(torch::Tensor& input,  // [num_tokens, topk, hidden_size]
 
     case 4:
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-            aiter::moe_sum_detail::launch(vllm::moe::moe_sum_kernel<scalar_t, 4>,
+            aiter::launch_kernel(aiter::launch_policy::moe_sum, vllm::moe::moe_sum_kernel<scalar_t, 4>,
                 grid, block, 0, stream,
                 output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         });
@@ -725,34 +724,34 @@ void moe_sum(torch::Tensor& input,  // [num_tokens, topk, hidden_size]
 
     case 5:
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-            aiter::moe_sum_detail::launch(vllm::moe::moe_sum_kernel<scalar_t, 5>,
+            aiter::launch_kernel(aiter::launch_policy::moe_sum, vllm::moe::moe_sum_kernel<scalar_t, 5>,
                 grid, block, 0, stream,
                 output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         });
         break;
     case 6:
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-            aiter::moe_sum_detail::launch(vllm::moe::moe_sum_kernel<scalar_t, 6>,
+            aiter::launch_kernel(aiter::launch_policy::moe_sum, vllm::moe::moe_sum_kernel<scalar_t, 6>,
                 grid, block, 0, stream,
                 output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         });
         break;
     case 8:
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-            aiter::moe_sum_detail::launch(vllm::moe::moe_sum_kernel<scalar_t, 8>,
+            aiter::launch_kernel(aiter::launch_policy::moe_sum, vllm::moe::moe_sum_kernel<scalar_t, 8>,
                 grid, block, 0, stream,
                 output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         });
         break;
     default:
-#if AITER_MOE_SUM_ENABLE_MULTIDIE
+#if AITER_ENABLE_MULTIDIE
         if(ck_tile::get_hip_device_info().arch_name == "gfx946" &&
            (input.scalar_type() == at::ScalarType::Float ||
             input.scalar_type() == at::ScalarType::Half ||
             input.scalar_type() == at::ScalarType::BFloat16))
         {
             VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_strided_kernel", [&] {
-                aiter::moe_sum_detail::launch(vllm::moe::moe_sum_strided_kernel<scalar_t>,
+                aiter::launch_kernel(aiter::launch_policy::moe_sum, vllm::moe::moe_sum_strided_kernel<scalar_t>,
                     grid, block, 0, stream, output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
                     topk, hidden_size, input.stride(0), input.stride(1), input.stride(2),
                     output.stride(0), output.stride(1));

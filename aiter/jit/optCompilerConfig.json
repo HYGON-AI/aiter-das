@@ -79,8 +79,7 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-DDTK_ENV' if any(a.strip() in ('gfx92a', 'gfx936', 'gfx938', 'gfx946') for a in get_gfx().split(';')) else None",
-            "'-DAITER_NORMAL_GEMM_ENABLE_MULTIDIE=1' if 'gfx946' in get_gfx().split(';') else None"
+            "'-DDTK_ENV' if any(a.strip() in ('gfx92a', 'gfx936', 'gfx938', 'gfx946') for a in get_gfx().split(';')) else None"
         ],
         "extra_ldflags": "None",
         "extra_include": [],

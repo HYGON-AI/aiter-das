@@ -12,7 +12,7 @@
  */
 
 #include "dispatch_utils.h"
-#include "moe_topk_launch.h"
+#include "hip_kernel_launch.h"
 #include "hip_reduce.h"
 #include "py_itfs_common.h"
 #include "warp_sort.h"
@@ -1177,7 +1177,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
 
 #define LAUNCHER_biased_grouped_topk_kernel(VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)      \
     VLLM_DISPATCH_FLOATING_TYPES(gating_output.scalar_type(), "biased_grouped_topk_kernel", [&] {  \
-        aiter::moe_topk_detail::launch(                                                                        \
+        aiter::launch_kernel(aiter::launch_policy::moe_topk,                                                                         \
             (aiter::                                                                               \
                  grouped_topk_kernel<scalar_t, VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax>), \
             dim3(grid),                                                                            \
@@ -1198,7 +1198,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
 
 #define LAUNCHER_grouped_topk_kernel(VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)             \
     VLLM_DISPATCH_FLOATING_TYPES(gating_output.scalar_type(), "grouped_topk_kernel", [&] {         \
-        aiter::moe_topk_detail::launch(                                                                        \
+        aiter::launch_kernel(aiter::launch_policy::moe_topk,                                                                         \
             (aiter::                                                                               \
                  grouped_topk_kernel<scalar_t, VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax>), \
             dim3(grid),                                                                            \
@@ -1221,7 +1221,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
     VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)                             \
     VLLM_DISPATCH_FLOATING_TYPES(                                                 \
         gating_output.scalar_type(), "biased_grouped_topk_opt_sort_kernel", [&] { \
-            aiter::moe_topk_detail::launch((aiter::grouped_topk_opt_sort_kernel<scalar_t,     \
+            aiter::launch_kernel(aiter::launch_policy::moe_topk, (aiter::grouped_topk_opt_sort_kernel<scalar_t,     \
                                                                     VEC_F,        \
                                                                     NUM_GRP,      \
                                                                     need_renorm,  \

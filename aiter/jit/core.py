@@ -848,21 +848,16 @@ def build_module(
                 flags_hip.append("-DCK_TILE_LAYERNORM_ENABLE_MULTIDIE=1")
             elif md_name == "module_rmsnorm":
                 flags_hip.append("-DCK_TILE_RMSNORM_ENABLE_MULTIDIE=1")
-            elif md_name == "module_quant":
-                flags_hip.append("-DAITER_QUANT_ENABLE_MULTIDIE=1")
             elif md_name == "module_cpp_api":
-                flags_hip.extend(
-                    [
-                        "-DAITER_QUANT_ENABLE_MULTIDIE=1",
-                        "-DAITER_MOE_TOPK_ENABLE_MULTIDIE=1",
-                        "-DAITER_MOE_SUM_ENABLE_MULTIDIE=1",
-                        "-DCK_TILE_MOE_SORTING_ENABLE_MULTIDIE=1",
-                    ]
-                )
-            elif md_name == "module_moe_utils":
-                flags_hip.append("-DAITER_MOE_SUM_ENABLE_MULTIDIE=1")
-            elif md_name == "module_activation":
-                flags_hip.append("-DAITER_SILU_ENABLE_MULTIDIE=1")
+                flags_hip.append("-DCK_TILE_MOE_SORTING_ENABLE_MULTIDIE=1")
+            if md_name in {
+                "module_activation",
+                "module_quant",
+                "module_cpp_api",
+                "module_moe_utils",
+                "module_custom",
+            }:
+                flags_hip.append("-DAITER_ENABLE_MULTIDIE=1")
         parallel_jobs = os.getenv("AITER_HIP_PARALLEL_JOBS")
         if parallel_jobs is not None:
             if not parallel_jobs.isdigit() or int(parallel_jobs) < 1:

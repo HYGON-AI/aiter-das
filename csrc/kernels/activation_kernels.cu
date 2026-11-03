@@ -33,7 +33,7 @@
 #include "hip_compat.h"
 #include "py_itfs_common.h"
 #include "vec_convert.h"
-#include "silu_and_mul_launch.h"
+#include "hip_kernel_launch.h"
 
 using fp8_type = ck_tile::fp8_t;
 
@@ -389,10 +389,10 @@ void silu_and_mul(torch::Tensor& out,   // [..., d]
         auto* source = reinterpret_cast<const T*>(input.data_ptr());
         AITER_DISPATCH_CASE_VEC_SIZE(vec,
             if(limit > 0)
-                silu_detail::launch(silu_and_mul_kernel<T, VEC_SIZE, true>,
+                launch_kernel(aiter::launch_policy::silu, silu_and_mul_kernel<T, VEC_SIZE, true>,
                                     grid, block, stream, output, source, d, limit);
             else
-                silu_detail::launch(silu_and_mul_kernel<T, VEC_SIZE, false>,
+                launch_kernel(aiter::launch_policy::silu, silu_and_mul_kernel<T, VEC_SIZE, false>,
                                     grid, block, stream, output, source, d, limit);)
     });
 }

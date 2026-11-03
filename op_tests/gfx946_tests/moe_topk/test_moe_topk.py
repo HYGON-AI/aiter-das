@@ -138,7 +138,8 @@ def run_case(c, dtype_name, non_default_stream=False):
     token_indices = token_base[1:-1].reshape(m,k)
     hidden = torch.empty((m,1), dtype=dtype, device='cuda')
     stream = torch.cuda.Stream() if non_default_stream else torch.cuda.current_stream()
-    stream.wait_stream(torch.cuda.current_stream())
+    if non_default_stream:
+        stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         if op == 'topk_softmax':
             aiter.topk_softmax(weights, ids, token_indices, x, c['renorm'])

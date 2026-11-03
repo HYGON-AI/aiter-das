@@ -25,7 +25,7 @@
 #include "dispatch_utils.h"
 #include "hip_reduce.h"
 #include "quant_common.cuh"
-#include "quant_launch.h"
+#include "hip_kernel_launch.h"
 #include "rocprim/rocprim.hpp"
 #include "vec_convert.h"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
@@ -985,7 +985,7 @@ void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
     {
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
             using input_dtype = typename t2ck<scalar_t>::type;
-            quant_detail::launch(aiter::scaled_quant_kernel<input_dtype, ck_tile::int8_t>, grid, block, stream,
+            launch_kernel(aiter::launch_policy::quant, aiter::scaled_quant_kernel<input_dtype, ck_tile::int8_t>, grid, block, stream,
                 reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 scale.data_ptr<float>(),
@@ -997,7 +997,7 @@ void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
     {
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
             using input_dtype = typename t2ck<scalar_t>::type;
-            quant_detail::launch(aiter::scaled_quant_kernel<input_dtype, FP8_TYPE>, grid, block, stream,
+            launch_kernel(aiter::launch_policy::quant, aiter::scaled_quant_kernel<input_dtype, FP8_TYPE>, grid, block, stream,
                 reinterpret_cast<FP8_TYPE*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 scale.data_ptr<float>(),
@@ -1021,7 +1021,7 @@ void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
                 scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,                  \
                 cols, num_rows_ptr, num_rows_factor);                                           \
         else                                                                                   \
-            quant_detail::launch(aiter::quant_kernel<input_dtype, DTYPE_O, THREAD_DATA>,       \
+            launch_kernel(aiter::launch_policy::quant, aiter::quant_kernel<input_dtype, DTYPE_O, THREAD_DATA>,       \
                 grid, block, stream, reinterpret_cast<DTYPE_O*>(out.data_ptr()),                \
                 scales.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()),    \
                 scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,                  \
@@ -1070,11 +1070,11 @@ void dynamic_per_tensor_quant(torch::Tensor& out,         // [..., d]
             using input_dtype = typename t2ck<scalar_t>::type;
             vllm::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
                 scale.data_ptr<float>(), 1, 0.0f);
-            quant_detail::launch(aiter::data_to_scale_kernel<input_dtype, ck_tile::int8_t>, grid, block, stream,
+            launch_kernel(aiter::launch_policy::quant, aiter::data_to_scale_kernel<input_dtype, ck_tile::int8_t>, grid, block, stream,
                 scale.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
-            quant_detail::launch(aiter::finalize_tensor_scale<ck_tile::int8_t>,
+            launch_kernel(aiter::launch_policy::quant, aiter::finalize_tensor_scale<ck_tile::int8_t>,
                                  dim3(1), dim3(64), stream, scale.data_ptr<float>());
-            quant_detail::launch(aiter::scaled_quant_kernel<input_dtype, ck_tile::int8_t>, grid, block, stream,
+            launch_kernel(aiter::launch_policy::quant, aiter::scaled_quant_kernel<input_dtype, ck_tile::int8_t>, grid, block, stream,
                 reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 scale.data_ptr<float>(),
@@ -1088,11 +1088,11 @@ void dynamic_per_tensor_quant(torch::Tensor& out,         // [..., d]
             using input_dtype = typename t2ck<scalar_t>::type;
             vllm::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
                 scale.data_ptr<float>(), 1, 0.0f);
-            quant_detail::launch(aiter::data_to_scale_kernel<input_dtype, FP8_TYPE>, grid, block, stream,
+            launch_kernel(aiter::launch_policy::quant, aiter::data_to_scale_kernel<input_dtype, FP8_TYPE>, grid, block, stream,
                 scale.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
-            quant_detail::launch(aiter::finalize_tensor_scale<FP8_TYPE>,
+            launch_kernel(aiter::launch_policy::quant, aiter::finalize_tensor_scale<FP8_TYPE>,
                                  dim3(1), dim3(64), stream, scale.data_ptr<float>());
-            quant_detail::launch(aiter::scaled_quant_kernel<input_dtype, FP8_TYPE>, grid, block, stream,
+            launch_kernel(aiter::launch_policy::quant, aiter::scaled_quant_kernel<input_dtype, FP8_TYPE>, grid, block, stream,
                 reinterpret_cast<FP8_TYPE*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 scale.data_ptr<float>(),
@@ -1144,7 +1144,7 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
     bool use_safe = cols % vector_width != 0 ||
                     reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 != 0 ||
                     reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 != 0;
-#if AITER_QUANT_ENABLE_MULTIDIE
+#if AITER_ENABLE_MULTIDIE
     // The existing vector INT8 paths fail the gfx946 PMD byte-packing
     // reference test; FP8 also differs at some FP32 rounding midpoints.
     // Use the bounded conversion with the same scale order as tensor quant.
@@ -1158,13 +1158,13 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_safe", [&] {
             using input_dtype = typename t2ck<scalar_t>::type;
             if(out.scalar_type() == torch::kInt8)
-                quant_detail::launch(dynamic_per_token_scaled_quant_safe_kernel<input_dtype, ck_tile::int8_t>,
+                launch_kernel(aiter::launch_policy::quant, dynamic_per_token_scaled_quant_safe_kernel<input_dtype, ck_tile::int8_t>,
                     dim3(rows), dim3(BlockSize), stream,
                     reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()), scales.data_ptr<float>(),
                     reinterpret_cast<const input_dtype*>(input.data_ptr()), cols, num_rows_ptr, num_rows_factor);
 #ifdef GPU_ENABLE_FP8
             else
-                quant_detail::launch(dynamic_per_token_scaled_quant_safe_kernel<input_dtype, FP8_TYPE>,
+                launch_kernel(aiter::launch_policy::quant, dynamic_per_token_scaled_quant_safe_kernel<input_dtype, FP8_TYPE>,
                     dim3(rows), dim3(BlockSize), stream,
                     reinterpret_cast<FP8_TYPE*>(out.data_ptr()), scales.data_ptr<float>(),
                     reinterpret_cast<const input_dtype*>(input.data_ptr()), cols, num_rows_ptr, num_rows_factor);
@@ -1176,7 +1176,7 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
     if(cols == 640 && rows >= 512 && input.scalar_type() == torch::kBFloat16 &&
        out.scalar_type() == torch::kInt8)
     {
-        quant_detail::launch(aiter::dynamic_per_token_int8_quant_wave_kernel<ck_tile::bf16_t, 640>,
+        launch_kernel(aiter::launch_policy::quant, aiter::dynamic_per_token_int8_quant_wave_kernel<ck_tile::bf16_t, 640>,
             dim3((rows + 3) / 4), dim3(128), stream,
                 reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()),
                 scales.data_ptr<float>(),
@@ -1347,7 +1347,7 @@ void dynamic_per_group_scaled_quant(torch::Tensor& out,
             const auto kernel = e8m0_scale
                 ? dynamic_per_group_scaled_quant_kernel<input_dtype, output_dtype, 32, true>
                 : dynamic_per_group_scaled_quant_kernel<input_dtype, output_dtype, 32, false>;
-            quant_detail::launch(kernel,
+            launch_kernel(aiter::launch_policy::quant, kernel,
                 grid, block, stream, output, reinterpret_cast<float*>(scales.data_ptr()),
                 reinterpret_cast<const input_dtype*>(input.data_ptr()),
                 scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
@@ -1420,7 +1420,7 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
     AITER_DISPATCH_FLOATING16_TYPES(
         input.scalar_type(), "dynamic_per_group_scaled_quant_kernel", [&] {
             using input_dtype = typename t2ck<scalar_t>::type;
-            quant_detail::launch(aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, ck_tile::fp4x2_t>,
+            launch_kernel(aiter::launch_policy::quant, aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, ck_tile::fp4x2_t>,
                 grid, block, stream,
                 reinterpret_cast<ck_tile::fp4x2_t*>(out.data_ptr()),
                 reinterpret_cast<float*>(scales.data_ptr()),
