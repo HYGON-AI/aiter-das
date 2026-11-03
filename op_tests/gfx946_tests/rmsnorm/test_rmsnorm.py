@@ -40,6 +40,9 @@ ENV = ('CK_TILE_RMSNORM_DIE_MODE', 'CK_TILE_RMSNORM_DIE_CHUNK',
 WIDTHS = (10, 64, 126, 128, 256, 512, 640, 768, 1024, 1152,
           1536, 2048, 3071, 3072, 4094, 4096, 6143, 6144, 8190, 8192,
           8193, 8194, 8204, 8200)
+# Fixed matrix widths whose selected CK tile has an even thread buffer.
+# Physical gfx936/gfx938 use cast_tile_pk_fp16_fp32's explicit RTZ conversion.
+FP16_PACKED_CAST_WIDTHS = frozenset(WIDTHS) - {10, 3071}
 
 
 @contextmanager
@@ -123,13 +126,23 @@ def cases(suite):
     return []
 
 
-def reference(x, residual, weight, epsilon, fused):
+def fp16_rtz(value):
+    """Independent CPU round-toward-zero conversion for finite FP32 values."""
+    nearest = value.half()
+    overshoot = nearest.float().abs() > value.abs()
+    bits = nearest.view(torch.int16).clone()
+    # For either sign, decrementing the FP16 encoding steps toward zero.
+    bits[overshoot] -= 1
+    return bits.view(torch.float16)
+
+
+def reference(x, residual, weight, epsilon, fused, residual_rtz=False):
     if not fused:
         value = x.float()
         ref = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + epsilon) * weight.float()
         return ref, None
     value = x.float() + residual.float()
-    stored = value.to(x.dtype)
+    stored = fp16_rtz(value) if residual_rtz else value.to(x.dtype)
     if x.dtype == torch.bfloat16:
         # Existing CK PRE_ADD_STORE rounds the sum, normalized value and product.
         value = stored.float()
@@ -156,7 +169,10 @@ def run_case(aiter, name, c):
         x = (x.float() * 1e-4).to(dtype)
         residual = (residual.float() * 1e-4).to(dtype)
     fused = c['op'] == OPS[2]
-    ref, ref_residual = reference(x, residual, weight, c['epsilon'], fused)
+    arch = torch.cuda.get_device_properties(0).gcnArchName.split(':')[0]
+    residual_rtz = (fused and dtype == torch.float16 and arch in ('gfx936', 'gfx938')
+                    and n in FP16_PACKED_CAST_WIDTHS)
+    ref, ref_residual = reference(x, residual, weight, c['epsilon'], fused, residual_rtz)
     dx, dw = x.cuda(), weight.cuda()
     dr = residual.cuda() if fused else None
     with config(c['mode'], c['chunk']):
@@ -186,13 +202,14 @@ def run_case(aiter, name, c):
         if not c['inplace']:
             assert torch.equal(dr.cpu(), residual), 'residual_in modified'
     return dict(max_abs_error=float(error.max()), max_tolerance_ratio=float((error/limit).max()),
-                residual_exact=fused)
+                residual_exact=fused,
+                residual_rounding=('rtz' if residual_rtz else 'rne') if fused else None)
 
 
 def invalid_cases(aiter, single=False):
     x = torch.ones(1, 128, dtype=torch.bfloat16).cuda()
     weight = torch.ones(128, dtype=torch.bfloat16).cuda()
-    configs = [('linear', 1, 0, 'at least 2 XCDs')] if single else [
+    configs = [('linear', 1, 0, 'at least 2 reported XCDs')] if single else [
         ('bad', 1, 0, 'DIE_MODE'), ('linear', 0, 0, 'DIE_CHUNK'),
         ('linear', -1, 0, 'DIE_CHUNK'), ('linear', 'abc', 0, 'DIE_CHUNK'),
         ('linear', 1, 1, 'DIE_MASK'), ('linear', 1, 2, 'DIE_MASK')]

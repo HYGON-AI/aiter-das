@@ -178,7 +178,7 @@ torch::Tensor gemm_a8w8_blockscale(
     E8M0ScaleArgs args{ x_scale.data_ptr<uint8_t>(), w_scale.data_ptr<uint8_t>(),
                        decoded_a.data_ptr<float>(), decoded_b.data_ptr<float>(),
                        static_cast<int>(x_scale.numel()), static_cast<int>(w_scale.numel()) };
-    ck::launch_and_time_w8a8_kernel(
+    ck::launch_and_time_multidie_kernel(ck::launch_policy::w8a8,
         StreamConfig{at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream()},
         w8a8_decode_e8m0_scales, dim3((args.a_size + args.b_size + 255) / 256), dim3(256), 0, args);
     if (Y.dtype() == at::ScalarType::Half)

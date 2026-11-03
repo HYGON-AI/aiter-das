@@ -1,6 +1,6 @@
 # gfx946 RMSNorm 测试
 
-这两个测试脚本可随仓库直接运行，默认不依赖临时目录、历史 JSON、构建辅助脚本或专用 JIT 缓存。`test_rmsnorm_dynamicquant.py` 导入同目录 `test_rmsnorm.py` 中的环境设置及拓扑查询函数，因此应一同保留两个文件。每个数值用例只调用一次被测算子，没有 warmup 或性能循环。
+这两个测试脚本可随仓库直接运行，默认不依赖临时目录、历史 JSON、构建辅助脚本或专用 JIT 缓存。`test_rmsnorm_dynamicquant.py` 导入同目录 `test_rmsnorm.py` 中的环境设置、拓扑查询及 CPU FP16 舍入参考函数，因此应一同保留两个文件。每个数值用例只调用一次被测算子，没有 warmup 或性能循环。
 
 前提：配置好的 PyTorch/HIP（Perf Model 还需 PMD）、当前 AITER Python 源码及依赖。首次构建还需要 HIP 编译器、Ninja，以及与当前算子实现匹配的完整 `3rdparty/composable_kernel` 子模块。仅复制测试脚本不能替代算子适配源码。
 
@@ -65,6 +65,17 @@ python "$TEST/test_rmsnorm_dynamicquant.py" --ops rmsnorm2d_fwd_with_add_dynamic
 以上是默认 dtype 下的用例数。将 `SUITE=full` 后执行同样五条命令，可在选定拓扑下覆盖宽度分桶、尾部、零/小值、残差原地写回等完整矩阵，共 266 例。Perf Model 使用 CPU 模拟，通常先运行 quick/multi 即可。`--json` 可省略；结束时应打印 `RESULT PASS N cases`，JSON 的 `complete` 应为 `true`，每个 case 为 `PASS`。
 
 ## 补充检查
+
+gfx936/gfx938 真机可运行普通模式的 `quick`、`full` 数值回归。gfx936 不支持这里的 FP8 输出，应显式选择 INT8：
+
+```bash
+python "$TEST/test_rmsnorm.py" --suite full --require-arch gfx936
+python "$TEST/test_rmsnorm_dynamicquant.py" --suite full --require-arch gfx936 --qdtypes int8
+python "$TEST/test_rmsnorm.py" --suite full --require-arch gfx938
+python "$TEST/test_rmsnorm_dynamicquant.py" --suite full --require-arch gfx938
+```
+
+物理 gfx936/gfx938 的固定测试矩阵中，偶数 thread buffer 的 FP16 fused residual 路径使用 CK 的 packed RTZ 转换。CPU 参考按这一已核对的语义检查残差精确值，结果记录 `residual_rounding`；其他路径保留原参考。此选择仅描述测试覆盖的宽度及环境，不作为任意新形状的舍入规则。
 
 单 die 显式 linear 应被拒绝：
 

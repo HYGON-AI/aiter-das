@@ -28,9 +28,10 @@ FP16残差参考匹配当前CK实例：gfx938的偶数线程缓冲区使用packe
     选择一个或两个公开入口，默认两个都测试；也作用于拒绝测试，例数相应减少。
   --qdtypes {int8,fp8} [...]
     量化输出dtype，可选一个或多个；默认int8 fp8。fp8指torch.float8_e4m3fn。
-  --require-arch {gfx946,gfx938}
-    要求实际设备架构与此值一致，默认gfx946。gfx938仅支持quick/full数值集合，
+  --require-arch {gfx946,gfx938,gfx936}
+    要求实际设备架构与此值一致，默认gfx946。真机仅支持quick/full数值集合，
     不查询gfx946专用XCD拓扑，也不宣称验证了多die路由。
+    gfx936须同时指定--qdtypes int8。
   --expect-xcds N
     校验HSA拓扑恰为一个设备、N个XCD；仅用于gfx946，未指定则不做此额外断言。
     只检查拓扑，不设置die数；PMD的1/2/4 XCD由启动前的GPU_CHIP=sb/sbx2/sbx4选择。
@@ -65,7 +66,7 @@ import os
 from pathlib import Path
 
 import torch
-from test_rmsnorm import config, query_xcds
+from test_rmsnorm import config, query_xcds, fp16_rtz
 
 DTYPES = {'bf16': torch.bfloat16, 'fp16': torch.float16}
 QTYPES = {'int8': torch.int8, 'fp8': torch.float8_e4m3fn}
@@ -103,16 +104,6 @@ def cases(suite):
     return []
 
 
-def fp16_rtz(value):
-    """Independent CPU round-toward-zero conversion; keep an exact FP16 result."""
-    nearest = value.half()
-    overshoot = nearest.float().abs() > value.abs()
-    bits = nearest.view(torch.int16).clone()
-    # For either sign, subtracting one from the FP16 encoding steps toward zero.
-    bits[overshoot] -= 1
-    return bits.view(torch.float16)
-
-
 def reference(x, residual, weight, eps, residual_rtz=False):
     value = x.float() if residual is None else x.float() + residual.float()
     # Dynamic quant keeps FP32 intermediates even for BF16 fused residuals.
@@ -148,7 +139,8 @@ def run_case(aiter, dtype_name, qname, c):
         residual = (residual.float() * 1e-4).to(dtype)
     fused = c['op'] == OPS[1]
     arch = torch.cuda.get_device_properties(0).gcnArchName.split(':')[0]
-    residual_rtz = fused and dtype == torch.float16 and arch == 'gfx938' and n in FP16_PACKED_CAST_WIDTHS
+    residual_rtz = (fused and dtype == torch.float16 and arch in ('gfx936', 'gfx938')
+                    and n in FP16_PACKED_CAST_WIDTHS)
     ref, ref_residual = reference(x, residual if fused else None, weight, c['epsilon'], residual_rtz)
     qmax = 127 if qname == 'int8' else 448
     ref_scale = ref.abs().amax(-1, keepdim=True) / qmax
@@ -199,7 +191,7 @@ def rejections(aiter, single=False, ops=OPS):
     q = torch.empty_like(x, dtype=torch.int8)
     s = torch.empty((17, 1), dtype=torch.float32, device=x.device)
     r = torch.empty_like(x)
-    tests = [('single-linear', 'linear', 1, 0, 'at least 2 XCDs')] if single else [
+    tests = [('single-linear', 'linear', 1, 0, 'at least 2 reported XCDs')] if single else [
         ('mode', 'bad', 1, 0, 'DIE_MODE'), ('chunk0', 'linear', 0, 0, 'DIE_CHUNK'),
         ('chunk-text', 'linear', 'abc', 0, 'DIE_CHUNK'), ('mask', 'linear', 1, 1, 'DIE_MASK')]
     for op in ops:
@@ -242,8 +234,8 @@ def main():
                         help='输入/weight dtype，可多选（默认：bf16 fp16；拒绝测试忽略此项）')
     parser.add_argument('--qdtypes', nargs='+', choices=QTYPES, default=list(QTYPES),
                         help='量化输出dtype，fp8为E4M3FN（默认：int8 fp8；拒绝测试忽略此项）')
-    parser.add_argument('--require-arch', choices=('gfx946','gfx938'), default='gfx946',
-                        help='要求实际架构匹配；gfx938仅支持quick/full（默认：gfx946）')
+    parser.add_argument('--require-arch', choices=('gfx946','gfx938','gfx936'), default='gfx946',
+                        help='要求实际架构匹配；真机仅支持quick/full，gfx936须选int8（默认：gfx946）')
     parser.add_argument('--expect-xcds', type=int,
                         help='断言一个设备上有N个XCD；不改变拓扑（默认：不额外断言）')
     parser.add_argument('--json', type=Path,
@@ -254,7 +246,9 @@ def main():
                         help='测试前用当前AITER/CK源码重建共享的module_rmsnorm（默认：缺失时才构建）')
     args = parser.parse_args()
     if args.require_arch != 'gfx946' and (args.suite not in ('quick','full') or args.expect_xcds is not None):
-        parser.error('gfx938 only supports quick/full without --expect-xcds')
+        parser.error('physical HCU tests only support quick/full without --expect-xcds')
+    if args.require_arch == 'gfx936' and 'fp8' in args.qdtypes:
+        parser.error('gfx936 requires --qdtypes int8')
     torch.set_num_threads(1)
     props = torch.cuda.get_device_properties(0)
     assert props.gcnArchName.split(':')[0] == args.require_arch, props

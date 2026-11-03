@@ -7,8 +7,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DAITER_W8A8_HCU=1'",
-            "'-DCK_W8A8_NATIVE_I8_X32=1'",
-            "'-DCK_W8A8_ENABLE_MULTIDIE=1' if 'gfx946' in get_gfx().split(';') else None"
+            "'-DCK_W8A8_NATIVE_I8_X32=1'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -24,8 +23,7 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-DAITER_W8A8_HCU=1'",
-            "'-DCK_W8A8_ENABLE_MULTIDIE=1' if 'gfx946' in get_gfx().split(';') else None"
+            "'-DAITER_W8A8_HCU=1'"
         ],
         "extra_ldflags": "None",
         "extra_include": [

@@ -844,12 +844,14 @@ def build_module(
         # gfx946 builds require its HIP multi-die SDK. Compile both launch paths;
         # the selected device's runtime topology decides which one to use.
         if "gfx946" in archs:
-            if md_name == "module_norm":
-                flags_hip.append("-DCK_TILE_LAYERNORM_ENABLE_MULTIDIE=1")
-            elif md_name == "module_rmsnorm":
-                flags_hip.append("-DCK_TILE_RMSNORM_ENABLE_MULTIDIE=1")
-            elif md_name == "module_cpp_api":
-                flags_hip.append("-DCK_TILE_MOE_SORTING_ENABLE_MULTIDIE=1")
+            if md_name in {
+                "module_norm",
+                "module_rmsnorm",
+                "module_cpp_api",
+                "module_gemm_a8w8",
+                "module_gemm_a8w8_blockscale",
+            }:
+                flags_hip.append("-DCK_ENABLE_MULTIDIE=1")
             if md_name in {
                 "module_activation",
                 "module_quant",
