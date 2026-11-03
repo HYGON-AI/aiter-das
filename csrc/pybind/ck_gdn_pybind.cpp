@@ -75,6 +75,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("a_log")        = std::nullopt,
           py::arg("dt_bias")      = std::nullopt,
           py::arg("initial_state") = std::nullopt,
+          py::arg("initial_state_indices") = std::nullopt,
           py::arg("cu_seqlens")   = std::nullopt,
           py::arg("scale")        = std::nullopt,
           py::arg("use_g")        = true,

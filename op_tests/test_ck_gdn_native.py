@@ -24,6 +24,9 @@ pre-build it with ``PREBUILD_KERNELS=1`` or a dummy call before benchmarking.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
 import torch
 
@@ -299,3 +302,165 @@ def test_ck_decode_matches_hipc_and_triton(dtype_name, heads, value_heads):
     _assert_close(ck_final, refs["triton"][1], "CK vs Triton final state", rtol, atol)
     _assert_close(ck_out, refs["hipc"][0], "CK vs HIPC output", rtol, atol)
     _assert_close(ck_final, refs["hipc"][1], "CK vs HIPC final state", rtol, atol)
+
+
+# --------------------------------------------------------------------------- #
+# 3b. paged state pool: block-table indexing must match a gathered dense call
+# --------------------------------------------------------------------------- #
+def _ck_decode(data, state, batch, scale, indices=None):
+    return aiter.ck_gdn_decode(
+        data["q"],
+        data["k"],
+        data["v"],
+        data["a"],
+        torch.sigmoid(data["b"]),
+        a_log=data["a_log"],
+        dt_bias=data["dt_bias"],
+        initial_state=state,
+        initial_state_indices=indices,
+        cu_seqlens=torch.arange(batch + 1, dtype=torch.int64, device="cuda"),
+        scale=scale,
+        use_g=True,
+        gate_in_kernel=True,
+        has_dt_bias=True,
+        transpose_state=True,
+        store_final_state=True,
+    )
+
+
+@pytest.mark.parametrize("with_null", [False, True])
+def test_ck_decode_paged_state_matches_dense(with_null):
+    """`initial_state_indices` must reproduce gather + dense call bit for bit."""
+    batch, heads, value_heads, pool_size = 6, 2, 8, 9
+    scale = HEAD_DIM ** -0.5
+    data = _packed_decode_inputs(torch.bfloat16, batch, heads, value_heads, pool_size)
+    pool = data["state_pool"]
+    # slots 1..batch, shuffled; slot 0 stays the framework's NULL_BLOCK_ID
+    idx = (torch.randperm(batch, device="cuda") + 1).to(torch.int32)
+    if with_null:
+        idx[0] = 0
+
+    # reference: gather the slots the framework would have used, zero the rows
+    # that have no slot, and run the dense entry
+    dense_in = pool.index_select(0, idx.clamp(min=0).long()).contiguous()
+    dense_in[idx <= 0] = 0
+    out_dense, state_dense = _ck_decode(data, dense_in, batch, scale)
+
+    pool_paged = pool.clone()
+    out_paged, state_paged = _ck_decode(
+        data, pool_paged, batch, scale, indices=idx
+    )
+    torch.cuda.synchronize()
+
+    assert state_paged.data_ptr() == pool_paged.data_ptr(), (
+        "paged mode must write the pool in place"
+    )
+    assert torch.equal(out_paged, out_dense), "paged output differs from dense"
+    for i in range(batch):
+        slot = int(idx[i])
+        if slot > 0:
+            assert torch.equal(pool_paged[slot], state_dense[i]), (
+                f"slot {slot} differs from the dense final state"
+            )
+        else:
+            assert torch.equal(pool_paged[0], pool[0]), "NULL_BLOCK_ID row wrote a slot"
+    used = {int(t) for t in idx if int(t) > 0}
+    for slot in range(pool_size):
+        if slot not in used:
+            assert torch.equal(pool_paged[slot], pool[slot]), (
+                f"untouched slot {slot} was modified"
+            )
+
+
+# --------------------------------------------------------------------------- #
+# 4. memory safety: a partial tail chunk must not load q past its end
+# --------------------------------------------------------------------------- #
+# The output stage loads a full row tile of q.  When the last chunk of the last
+# sequence holds fewer than CHUNK tokens, the surplus rows sit past the end of
+# `q`.  The read only turns into a VMFault when the bytes after `q` are
+# unmapped, so a plain numeric test can never see it -- and a regression aborts
+# the process, which cannot be caught in-process.  The probe below therefore runs
+# in a subprocess and pins the layout itself.
+_TAIL_PROBE = r'''
+import ctypes
+import sys
+
+import torch
+import aiter
+
+H, HV, D = 16, 48, 128
+MB2 = 2 << 20
+TOKEN_BYTES = H * D * 2
+LENS = [2000, 49]          # last chunk holds 49 tokens -> partial
+T = sum(LENS)
+dev = "cuda"
+
+
+def unmapped(addr):
+    """500 means `addr` belongs to no HIP allocation, i.e. the first over-read faults."""
+    hip = ctypes.CDLL("libamdhip64.so")
+    base, size = ctypes.c_void_p(), ctypes.c_size_t()
+    return hip.hipMemGetAddressRange(
+        ctypes.byref(base), ctypes.byref(size), ctypes.c_void_p(addr)) == 500
+
+
+cu = torch.tensor([0] + torch.tensor(LENS).cumsum(0).tolist(),
+                  dtype=torch.int64, device=dev)
+g = -torch.rand(T, HV, dtype=torch.float32, device=dev) * 0.5
+beta = torch.rand(T, HV, dtype=torch.float32, device=dev)
+v = torch.randn(T, HV, D, dtype=torch.bfloat16, device=dev) * 0.5
+k = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+flags = dict(use_g=True, use_exp2=False, transpose_state=True,
+             output_final_state=True)
+
+q_elems = T * H * D
+ranges = []                     # live allocations that stay mapped
+
+
+def reserve(t):
+    ranges.append((t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()))
+    return t
+
+
+probe = torch.empty(T, H, D, dtype=torch.bfloat16, device=dev)
+ws_bytes = aiter.ck_gdn_prefill_workspace_bytes(probe, v, cu_seqlens=cu, **flags)
+del probe
+ws_keep = reserve(torch.empty(ws_bytes, dtype=torch.uint8, device=dev))
+out_probe = reserve(torch.empty(T, HV, D, dtype=torch.bfloat16, device=dev))
+fs_probe = reserve(torch.empty(len(LENS), HV, D, D, dtype=torch.float32, device=dev))
+
+base = ((q_elems * 2 + MB2 - 1) // MB2) * MB2
+for extra in range(8):
+    torch.cuda.empty_cache()
+    slab = torch.empty((base + extra * MB2) // 2, dtype=torch.bfloat16, device=dev)
+    q_end = slab.data_ptr() + slab.numel() * 2
+    if unmapped(q_end) and not any(a <= q_end < b for a, b in ranges):
+        break
+    del slab
+else:
+    print("SKIP could not expose q_end")
+    sys.exit(0)
+
+q = slab.narrow(0, slab.numel() - q_elems, q_elems).view(T, H, D)
+q.normal_()
+# Hand the probe blocks back so the op reuses them instead of mapping fresh
+# memory right behind q_end.  The workspace is passed explicitly: letting the
+# op allocate its own would map ~150 MiB that can hide the over-read.
+del out_probe, fs_probe
+aiter.ck_gdn_prefill(q, k, v, g, beta, workspace=ws_keep, cu_seqlens=cu, **flags)
+torch.cuda.synchronize()
+print("OK")
+'''
+
+
+def test_prefill_partial_tail_does_not_read_past_q():
+    proc = subprocess.run(
+        [sys.executable, "-c", _TAIL_PROBE], capture_output=True, text=True
+    )
+    if "SKIP" in proc.stdout:
+        pytest.skip("could not expose q_end on this device")
+    assert proc.returncode == 0, (
+        "ck_gdn_prefill with a partial last chunk crashed "
+        f"(rc={proc.returncode}):\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
+    )
+    assert "OK" in proc.stdout

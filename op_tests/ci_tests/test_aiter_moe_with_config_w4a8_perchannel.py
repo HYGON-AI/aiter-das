@@ -609,8 +609,8 @@ def pack_weight_k_contiguous(weight):
 
 
 def pack_weight_k_for_aiter_triton(weight):
-    # Match aiter Triton w4a8 channelwise kernel layout:
-    # even-k nibble in low 4 bits, odd-k nibble in high 4 bits.
+    # Match aiter Triton w4a8 channelwise kernel layout (same as
+    # pack_weight_k_contiguous): even-k nibble in high 4 bits, odd-k nibble in low 4 bits.
     E, n2, k2 = weight.shape
     assert k2 % 2 == 0, "K 维度必须是偶数才能成对打包"
 
@@ -618,7 +618,7 @@ def pack_weight_k_for_aiter_triton(weight):
     w_reshaped = w_unsigned.view(E, n2, k2 // 2, 2)
     w_even = w_reshaped[..., 0]
     w_odd = w_reshaped[..., 1]
-    packed_weight = (w_odd << 4) | w_even
+    packed_weight = (w_even << 4) | w_odd
     return packed_weight.contiguous()
 
 def prepare_w4a8_inputs(m, k, n, E, topk,  out_dtype, device: str = "cuda", per_channel_quant: bool = True):
@@ -767,7 +767,7 @@ def test_aiter_moe_w8a8(m, k, n, e, topk,  dtype):
         "Non-finite output in test_aiter_moe_w4a8_perchannel (triton): "
         f"{m=}, {k=}, {n=}, {e=}, {topk=}, {dtype=}"
     )
-    triton_check_ret = checkAllclose(ref_out, aiter_triton_out, rtol=0.01, atol=100, msg=msg)
+    triton_check_ret = checkAllclose(ref_out, aiter_triton_out, rtol=0.01, atol=0.2, msg=msg)
     assert triton_check_ret <= 0.03, (
         "Accuracy check failed in test_aiter_moe_w4a8_perchannel (triton): "
         f"{m=}, {k=}, {n=}, {e=}, {topk=}, {dtype=}, "

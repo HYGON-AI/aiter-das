@@ -71,6 +71,7 @@ std::vector<torch::Tensor> decode(const torch::Tensor& q,
                                   const std::optional<torch::Tensor>& a_log,
                                   const std::optional<torch::Tensor>& dt_bias,
                                   const std::optional<torch::Tensor>& initial_state,
+                                  const std::optional<torch::Tensor>& initial_state_indices,
                                   const std::optional<torch::Tensor>& cu_seqlens,
                                   const std::optional<double>& scale,
                                   bool use_g,
@@ -152,7 +153,47 @@ std::vector<torch::Tensor> decode(const torch::Tensor& q,
     TORCH_CHECK(!has_dt_bias || gate_in_kernel,
                 "has_dt_bias is only meaningful together with gate_in_kernel");
 
-    if(initial_state.has_value())
+    // Paged state: `initial_state` is a slot pool addressed through a block
+    // table. The kernel resolves each sequence's slot itself, which removes the
+    // gather/scatter the framework would otherwise do around this call.
+    const bool pooled_state = initial_state_indices.has_value();
+    torch::Tensor pooled_indices; // keeps an int64 copy alive for the launch
+    if(pooled_state)
+    {
+        TORCH_CHECK(initial_state.has_value(),
+                    "initial_state (the state pool) is required together with "
+                    "initial_state_indices");
+        TORCH_CHECK(store_final_state,
+                    "initial_state_indices requires store_final_state: the pool is "
+                    "updated in place");
+        const auto& pool = *initial_state;
+        TORCH_CHECK(pool.is_cuda() && pool.dim() == 4 &&
+                        pool.scalar_type() == at::kFloat,
+                    "a paged initial_state must be a float32 device tensor "
+                    "[slots, h_v, 128, 128]");
+        // Only the inner three dims have to be dense; the framework is free to
+        // pad the distance between two slots.
+        TORCH_CHECK(pool.stride(3) == 1 && pool.stride(2) == pool.size(3) &&
+                        pool.stride(1) == pool.size(2) * pool.size(3),
+                    "a paged initial_state must keep each [h_v, 128, 128] slot dense");
+        TORCH_CHECK(pool.size(1) == h_v && pool.size(2) == kHeadDimCk &&
+                        pool.size(3) == kHeadDimCk,
+                    "a paged initial_state must be [slots, h_v, 128, 128]");
+
+        const auto& indices = *initial_state_indices;
+        TORCH_CHECK(indices.is_cuda() && indices.dim() == 1 &&
+                        indices.numel() >= sequences,
+                    "initial_state_indices must be a 1D device tensor with one entry "
+                    "per sequence");
+        TORCH_CHECK(indices.scalar_type() == at::kInt || indices.scalar_type() == at::kLong,
+                    "initial_state_indices must be int32 or int64");
+        // The kernel reads int64 and the table is a handful of entries, so a
+        // dtype fixup costs nothing and keeps one code path on device.
+        pooled_indices = indices.scalar_type() == at::kLong
+                             ? indices.contiguous()
+                             : indices.to(at::kLong).contiguous();
+    }
+    else if(initial_state.has_value())
     {
         const auto& state = *initial_state;
         TORCH_CHECK(state.is_cuda() && state.is_contiguous() &&
@@ -165,8 +206,10 @@ std::vector<torch::Tensor> decode(const torch::Tensor& q,
     const bool use_initial_state = initial_state.has_value();
     const auto output = torch::empty({total_tokens, h_v, kHeadDimCk}, q.options());
     auto final_state = store_final_state
-                           ? torch::empty({sequences, h_v, kHeadDimCk, kHeadDimCk},
-                                          q.options().dtype(at::kFloat))
+                           ? (pooled_state ? *initial_state
+                                           : torch::empty({sequences, h_v, kHeadDimCk,
+                                                           kHeadDimCk},
+                                                          q.options().dtype(at::kFloat)))
                            : torch::Tensor();
 
     const float resolved_scale =
@@ -187,9 +230,20 @@ std::vector<torch::Tensor> decode(const torch::Tensor& q,
     args.a_log  = a_log.has_value() ? a_log->data_ptr() : nullptr;
     args.dt_bias = dt_bias.has_value() ? dt_bias->data_ptr() : nullptr;
     args.initial_state = initial_state.has_value() ? initial_state->data_ptr<float>() : nullptr;
+    args.state_indices =
+        pooled_state ? pooled_indices.data_ptr<int64_t>() : nullptr;
     args.cu_seqlens    = variable_length ? cu_seqlens->data_ptr<int64_t>() : nullptr;
     args.output        = output.data_ptr();
     args.final_state   = store_final_state ? final_state.data_ptr<float>() : nullptr;
+
+    // Dense callers get the historical "slot == sequence" mapping back by
+    // construction: slot stride h_v * key_dim * value_dim over the sequence
+    // index reproduces sequence_head * key_dim * value_dim exactly.
+    args.state_slot_stride =
+        pooled_state
+            ? static_cast<ck_tile::long_index_t>(initial_state->stride(0))
+            : static_cast<ck_tile::long_index_t>(h_v) * kHeadDimCk * kHeadDimCk;
+    args.state_slot = 0; // resolved per CTA inside the kernel
 
     args.batch       = static_cast<ck_tile::index_t>(batch);
     args.time        = static_cast<ck_tile::index_t>(time);
