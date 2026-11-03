@@ -23,6 +23,14 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
                                     std::optional<at::Tensor> const& num_rows = std::nullopt,
                                     int num_rows_factor                       = 1);
 
+void dynamic_per_group_scaled_quant(torch::Tensor& out,
+                                    torch::Tensor const& input,
+                                    torch::Tensor& scales,
+                                    std::optional<at::Tensor> const& scale_ub,
+                                    bool shuffle_scale,
+                                    std::optional<at::Tensor> const& num_rows,
+                                    int num_rows_factor);
+
 void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
                                         torch::Tensor const& input, // [..., d]
                                         torch::Tensor& scales,

@@ -35,7 +35,18 @@ const int32_t BlockSize           = 256;
 const int32_t groupQuantBlockSize = 64;
 
 namespace aiter {
-template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32>
+// E2M1 round-to-nearest-even fallback for architectures without native FP4.
+__device__ inline uint8_t group_fp4_rne(float value)
+{
+    const float a = fabsf(value);
+    const uint8_t sign = (__float_as_uint(value) >> 28) & 8;
+    const uint8_t q = a > 5.f ? 7 : a >= 3.5f ? 6 : a > 2.5f ? 5 :
+                      a >= 1.75f ? 4 : a > 1.25f ? 3 : a >= .75f ? 2 :
+                      a > .25f ? 1 : 0;
+    return sign | q;
+}
+
+template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, bool e8m0_scale = false>
 __global__ void
 dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       float* __restrict__ scale,
@@ -53,9 +64,10 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         return (x / 32 * scaleN_pad) * 32 + (y / 8) * 256 + (y % 4) * 64 + (x % 16) * 4 +
                (y % 8) / 4 * 2 + (x % 32) / 16;
     };
+    const int64_t capacity_rows = ori_rows;
     if(num_rows != nullptr)
     {
-        ori_rows = *num_rows * num_cols_factor;
+        ori_rows = min(ori_rows, max(int64_t(0), int64_t(*num_rows) * num_cols_factor));
     }
     int num_thread_per_group = group_size / thread_data_size;
     int64_t row_offset       = blockIdx.x * groupQuantBlockSize;
@@ -98,7 +110,9 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     // static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
     static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
     // const int32_t oob_i             = (cols + ooba_i - 1) / ooba_i * ooba_i;
-    const int64_t oob_o = (ori_rows * ori_cols + ooba_o - 1) / ooba_o * ooba_o;
+    const int64_t output_elements = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
+                                       ? ori_rows * ori_cols / 2 : ori_rows * ori_cols;
+    const int64_t oob_o = (output_elements + ooba_o - 1) / ooba_o * ooba_o;
     // auto buffer_i = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(input +
     // row_offset, oob_i); buffer_i.init_raw();
 
@@ -126,8 +140,15 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     float inverted_scale = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
                                ? fp4_scale(absMax) * inverted_DTYPE_MAX
                                : absMax * inverted_DTYPE_MAX;
+    if constexpr(e8m0_scale)
+    {
+        // E8M0 scale is the smallest power of two not below amax / 448.
+        const uint32_t bits = __float_as_uint(inverted_scale);
+        const uint32_t exponent = (bits >> 23) + ((bits & 0x7fffff) != 0);
+        inverted_scale = __uint_as_float(exponent << 23);
+    }
     row_offset           = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
-                               ? groupId * group_size / 2 + (threadIdx.x % num_thread_per_group) * vec_size_o
+                               ? (x * scaleN + y) * group_size / 2 + (threadIdx.x % num_thread_per_group) * vec_size_o
                                : groupId * group_size + (threadIdx.x % num_thread_per_group) * vec_size_o;
     if(threadIdx.x % num_thread_per_group == 0)
     {
@@ -145,9 +166,12 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         {
             if(shuffle_scale)
             {
-                groupId = y * ori_rows + x;
+                groupId = y * capacity_rows + x;
             }
-            scale[groupId] = inverted_scale;
+            if constexpr(e8m0_scale)
+                reinterpret_cast<uint8_t*>(scale)[groupId] = __float_as_uint(inverted_scale) >> 23;
+            else
+                scale[groupId] = inverted_scale;
         }
     }
     inverted_scale =
@@ -157,6 +181,38 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         inverted_scale = 127.0f / absMax;
     }
 
+#if defined(__gfx946__)
+    if constexpr(std::is_same_v<DTYPE_O, ck_tile::int8_t>)
+    {
+        // Keep each byte unsigned and pack explicitly: PMD currently mishandles
+        // the compiler's packed-byte sequence for negative INT8 values.
+#pragma unroll
+        for(int j = 0; j < thread_data_size; j += 4)
+        {
+            uint32_t bytes[4];
+#pragma unroll
+            for(int k = 0; k < 4; ++k)
+            {
+                float value = ck_tile::type_convert<float>(thread_data[j + k]) * inverted_scale;
+                const float rounded = rintf(value);
+                uint32_t converted;
+                asm volatile("v_cvt_i32_f32 %0, %1\n\tv_and_b32 %0, 255, %0"
+                             : "=&v"(converted) : "v"(rounded));
+                bytes[k] = converted;
+            }
+            uint32_t a=bytes[0], b=bytes[1], c=bytes[2], d=bytes[3];
+            asm volatile("v_lshlrev_b32 %1, 8, %1\n\t"
+                         "v_lshlrev_b32 %2, 16, %2\n\t"
+                         "v_lshlrev_b32 %3, 24, %3\n\t"
+                         "v_or_b32 %0, %0, %1\n\t"
+                         "v_or_b32 %0, %0, %2\n\t"
+                         "v_or_b32 %0, %0, %3"
+                         : "+v"(a), "+v"(b), "+v"(c), "+v"(d));
+            *reinterpret_cast<uint32_t*>(out + row_offset + j) = a;
+        }
+        return;
+    }
+#endif
     using DTYPE_STORE = typename ck_tile::vector_traits<DTYPE_O>::scalar_type;
     auto* out_ptr     = reinterpret_cast<DTYPE_STORE*>(out);
     auto buffer_o =
@@ -164,9 +220,43 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                   ck_tile::amd_buffer_coherence_enum::glc>(out_ptr, oob_o);
     buffer_o.init_raw();
 
-    auto out_s =
-        ck_tile::vec_convert<DTYPE_O, DTYPE_I, thread_data_size>(thread_data, inverted_scale)
-            .template get_as<DTYPE_STORE>();
+    ck_tile::vec_t<DTYPE_STORE, vec_size_o> out_s;
+    if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
+    {
+#pragma unroll
+        for(int j = 0; j < thread_data_size / 2; ++j)
+        {
+            const float a = ck_tile::type_convert<float>(thread_data[2 * j]);
+            const float b = ck_tile::type_convert<float>(thread_data[2 * j + 1]);
+#if defined(__gfx946__)
+            const uint32_t exponent = (__float_as_uint(inverted_scale) >> 23) & 255;
+            const uint32_t packed = __builtin_hcu_cvt_scale_pk_fp4_f32(a, b, exponent, 0, 0, 0);
+            out_s[j] = ((packed >> 2) & 15) | ((packed >> 6) & 240);
+#else
+            out_s[j] = group_fp4_rne(a / inverted_scale) |
+                       (group_fp4_rne(b / inverted_scale) << 4);
+#endif
+        }
+    }
+    else
+    {
+#if defined(__gfx946__) || defined(__gfx936__)
+        // Scalar conversion avoids the gfx946 PMD packed INT8 conversion defect;
+        // CK supplies software E4M3 conversion on gfx936.
+#pragma unroll
+        for(int j = 0; j < thread_data_size; ++j)
+        {
+            const float value = ck_tile::type_convert<float>(thread_data[j]) * inverted_scale;
+            if constexpr(std::is_same_v<DTYPE_O, ck_tile::int8_t>)
+                out_s[j] = static_cast<int8_t>(rintf(value));
+            else
+                out_s[j] = ck_tile::type_convert<DTYPE_O>(value);
+        }
+#else
+        out_s = ck_tile::vec_convert<DTYPE_O, DTYPE_I, thread_data_size>(thread_data, inverted_scale)
+                    .template get_as<DTYPE_STORE>();
+#endif
+    }
     if constexpr(thread_data_size <= 16)
     {
         buffer_o.set(row_offset, 0, true, out_s);
@@ -854,19 +944,24 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 }
 
 inline void check_quant_buffers(const torch::Tensor& out, const torch::Tensor& input,
-                                const torch::Tensor& scale, bool per_tensor)
+                                const torch::Tensor& scale, bool per_tensor,
+                                bool allow_e8m0 = false)
 {
     TORCH_CHECK(input.is_cuda() && out.is_cuda() && scale.is_cuda(),
                 "quant input, output and scale must be on a HIP device");
     TORCH_CHECK(input.device() == out.device() && input.device() == scale.device(),
                 "quant buffers must be on the same device");
+    TORCH_CHECK(out.scalar_type() != torch::kFloat8_e4m3fnuz &&
+                scale.scalar_type() != torch::kFloat8_e4m3fnuz,
+                "Hygon quantization does not support float8_e4m3fnuz");
     TORCH_CHECK(input.dim() >= 1 && input.size(-1) > 0, "quant requires a nonempty last dimension");
     TORCH_CHECK(input.is_contiguous() && out.is_contiguous() && scale.is_contiguous(),
                 "quant buffers must be contiguous");
     TORCH_CHECK(input.scalar_type() == torch::kHalf || input.scalar_type() == torch::kBFloat16,
                 "quant input must be FP16 or BF16");
     TORCH_CHECK(out.numel() == input.numel(), "quant output size must match input");
-    TORCH_CHECK(scale.scalar_type() == torch::kFloat32, "quant scale must be FP32");
+    TORCH_CHECK(scale.scalar_type() == torch::kFloat32 || (allow_e8m0 && scale.element_size() == 1),
+                "quant scale must be FP32 or supported E8M0 storage");
     TORCH_CHECK(scale.numel() == (per_tensor ? 1 : input.numel() / input.size(-1)),
                 "quant scale has the wrong number of elements");
     TORCH_CHECK(input.size(-1) <= INT32_MAX && input.numel() / input.size(-1) <= INT32_MAX,
@@ -1214,6 +1309,58 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
     }
 }
 
+void dynamic_per_group_scaled_quant(torch::Tensor& out,
+                                    torch::Tensor const& input,
+                                    torch::Tensor& scales,
+                                    std::optional<at::Tensor> const& scale_ub,
+                                    bool shuffle_scale,
+                                    std::optional<at::Tensor> const& num_rows,
+                                    int num_rows_factor)
+{
+    check_quant_buffers(out, input, scales, false, true);
+    const bool e8m0_scale = scales.element_size() == 1;
+    TORCH_CHECK(!e8m0_scale || out.scalar_type() == torch_fp8, "E8M0 scales require E4M3FN output");
+    const int cols = input.size(-1);
+    TORCH_CHECK(cols == 32 || cols == 64 || cols == 128, "group size must be 32, 64 or 128");
+    TORCH_CHECK(out.scalar_type() == torch::kInt8 || out.scalar_type() == torch_fp8,
+                "group quant output must be INT8 or E4M3FN");
+    TORCH_CHECK(num_rows_factor > 0, "num_rows_factor must be positive");
+    if(num_rows.has_value())
+        TORCH_CHECK(num_rows->is_cuda() && num_rows->device() == input.device() &&
+                    num_rows->scalar_type() == torch::kInt32 && num_rows->is_contiguous() &&
+                    num_rows->numel() == 1, "num_rows must be one contiguous device int32");
+    const int ori_cols = out.size(-1);
+    TORCH_CHECK(ori_cols > 0 && ori_cols % cols == 0, "output columns must contain complete groups");
+    const int64_t ori_rows = input.numel() / ori_cols;
+    if(ori_rows == 0)
+        return;
+    const int groups_per_tg = groupQuantBlockSize / (cols / 32);
+    const int64_t groups = input.numel() / cols;
+    const dim3 grid((groups + groups_per_tg - 1) / groups_per_tg);
+    const dim3 block(groupQuantBlockSize);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "group_quant", [&] {
+        using input_dtype = typename t2ck<scalar_t>::type;
+        auto launch_group = [&](auto* output) {
+            using output_dtype = std::remove_pointer_t<decltype(output)>;
+            const auto kernel = e8m0_scale
+                ? dynamic_per_group_scaled_quant_kernel<input_dtype, output_dtype, 32, true>
+                : dynamic_per_group_scaled_quant_kernel<input_dtype, output_dtype, 32, false>;
+            quant_detail::launch(kernel,
+                grid, block, stream, output, reinterpret_cast<float*>(scales.data_ptr()),
+                reinterpret_cast<const input_dtype*>(input.data_ptr()),
+                scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
+                cols, ori_rows, ori_cols, ori_cols, shuffle_scale,
+                num_rows.has_value() ? num_rows->data_ptr<int32_t>() : nullptr, num_rows_factor);
+        };
+        if(out.scalar_type() == torch::kInt8)
+            launch_group(reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()));
+        else
+            launch_group(reinterpret_cast<FP8_TYPE*>(out.data_ptr()));
+    });
+}
+
 void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
                                         torch::Tensor const& input, // [..., d]
                                         torch::Tensor& scales,
@@ -1225,7 +1372,24 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
     TORCH_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
                 __func__,
                 " only support group_size [32, 64 , 128]");
-    TORCH_CHECK(out.is_contiguous());
+    TORCH_CHECK(input.dim() == 2 && input.size(1) > 0 && input.stride(1) == 1,
+                "FP4 input must be a matrix with contiguous columns");
+    TORCH_CHECK(input.is_cuda() && out.is_cuda() && scales.is_cuda() &&
+                input.device() == out.device() && input.device() == scales.device(),
+                "FP4 buffers must share a HIP device");
+    TORCH_CHECK(out.scalar_type() != torch::kFloat8_e4m3fnuz &&
+                scales.scalar_type() != torch::kFloat8_e4m3fnuz,
+                "Hygon quantization does not support float8_e4m3fnuz");
+    TORCH_CHECK(input.scalar_type() == torch::kHalf || input.scalar_type() == torch::kBFloat16,
+                "FP4 input must be FP16 or BF16");
+    TORCH_CHECK(out.is_contiguous() && scales.is_contiguous() &&
+                out.element_size() == 1 && scales.element_size() == 1 &&
+                out.numel() == input.numel() / 2, "invalid packed FP4 output/scale storage");
+    TORCH_CHECK(num_rows_factor > 0, "num_rows_factor must be positive");
+    if(num_rows.has_value())
+        TORCH_CHECK(num_rows->is_cuda() && num_rows->device() == input.device() &&
+                    num_rows->scalar_type() == torch::kInt32 && num_rows->is_contiguous() &&
+                    num_rows->numel() == 1, "num_rows must be one contiguous device int32");
 
     int const cols        = input.size(-1);
     int const rows        = input.numel() / cols;
@@ -1242,17 +1406,22 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
     int num_group_per_tg     = groupQuantBlockSize / num_thread_per_group;
 
     int scaleN    = cols / group_size;
+    const int64_t required_scales = shuffle_scale ? int64_t((rows + 255) / 256 * 256) *
+                                                   ((scaleN + 7) / 8 * 8) : int64_t(rows) * scaleN;
+    TORCH_CHECK(scales.numel() >= required_scales, "FP4 scale storage is too small");
+    if(rows == 0)
+        return;
     int num_group = shuffle_scale ? rows * ((scaleN + 7) / 8 * 8) : rows * scaleN;
     // int num_group = shuffle_scale ? ((rows + 255) / 256 * 256) * ((scaleN + 7) / 8 * 8) : rows *
     // scaleN;
     dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
     dim3 const block(groupQuantBlockSize);
 
-#if defined(__Float4_e2m1fn_x2)
     AITER_DISPATCH_FLOATING16_TYPES(
         input.scalar_type(), "dynamic_per_group_scaled_quant_kernel", [&] {
             using input_dtype = typename t2ck<scalar_t>::type;
-            aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
+            quant_detail::launch(aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, ck_tile::fp4x2_t>,
+                grid, block, stream,
                 reinterpret_cast<ck_tile::fp4x2_t*>(out.data_ptr()),
                 reinterpret_cast<float*>(scales.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
@@ -1265,9 +1434,6 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
                 num_rows_ptr,
                 num_rows_factor);
         });
-#else
-    TORCH_CHECK(false, __func__, " device not support Float4_e2m1fn_x2 dtype");
-#endif
 }
 
 #define SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE) \
