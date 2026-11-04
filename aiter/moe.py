@@ -500,6 +500,9 @@ def _try_get_triton_default_config(
     }
     if quant_type not in dtype_names:
         return None
+    if quant_type == MoeQuantType.W4A16 and block_size <= 0:
+        return None
+
     try:
         if quant_type == MoeQuantType.FP8_W8A8:
             from .utility import dtypes
