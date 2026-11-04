@@ -1,6 +1,8 @@
 """CAR collectives, fused operators, transport and input reuse contracts at TP2/4/8.
 
-Run with python and no arguments for the TP2 + TP4 CI matrix.
+Run with python and no arguments for the topology-admitted TP2 + TP4 CI matrix.
+Automatic TP4 is reported as skipped when GPUs or HIP IPC connectivity are
+insufficient. Topology query errors fail; an explicit --tp-size stays strict.
 AITER_AR_TP_SIZE limits the default matrix to the CI GPU allocation (2 or 4).
 TP8 requires explicit --tp-size 8 or torchrun. Explicit torchrun accepts one --suite.
 """
@@ -986,6 +988,27 @@ def run_job(command, env, log_path, timeout):
             return 124, True
 
 
+def automatic_tp_skips(args, tp_sizes, available):
+    """Skip only known unsupported automatic groups, never a probe failure."""
+    if args.tp_size is not None or args.tp6:
+        return {}
+    import torch
+    skipped = {}
+    for tp in tp_sizes:
+        if available < tp:
+            skipped[tp] = dict(reason=f'TP{tp} requires {tp} visible GPUs, found {available}')
+        elif tp > 2 and args.transport == 'ipc' and torch.version.hip:
+            # Reuse the runtime predicate, including HIP/ROCR visibility mapping.
+            # Do not turn an import/SMI/identity error into a successful CI skip.
+            from aiter.dist.device_communicators.topology import (
+                _device_pci_bus_id, _query_hsl_connectivity)
+            bus_ids = [_device_pci_bus_id(torch.device('cuda', i)) for i in range(tp)]
+            if not _query_hsl_connectivity(bus_ids):
+                skipped[tp] = dict(reason='HIP IPC requires type=2, hops=1 for every GPU pair',
+                                   devices=bus_ids)
+    return skipped
+
+
 def launch_ci(args, parser):
     try:
         allocation = int(os.environ.get('AITER_AR_TP_SIZE', '4'))
@@ -1004,21 +1027,43 @@ def launch_ci(args, parser):
         return
     import torch
     available = torch.cuda.device_count()
-    if available < max(tp_sizes):
-        parser.error(f'TP{max(tp_sizes)} requires {max(tp_sizes)} visible GPUs, found {available}; '
+    required = max(tp_sizes) if args.tp_size is not None or args.tp6 else min(tp_sizes)
+    if available < required:
+        parser.error(f'TP{required} requires {required} visible GPUs, found {available}; '
                      'select GPUs with HIP_VISIBLE_DEVICES or request --tp-size 2')
     root = Path(args.output).resolve()
     root.mkdir(parents=True, exist_ok=True)
     run_dir = Path(tempfile.mkdtemp(prefix='run-', dir=root))
-    report = dict(tp_sizes=tp_sizes, status='running', planned_jobs=len(jobs), jobs=[])
+    report = dict(tp_sizes=tp_sizes, status='running', planned_jobs=len(jobs),
+                  executed_jobs=0, skipped_jobs=0, jobs=[])
     report_path = run_dir / 'summary.json'
 
     def save_report():
         report_path.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
 
     save_report()
-    print(f'CAR_CI_START TP={tp_sizes} jobs={len(jobs)} report={report_path}', flush=True)
+    try:
+        skipped = automatic_tp_skips(args, tp_sizes, available)
+    except Exception as exc:
+        report.update(status='failed', preflight_error=f'{type(exc).__name__}: {exc}')
+        save_report()
+        print(f'CAR_CI_PREFLIGHT_FAIL {report["preflight_error"]} report={report_path}', flush=True)
+        raise
+    report['active_tp_sizes'] = [tp for tp in tp_sizes if tp not in skipped]
+    report['skipped_tp_sizes'] = skipped
+    skip_count = sum(tp in skipped for tp, _, _, _ in jobs)
+    save_report()
+    print(f'CAR_CI_START TP={report["active_tp_sizes"]} jobs={len(jobs)-skip_count} '
+          f'skipped={skip_count} planned={len(jobs)} report={report_path}', flush=True)
     for tp, suite, mode, command in jobs:
+        if tp in skipped:
+            report['jobs'].append(dict(tp=tp, suite=suite, small_message=mode, status='skipped',
+                command=command, workers=[], **skipped[tp]))
+            report['skipped_jobs'] += 1
+            save_report()
+            print(f'CAR_CI_JOB_SKIP tp={tp} suite={suite} mode={mode} '
+                  f'reason={skipped[tp]["reason"]}', flush=True)
+            continue
         log_path = run_dir / f'tp{tp}_{suite}_{mode}.log'
         rank_dir = run_dir / f'tp{tp}_{suite}_{mode}'
         rank_dir.mkdir()
@@ -1038,6 +1083,7 @@ def launch_ci(args, parser):
         report['jobs'].append(dict(tp=tp, suite=suite, small_message=mode, status='passed' if passed else 'failed',
             returncode=rc, timed_out=timed_out, elapsed_s=time.monotonic()-started,
             command=command, log=str(log_path), workers=records))
+        report['executed_jobs'] += 1
         report['status'] = 'running' if passed else 'failed'
         save_report()
         print(f'CAR_CI_JOB_{"PASS" if passed else "FAIL"} tp={tp} suite={suite} mode={mode} log={log_path}', flush=True)
@@ -1046,7 +1092,8 @@ def launch_ci(args, parser):
             raise SystemExit(rc if rc > 0 else 1)
     report['status'] = 'passed'
     save_report()
-    print(f'CAR_CI_PASS jobs={len(jobs)} report={report_path}', flush=True)
+    print(f'CAR_CI_PASS jobs={report["executed_jobs"]} skipped={report["skipped_jobs"]} '
+          f'report={report_path}', flush=True)
 
 
 def worker_provenance(args):
@@ -1073,7 +1120,8 @@ def main():
     parser.add_argument('--register', choices=['off', 'on', 'both'], default='both')
     parser.add_argument('--tp6', action='store_true')
     parser.add_argument('--tp-size', type=int, choices=[2, 4, 8],
-                        help='run one TP size; default runs TP2 + TP4, limited by AITER_AR_TP_SIZE')
+                        help='strictly require one TP size; default selects TP2 + TP4, limited by '
+                             'AITER_AR_TP_SIZE, visible GPUs and HIP IPC topology')
     parser.add_argument('--fabric-disabled', action='store_true')
     parser.add_argument('--small-message', choices=['off', 'auto', 'll', 'll128', 'both'],
                         help='all defaults to off/auto for AR suites and off for other suites; '

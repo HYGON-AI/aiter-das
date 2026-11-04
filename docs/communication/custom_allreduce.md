@@ -212,8 +212,9 @@ gfx938 TP8也有明显批间漂移，不能按单行数字宣称稳定收益。T
 ## 精度与覆盖范围
 
 日常算子回归入口是 `python op_tests/ci_tests/test_custom_allreduce_api.py`。
-无参数默认依次执行 TP2、TP4，共18个独立任务：输入立即复用、Graph变化输入、边界与RNE精度专项各测off/auto，再测AG/RS、融合与IPC初始化；不自动运行TP8。
-`--tp-size 2/4/8` 可显式选择单个TP，CI仅分配2卡时（`AITER_AR_TP_SIZE=2`）默认只测TP2。
+无参数默认规划 TP2、TP4，共18个独立任务：输入立即复用、Graph变化输入、边界与RNE精度专项各测off/auto，再测AG/RS、融合与IPC初始化；不自动运行TP8。启动前自动检查可见卡数和 HIP IPC 拓扑：不足4卡或所选四卡不满足每对 `type=2,hops=1` 时，保留TP2并将TP4明确记录为SKIP；满足条件的机器继续测试TP4。
+`--tp-size 2/4/8` 显式要求单个TP，仍执行严格检查，不因拓扑不支持自动跳过。CI仅分配2卡时（`AITER_AR_TP_SIZE=2`）默认只规划TP2。自动模式下不足2卡、拓扑依赖缺失或查询异常仍报错；`--dry-run` 仅展示规划，不访问GPU判断拓扑。
+日志和 `summary.json` 分别记录实际执行数、跳过数及原因；例如TP2通过9项、TP4跳过9项，不等价于18项正确性通过。
 原 `test_custom_allreduce.py` 保留独立精度/性能测试。参数、日志和覆盖边界见[测试说明](../../op_tests/multigpu_tests/README.md#interface-and-correctness-tests)。
 2026-10-12 在 gfx936/gfx938 上验证该无参数入口，TP2/TP4 各架构均通过18/18个任务；未运行TP8或新增模型回归。
 
