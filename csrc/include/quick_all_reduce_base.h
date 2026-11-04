@@ -34,8 +34,8 @@ using fp32x16_t = __attribute__((__vector_size__(16 * sizeof(float)))) float;
 #endif
 
 // HCU QR preserves the upstream E4M3FNUZ wire format (max 240, bias 8).
-// gfx936 lacks the AMD FP8 builtins; use the same software codec on gfx938
-// so both targets have identical rounding and scale semantics.
+// gfx92a and gfx936 lack the AMD FP8 conversion instructions; use the same
+// software codec on gfx938 to keep identical rounding and scale semantics.
 __quickreduce_device_inline__ uint8_t qr_fp8_fnuz_encode(float x)
 {
     if(isnan(x)) return 0x80;
@@ -65,7 +65,7 @@ __quickreduce_device_inline__ float qr_fp8_fnuz_decode(uint8_t x)
 
 __quickreduce_device_inline__ int qr_pack_fp8(float a, float b, int previous, bool upper)
 {
-#if defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
     uint32_t bits = uint32_t(qr_fp8_fnuz_encode(a)) | (uint32_t(qr_fp8_fnuz_encode(b)) << 8);
     return upper ? (uint32_t(previous) & 0xffffu) | (bits << 16)
                  : (uint32_t(previous) & 0xffff0000u) | bits;
@@ -77,7 +77,7 @@ __quickreduce_device_inline__ int qr_pack_fp8(float a, float b, int previous, bo
 
 __quickreduce_device_inline__ fp32x2_t qr_unpack_fp8(int packed, bool upper)
 {
-#if defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
     uint32_t bits = uint32_t(packed) >> (upper ? 16 : 0);
     return {qr_fp8_fnuz_decode(bits & 255), qr_fp8_fnuz_decode((bits >> 8) & 255)};
 #else

@@ -650,8 +650,16 @@ def run_ar_boundaries(args):
                              enable_register_for_capturing=True)
         assert not ca.disabled and ca.transport == 'ipc'
         requested = os.environ.get('AITER_AR_SMALL_MESSAGE', 'off')
-        if requested != 'off':
-            assert ca.small_ar_mode == requested, (ca.small_ar_mode, requested)
+        # Unsupported ranks must keep the traditional path even for auto/LL.
+        # On supported homogeneous groups, still require the requested mode.
+        arch = torch.cuda.get_device_properties(local).gcnArchName.split(':')[0]
+        capabilities = [None] * world
+        dist.all_gather_object(capabilities, arch in ('gfx936', 'gfx938'))
+        expected_mode = requested if all(capabilities) else 'off'
+        assert ca.small_ar_mode == expected_mode, (arch, ca.small_ar_mode, expected_mode)
+        print('AR_SMALL_MODE_RESULT', json.dumps(dict(rank=rank, arch=arch,
+              requested=requested, effective=ca.small_ar_mode,
+              expected=expected_mode, capabilities=capabilities)), flush=True)
         empty = torch.empty(0, device='cuda', dtype=torch.float16)
         assert not ca.should_custom_ar(empty)
         expect_value_error(lambda: ca.all_reduce(empty))
@@ -792,9 +800,16 @@ def run_ar_boundaries(args):
             else:
                 raise AssertionError('staging capacity overflow was accepted')
             print('AR_INPUT_CAPACITY_BOUNDARY_PASS',rank,flush=True)
-            expect_value_error(lambda: ops.configure_small_ar(ca._ptr, 64 << 20,
-                               ca._pool['meta'].max_size, 3))
-            print('AR_SMALL_CAPACITY_FALLBACK_PASS',rank,flush=True)
+            if arch in ('gfx936', 'gfx938'):
+                expect_value_error(lambda: ops.configure_small_ar(ca._ptr, 64 << 20,
+                                   ca._pool['meta'].max_size, 3))
+                print('AR_SMALL_CAPACITY_FALLBACK_PASS',rank,flush=True)
+            else:
+                # Native configuration is a no-op on unsupported local targets.
+                ops.configure_small_ar(ca._ptr, 64 << 20, ca._pool['meta'].max_size, 3)
+                print('AR_UNSUPPORTED_SMALL_CONFIG_NOOP_PASS',rank,arch,flush=True)
+            torch.testing.assert_close(ca.custom_all_reduce(tiny),
+                                       torch.full_like(tiny,world*(world+1)/2),rtol=0,atol=0)
             ca.close()
             ca = None
             # Simulate one unsupported participant in the capability exchange;
