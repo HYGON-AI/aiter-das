@@ -66,6 +66,17 @@ print("torch:", torch.__version__)
 print("hip:", torch.version.hip)
 PY
 
+# Prepare the test runner before NMZ compiles or BW waits for its wheel.
+if [[ "${CI_PIPELINE_SOURCE:-}" == "merge_request_event" ]]; then
+  "${PYTHON}" -m pip install optest -i "${DTK_PIP_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}"
+fi
+
+# BW uses the NMZ wheel after preparing the same environment.
+if [[ "${SKIP_WHEEL_BUILD:-0}" == "1" ]]; then
+  echo "Environment ready; skipping wheel build on BW"
+  exit 0
+fi
+
 echo "Initializing AITER submodules from the current commit..."
 git submodule sync --recursive
 git submodule update --init --recursive
