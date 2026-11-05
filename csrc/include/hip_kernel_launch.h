@@ -50,6 +50,9 @@ inline constexpr LaunchPolicy kpool_topk{
     "SGL_KERNEL_KPOOL_TOPK_DIE_MODE", "SGL_KERNEL_KPOOL_TOPK_DIE_CHUNK",
     "SGL_KERNEL_KPOOL_TOPK_DIE_MASK", "SGL_KERNEL_KPOOL_TOPK_LOG_LAUNCH",
     "kpool_topk", "kpool_topk", true};
+inline constexpr LaunchPolicy normal_communication{
+    "AITER_COMM_DIE_MODE", "AITER_COMM_DIE_CHUNK", "AITER_COMM_DIE_MASK",
+    "AITER_COMM_LOG_LAUNCH", "Normal communication", "normal communication", false};
 } // namespace launch_policy
 namespace launch_detail {
 inline unsigned int read_unsigned(const char* name, unsigned int fallback)

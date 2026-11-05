@@ -17,6 +17,7 @@
  * limitations under the License.
  */
 #include "aiter_hip_common.h"
+#include "hip_kernel_launch.h"
 #include "hip_float8.h"
 #include "opus/opus.hpp"
 #include <array>
@@ -619,7 +620,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
 
         buf = next_buf;
     }
-#if defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
     // Finish peer reads before a following copy overwrites the staging input.
     end_sync<ngpus, true>(sg, self_sg, rank);
 #endif
@@ -4381,11 +4382,12 @@ class CustomAllreduce
             }
         }
 
-#ifdef DTK_ENV
-// Only DTK 26.10+ headers/runtime expose the extended system-scope acquire.
-// Older DTK builds must not reference the flag and retain the standard launch.
+#if defined(DTK_ENV) || !defined(hipExtAddAcquireSystemScope)
+// Some HCU SDKs (including the gfx946 PMD SDK under /opt/rocm) do not
+// expose this extension. Check the header capability independently of the
+// installation path; retain the standard launch when it is unavailable.
 #if AITER_DTK_2610_EXT_SYSTEM_SCOPE_LAUNCH
-#define KL(ngpus, name, ...)                                                            \
+#define KL_DEFAULT(ngpus, name, ...)                                                            \
     do                                                                             \
     {                                                                              \
         if(is_gfx92a)                                                              \
@@ -4414,7 +4416,7 @@ class CustomAllreduce
         }                                                                          \
     } while(0)
 #else
-#define KL(ngpus, name, ...)                                                            \
+#define KL_DEFAULT(ngpus, name, ...)                                                            \
     do                                                                             \
     {                                                                              \
         if(is_broadcast_reg_outptr)                                                \
@@ -4428,7 +4430,7 @@ class CustomAllreduce
 #else
 // Non-DTK ROCm: use hipExtLaunchKernel with hipExtAddAcquireSystemScope
 // for cross-device memory visibility.
-#define KL(ngpus, name, ...)                                                            \
+#define KL_DEFAULT(ngpus, name, ...)                                                            \
     do                                                                             \
     {                                                                              \
         void* _args[] = {&input_ptrs, &output_ptrs, &sg_, &self_sg_,              \
@@ -4448,6 +4450,30 @@ class CustomAllreduce
                                hipExtAddAcquireSystemScope);                       \
         }                                                                          \
     } while(0)
+#endif
+
+// Preserve other architectures' acquire flags and dispatch policy. gfx946
+// uses the common launcher, with the same logical grid and signal-slot indices.
+#if AITER_ENABLE_MULTIDIE
+#define KL(ngpus, name, ...)                                                        \
+    do {                                                                           \
+        if(arch.compare(0, 6, "gfx946") == 0)                                       \
+        {                                                                          \
+            if(is_broadcast_reg_outptr)                                             \
+                launch_kernel(launch_policy::normal_communication,                 \
+                    name<T, ngpus, true __VA_OPT__(,) __VA_ARGS__>,                 \
+                    dim3(blocks), dim3(threads), stream,                            \
+                    input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size);    \
+            else                                                                   \
+                launch_kernel(launch_policy::normal_communication,                 \
+                    name<T, ngpus, false __VA_OPT__(,) __VA_ARGS__>,                \
+                    dim3(blocks), dim3(threads), stream,                            \
+                    input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size);    \
+        }                                                                          \
+        else { KL_DEFAULT(ngpus, name __VA_OPT__(,) __VA_ARGS__); }                  \
+    } while(0)
+#else
+#define KL(ngpus, name, ...) KL_DEFAULT(ngpus, name __VA_OPT__(,) __VA_ARGS__)
 #endif
 
         // HCU IPC TP2 uses the existing ordered FP32 register reduction.
@@ -4567,6 +4593,7 @@ class CustomAllreduce
     }
 #undef REDUCE_CASE
 #undef KL
+#undef KL_DEFAULT
 }
 
 template <int Format>
@@ -4581,10 +4608,10 @@ void dispatchReduceScatter8Bit(hipStream_t stream, unsigned char* input,
 #define RS_BYTE_LAUNCH(NG) \
     do { \
         if(vectorized) \
-            reduce_scatter_8bit_kernel<Format, NG, 16><<<grid, block, 0, stream>>>( \
+            launch_kernel(launch_policy::normal_communication, reduce_scatter_8bit_kernel<Format, NG, 16>, grid, block, stream,  \
                 ptrs, sg_, self_sg_, output, rank_, output_size, n, k, split_dim); \
         else \
-            reduce_scatter_8bit_kernel<Format, NG, 1><<<grid, block, 0, stream>>>( \
+            launch_kernel(launch_policy::normal_communication, reduce_scatter_8bit_kernel<Format, NG, 1>, grid, block, stream,  \
                 ptrs, sg_, self_sg_, output, rank_, output_size, n, k, split_dim); \
     } while(0)
     switch(world_size_)
@@ -4621,16 +4648,13 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
         switch(world_size_)
         {
         case 8:
-            reduce_scatter_first_dim<T, 8>
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+            launch_kernel(launch_policy::normal_communication, reduce_scatter_first_dim<T, 8>, grid, block, stream, ptrs, sg_, self_sg_, output, rank_, range);
             break;
         case 4:
-            reduce_scatter_first_dim<T, 4>
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+            launch_kernel(launch_policy::normal_communication, reduce_scatter_first_dim<T, 4>, grid, block, stream, ptrs, sg_, self_sg_, output, rank_, range);
             break;
         case 2:
-            reduce_scatter_first_dim<T, 2>
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+            launch_kernel(launch_policy::normal_communication, reduce_scatter_first_dim<T, 2>, grid, block, stream, ptrs, sg_, self_sg_, output, rank_, range);
             break;
         default: printf("reduce_scatter world_size error!\n");
         }
@@ -4647,11 +4671,9 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
 #define LAUNCH_LAST(NG)                                                                       \
     do {                                                                                      \
         if(vec)                                                                               \
-            reduce_scatter_split_lastdim<T, NG>                                               \
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, n, k);       \
+            launch_kernel(launch_policy::normal_communication, reduce_scatter_split_lastdim<T, NG>, grid, block, stream, ptrs, sg_, self_sg_, output, rank_, n, k);       \
         else                                                                                  \
-            reduce_scatter_split_lastdim_naive<T, NG>                                         \
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, n, k);       \
+            launch_kernel(launch_policy::normal_communication, reduce_scatter_split_lastdim_naive<T, NG>, grid, block, stream, ptrs, sg_, self_sg_, output, rank_, n, k);       \
     } while(0)
         switch(world_size_)
         {
@@ -4673,11 +4695,9 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
 #define LAUNCH_MID(NG)                                                                        \
     do {                                                                                      \
         if(vec)                                                                               \
-            reduce_scatter_split_middim<T, NG>                                                \
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, m, n, k);    \
+            launch_kernel(launch_policy::normal_communication, reduce_scatter_split_middim<T, NG>, grid, block, stream, ptrs, sg_, self_sg_, output, rank_, m, n, k);    \
         else                                                                                  \
-            reduce_scatter_split_middim_naive<T, NG>                                          \
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, m, n, k);    \
+            launch_kernel(launch_policy::normal_communication, reduce_scatter_split_middim_naive<T, NG>, grid, block, stream, ptrs, sg_, self_sg_, output, rank_, m, n, k);    \
     } while(0)
         switch(world_size_)
         {
@@ -4722,16 +4742,13 @@ void dispatchAllGather(
             switch(world_size_)
             {
             case 8:
-                allgather_naive<T, 8>
-                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                launch_kernel(launch_policy::normal_communication, allgather_naive<T, 8>, grid, block, stream, ptrs, sg_, self_sg_, output, rank_, size);
                 break;
             case 4:
-                allgather_naive<T, 4>
-                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                launch_kernel(launch_policy::normal_communication, allgather_naive<T, 4>, grid, block, stream, ptrs, sg_, self_sg_, output, rank_, size);
                 break;
             case 2:
-                allgather_naive<T, 2>
-                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                launch_kernel(launch_policy::normal_communication, allgather_naive<T, 2>, grid, block, stream, ptrs, sg_, self_sg_, output, rank_, size);
                 break;
             default: printf("allgather world_size error\n");
             }
@@ -4745,16 +4762,13 @@ void dispatchAllGather(
             switch(world_size_)
             {
             case 8:
-                allgather_vec<T, 8>
-                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                launch_kernel(launch_policy::normal_communication, allgather_vec<T, 8>, grid, block, stream, ptrs, sg_, self_sg_, output, rank_, size);
                 break;
             case 4:
-                allgather_vec<T, 4>
-                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                launch_kernel(launch_policy::normal_communication, allgather_vec<T, 4>, grid, block, stream, ptrs, sg_, self_sg_, output, rank_, size);
                 break;
             case 2:
-                allgather_vec<T, 2>
-                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                launch_kernel(launch_policy::normal_communication, allgather_vec<T, 2>, grid, block, stream, ptrs, sg_, self_sg_, output, rank_, size);
                 break;
             default: printf("allgather world_size error\n");
             }
@@ -4769,15 +4783,15 @@ void dispatchAllGather(
         switch(world_size_)
         {
         case 8:
-            allgather_lastdim<T, 8><<<grid, block, 0, stream>>>(
+            launch_kernel(launch_policy::normal_communication, allgather_lastdim<T, 8>, grid, block, stream,
                 ptrs, sg_, self_sg_, output, rank_, size, last_dim_size);
             break;
         case 4:
-            allgather_lastdim<T, 4><<<grid, block, 0, stream>>>(
+            launch_kernel(launch_policy::normal_communication, allgather_lastdim<T, 4>, grid, block, stream,
                 ptrs, sg_, self_sg_, output, rank_, size, last_dim_size);
             break;
         case 2:
-            allgather_lastdim<T, 2><<<grid, block, 0, stream>>>(
+            launch_kernel(launch_policy::normal_communication, allgather_lastdim<T, 2>, grid, block, stream,
                 ptrs, sg_, self_sg_, output, rank_, size, last_dim_size);
             break;
         default: printf("allgather world_size error\n");

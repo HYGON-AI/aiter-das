@@ -859,6 +859,7 @@ def build_module(
                 "module_moe_utils",
                 "module_custom",
                 "module_kpool_topk",
+                "module_custom_all_reduce",
             }:
                 flags_hip.append("-DAITER_ENABLE_MULTIDIE=1")
         parallel_jobs = os.getenv("AITER_HIP_PARALLEL_JOBS")
