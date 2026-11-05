@@ -664,9 +664,8 @@ def get_aiter_moe_config(
         elif dtype == torch.bfloat16:
             candidates = [
                 (MoeSolutionType.ASM, lambda: _try_get_asm_config(quant_type, M, E, n, K, top_k, block_size, use_shuffle)),
-                (MoeSolutionType.TRITON, lambda: _try_get_triton_config(quant_type, M, E, n, block_size, K, top_k)),
                 (MoeSolutionType.MOE_C, lambda: _try_get_moe_c_config(quant_type, M, E, n, block_size)),
-                
+                (MoeSolutionType.TRITON, lambda: _try_get_triton_config(quant_type, M, E, n, block_size, K, top_k)),
             ]
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
