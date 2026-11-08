@@ -67,6 +67,21 @@ def rmsnorm2d_fwd(
 
 
 @compile_ops("module_rmsnorm")
+def rmsnorm2d_fwd_out(
+    out: Tensor,
+    input: Tensor,
+    weight: Tensor,
+    epsilon: float,
+) -> None:
+    """
+    Out-parameter form of rmsnorm2d_fwd. Honours input/out row strides, so a
+    non-contiguous row view works; rms_norm_cu does not (its kernel indexes
+    input as contiguous).
+    """
+    ...
+
+
+@compile_ops("module_rmsnorm")
 def rmsnorm2d_fwd_with_add(
     out: Tensor,
     input: Tensor,

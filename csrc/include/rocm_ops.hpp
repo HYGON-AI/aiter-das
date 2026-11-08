@@ -1504,6 +1504,12 @@ namespace py = pybind11;
           py::arg("input"),                                                                        \
           py::arg("weight"),                                                                       \
           py::arg("epsilon"));                                             \
+    m.def("rmsnorm2d_fwd_out",                                                                     \
+          &rmsnorm2d_out,                                                                          \
+          py::arg("out"),                                                                          \
+          py::arg("input"),                                                                        \
+          py::arg("weight"),                                                                       \
+          py::arg("epsilon"));                                                                     \
     m.def("rmsnorm2d_fwd_with_add",                                                                \
           &rmsnorm2d_with_add,                                                                     \
           py::arg("out"),                                                                          \
@@ -1669,7 +1675,17 @@ namespace py = pybind11;
           py::arg("k_scale"),                                   \
           py::arg("v_scale"),                                   \
           py::arg("max_tokens_per_batch") = 0);                 \
-    m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);
+    m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way); \
+    m.def("fused_qk_rmsnorm",                                   \
+          &aiter::fused_qk_rmsnorm,                             \
+          py::arg("q"),                                         \
+          py::arg("q_weight"),                                  \
+          py::arg("q_eps"),                                     \
+          py::arg("k"),                                         \
+          py::arg("k_weight"),                                  \
+          py::arg("k_eps"),                                     \
+          py::arg("q_out") = std::nullopt,                      \
+          py::arg("k_out") = std::nullopt);
 
 #define SMOOTHQUANT_PYBIND                        \
       m.def("smoothquant_fwd", &smoothquant_fwd); \
@@ -1746,6 +1762,54 @@ namespace py = pybind11;
           py::arg("numRows"),                                                     \
           py::arg("stride0"),                                                     \
           py::arg("stride1"));
+
+// module_sample: torch-free sampling kernels taking aiter_tensor_t.
+// Deliberately does NOT register the aiter_tensor_t pybind class -- that class
+// is registered once by CUSTOM_ALL_REDUCE_PYBIND (via AITER_TENSOR_PYBIND) and
+// torch_to_aiter_pybind() builds instances from it, so registering it a second
+// time here would abort module import with "type already registered".
+#define SAMPLE_PYBIND                                                                \
+    AITER_SET_STREAM_PYBIND;                                                         \
+    m.def("greedy_sample", &aiter::greedy_sample, py::arg("out"), py::arg("input")); \
+    m.def("random_sample_outer_exponential",                                         \
+          &aiter::random_sample_outer_exponential,                                   \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("exponentials"),                                                   \
+          py::arg("temperature"),                                                    \
+          py::arg("eps") = 1e-10);                                                   \
+    m.def("random_sample",                                                           \
+          &aiter::random_sample,                                                     \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("temperature"),                                                    \
+          py::arg("lambd")         = 1.0,                                            \
+          py::arg("philox_seed")   = 0,                                              \
+          py::arg("philox_offset") = 0,                                              \
+          py::arg("eps")           = 1e-10);                                         \
+    m.def("mixed_sample_outer_exponential",                                          \
+          &aiter::mixed_sample_outer_exponential,                                    \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("exponentials"),                                                   \
+          py::arg("temperature"),                                                    \
+          py::arg("eps") = 1e-10);                                                   \
+    m.def("mixed_sample",                                                            \
+          &aiter::mixed_sample,                                                      \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("temperature"),                                                    \
+          py::arg("lambd")         = 1.0,                                            \
+          py::arg("philox_seed")   = 0,                                              \
+          py::arg("philox_offset") = 0,                                              \
+          py::arg("eps")           = 1e-10);                                         \
+    m.def("exponential",                                                             \
+          &aiter::exponential,                                                       \
+          py::arg("out"),                                                            \
+          py::arg("lambd")         = 1.0,                                            \
+          py::arg("philox_seed")   = 0,                                              \
+          py::arg("philox_offset") = 0,                                              \
+          py::arg("eps")           = 1e-10);
 
 #define SAMPLING_PYBIND                                                        \
     m.def("top_k_sampling_from_probs",                                         \

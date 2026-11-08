@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
- 
+#pragma once
+
 #include "hip_compat.h"
 #include <rocprim/rocprim.hpp>
+#include <type_traits>
 
 template <typename T, typename F>
 __device__ constexpr T wave_reduce_ds(T local, F reduce_op)
@@ -200,7 +202,12 @@ __device__ constexpr T block_reduce(T local, F reduce_op)
     const int wave_size        = WARP_SIZE;
     int wave_id                = threadIdx.x / wave_size;
     int lane_id                = threadIdx.x % wave_size;
-    __shared__ float smem[waves];
+    // T, not float: the cross-wave staging buffer must hold whatever the
+    // reduction operates on. With float here, every caller reducing a
+    // non-float T (e.g. aiter::KeyValuePair for an ArgMax) either fails to
+    // compile or silently narrows through float. All in-tree callers pass
+    // T=float, for which this is byte-identical to the previous buffer.
+    __shared__ T smem[waves];
 
     local = wave_reduce<T, F, WARP_SIZE, false>(local, reduce_op);
 
@@ -233,3 +240,71 @@ __device__ constexpr T block_reduce(T local, F reduce_op)
 
     return local;
 }
+
+// Reduction functors passed to the wave_/block_reduce helpers above.
+//
+// Max/Min use `(u > t) ? u : t`, so when exactly one operand is NaN the
+// comparison is false and `t` survives; the result therefore depends on
+// operand order for NaN inputs. ArgMax/ArgMin break value ties on the smaller
+// key, so their winner does NOT depend on the order lanes happen to be
+// combined in.
+namespace aiter {
+
+template <typename Key, typename Value>
+struct KeyValuePair
+{
+    Key key;
+    Value value;
+};
+
+struct Max
+{
+    template <typename T, typename U>
+    __host__ __device__ constexpr typename std::common_type<T, U>::type
+    operator()(T&& t, U&& u) const
+    {
+        return (u > t) ? u : t;
+    }
+};
+
+struct Min
+{
+    template <typename T, typename U>
+    __host__ __device__ constexpr typename std::common_type<T, U>::type
+    operator()(T&& t, U&& u) const
+    {
+        return (u < t) ? u : t;
+    }
+};
+
+struct Sum
+{
+    template <typename T, typename U>
+    __host__ __device__ constexpr typename std::common_type<T, U>::type
+    operator()(T&& t, U&& u) const
+    {
+        return t + u;
+    }
+};
+
+struct ArgMax
+{
+    template <typename Key, typename Value>
+    __host__ __device__ constexpr KeyValuePair<Key, Value>
+    operator()(const KeyValuePair<Key, Value>& a, const KeyValuePair<Key, Value>& b) const
+    {
+        return ((b.value > a.value) || ((a.value == b.value) && (b.key < a.key))) ? b : a;
+    }
+};
+
+struct ArgMin
+{
+    template <typename Key, typename Value>
+    __host__ __device__ constexpr KeyValuePair<Key, Value>
+    operator()(const KeyValuePair<Key, Value>& a, const KeyValuePair<Key, Value>& b) const
+    {
+        return ((b.value < a.value) || ((a.value == b.value) && (b.key < a.key))) ? b : a;
+    }
+};
+
+} // namespace aiter

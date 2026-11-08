@@ -62,6 +62,11 @@
  // interleave: interleave=!is_neox.
  // num_kv_heads: number of kv heads for kv cache
  // kv_dt: data type of kv cache for quantization
+ //
+ // Dispatched through AT_DISPATCH_FLOATING_TYPES_AND2, so scalar_t is a c10 type with a
+ // conforming operator float(); static_cast<float> is safe here. That is NOT true of
+ // fusedQKNormRopeBlockQuantCacheShuffleKernel below -- see the note on to_f32 there
+ // before re-pointing this entry at the OPUS dispatch.
  template <typename scalar_t,
            typename kv_cache_scalar_t,
            int head_dim,
@@ -313,6 +318,58 @@
     }
 }
 
+// ---------------------------------------------------------------------------
+// Conversions between an opus scalar and float.
+//
+// opus.hpp:884-891 defines opus::bf16_t as a plain `unsigned short` when
+// __clang_major__ < 20 (DTK 26.04 ships aicc clang 18; DTK 26.10 ships clang 22 and
+// gets the real __bf16). On the older toolchain every conversion between that type and
+// float -- static_cast, a functional cast, or an implicit one into a float parameter --
+// is an *integer* conversion, in both directions and with no warning:
+//   bf16 0x3FC0 (1.5f)  --static_cast<float>-->  16320.0f
+//   1.5f                --static_cast<bf16_t>--> 0x0001  (reads back as 2.98e-08)
+// That turned BF16 output into bit-level garbage (1e25 / 0 / nan, 94.5% of elements
+// wrong) on gfx936 while gfx938 was correct. opus::fp16_t is a real float type on both
+// branches, which is why only BF16 broke.
+//
+// The dispatch, not the file, decides whether this matters: this kernel is reached
+// through DISPATCH_BY_KV_CACHE_DTYPE_OPUS (quant_utils.cuh) and gets opus scalars,
+// while fusedQKNormRopeQuantCacheShuffleKernel above goes through
+// AT_DISPATCH_FLOATING_TYPES_AND2 and gets c10 types, whose operator float() is fine.
+//
+// Two notes on why these helpers are not just opus::cast everywhere:
+//  - Keep the native cast when the type really is floating point. opus::cast is correct
+//    there too, but it forces the value through integer shifts instead of the hardware
+//    convert, and measured 1.1-1.5x slower on gfx938 chunk-prefill.
+//  - opus::cast<bf16_t>(float) defaults to OPUS_FP32_to_BF16_DEFAULT, which opus.hpp:38
+//    sets to 2 = *truncate*, while the static_cast it replaces is round-to-nearest-even.
+//    Taking the default silently changed the rounding of every Q/K/cache store and cost
+//    ~146 extra borderline k_cache mismatches on gfx938, so pass rm=0 explicitly.
+//
+// Both helpers branch on std::is_integral_v rather than on __clang_major__: the thing
+// that matters is whether the opus scalar is currently standing in as an integer, which
+// is exactly what makes a value conversion wrong.
+// Same bug and same fix as csrc/kernels/fused_qk_norm.cu; see docs/fused_qk_rmsnorm.md
+// section 5.
+// ---------------------------------------------------------------------------
+template <typename S>
+OPUS_D inline float to_f32(const S& v)
+{
+    if constexpr(std::is_integral_v<S>)
+        return opus::cast<float>(v);
+    else
+        return static_cast<float>(v);
+}
+
+template <typename D>
+OPUS_D inline D from_f32(float v)
+{
+    if constexpr(std::is_integral_v<D>)
+        return opus::cast<D>(v, opus::number<0>{}); // rm=0: round to nearest even
+    else
+        return static_cast<D>(v);
+}
+
  template <typename scalar_t,
           typename kv_cache_scalar_t,
           int head_dim,
@@ -495,7 +552,7 @@
             #pragma unroll
             for(int j = 0; j < vec_size; j++)
             {
-                block_max = f_absmax_f32(block_max, static_cast<float>(elements[j]));
+                block_max = f_absmax_f32(block_max, to_f32(elements[j]));
             }
         }
     }
@@ -519,7 +576,7 @@
                     float partial_sum = 0.0f;
                     #pragma unroll
                     for(int j = 0; j < vec_size; j++)
-                        partial_sum += static_cast<float>(elements[j]) * static_cast<float>(elements[j]);
+                        partial_sum += to_f32(elements[j]) * to_f32(elements[j]);
                     float sumOfSquares = wave_reduce<float, decltype(sum_op), head_thread, true>(partial_sum, sum_op);
                     float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
                     int64_t pos_id  = position_ids[token_idx];
@@ -538,17 +595,17 @@
                     {
                         int const local0   = base_idx + k;
                         int const local1   = base_idx + k + 1;
-                        float weight0 = static_cast<float>(weights[k]);
-                        float weight1 = static_cast<float>(weights[k + 1]);
+                        float weight0 = to_f32(weights[k]);
+                        float weight1 = to_f32(weights[k + 1]);
                         int const half_dim = local0 / 2;
-                        float cos_val = static_cast<float>(cos[k/2]);
-                        float sin_val = static_cast<float>(sin[k/2]);
-                        float const val0  = static_cast<float>(elements[k]) * rms_rcp * weight0;
-                        float const val1  = static_cast<float>(elements[k + 1]) * rms_rcp * weight1;
-                        elements[k]       = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
-                        elements[k + 1]   = static_cast<scalar_t>(val0 * sin_val + val1 * cos_val);
-                        block_max          = f_absmax_f32(block_max, elements[k]);
-                        block_max          = f_absmax_f32(block_max, elements[k + 1]);
+                        float cos_val = to_f32(cos[k/2]);
+                        float sin_val = to_f32(sin[k/2]);
+                        float const val0  = to_f32(elements[k]) * rms_rcp * weight0;
+                        float const val1  = to_f32(elements[k + 1]) * rms_rcp * weight1;
+                        elements[k]       = from_f32<scalar_t>(val0 * cos_val - val1 * sin_val);
+                        elements[k + 1]   = from_f32<scalar_t>(val0 * sin_val + val1 * cos_val);
+                        block_max          = f_absmax_f32(block_max, to_f32(elements[k]));
+                        block_max          = f_absmax_f32(block_max, to_f32(elements[k + 1]));
                     }
                     reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot] = elements;
                 }
@@ -576,8 +633,8 @@
                     float partial_sum = 0.0f;
                     #pragma unroll
                     for(int j = 0; j < vec_size; j++)
-                        partial_sum += static_cast<float>(elements[j]) * static_cast<float>(elements[j])
-                                     + static_cast<float>(next_elements[j]) * static_cast<float>(next_elements[j]);
+                        partial_sum += to_f32(elements[j]) * to_f32(elements[j])
+                                     + to_f32(next_elements[j]) * to_f32(next_elements[j]);
                     float sumOfSquares = wave_reduce<float, decltype(sum_op), head_thread_half, true>(partial_sum, sum_op);
                     float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
                     using cos_sin_ltype = ::vec_t<scalar_t, vec_size>;
@@ -590,18 +647,18 @@
                     {
                         int const idx0 = vec_slot * vec_size + j;
                         int const idx1 = pair_slot * vec_size + j;
-                        float weight0 = static_cast<float>(weights0[j]);
-                        float weight1 = static_cast<float>(weights1[j]);
-                        float cos_val = static_cast<float>(cos[j]);
-                        float sin_val = static_cast<float>(sin[j]);
-                        float const val0 = static_cast<float>(elements[j]) * rms_rcp * weight0;
-                        float const val1 = static_cast<float>(next_elements[j]) * rms_rcp * weight1;
+                        float weight0 = to_f32(weights0[j]);
+                        float weight1 = to_f32(weights1[j]);
+                        float cos_val = to_f32(cos[j]);
+                        float sin_val = to_f32(sin[j]);
+                        float const val0 = to_f32(elements[j]) * rms_rcp * weight0;
+                        float const val1 = to_f32(next_elements[j]) * rms_rcp * weight1;
                         float out0 = val0 * cos_val - val1 * sin_val;
                         float out1 = val1 * cos_val + val0 * sin_val;
                         block_max = f_absmax_f32(block_max, out0);
                         block_max = f_absmax_f32(block_max, out1);
-                        elements[j]      = static_cast<scalar_t>(out0);
-                        next_elements[j] = static_cast<scalar_t>(out1);
+                        elements[j]      = from_f32<scalar_t>(out0);
+                        next_elements[j] = from_f32<scalar_t>(out1);
                     }
                     reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot]  = elements;
                     reinterpret_cast<ltype*>(qkv_void)[offsetWarp + pair_slot]  = next_elements;
@@ -692,7 +749,7 @@
                 kv_cache_ltype out_vec;
                 for(int j = 0; j < vec_size; j++)
                 {
-                    out_vec[j] = opus::cast<kv_cache_scalar_t>(float(elements[j]) * inv_scale_val);
+                    out_vec[j] = opus::cast<kv_cache_scalar_t>(to_f32(elements[j]) * inv_scale_val);
                 }
                 *reinterpret_cast<kv_cache_ltype*>(k_cache + vec_offset) = out_vec;
             }
@@ -795,7 +852,7 @@
                 else
                 {
                     v_cache[offset] =
-                    opus::cast<kv_cache_scalar_t>(float(elements[j]) * inv_scale_val);
+                    opus::cast<kv_cache_scalar_t>(to_f32(elements[j]) * inv_scale_val);
                 }
             }
         }

@@ -114,6 +114,16 @@ torch::Tensor rmsnorm2d(
     return out;
 }
 
+// Named entry for the out-parameter overload above (see rmsnorm.h for why this
+// is not itself an overload).
+void rmsnorm2d_out(torch::Tensor& out,    // [m, n]
+                   torch::Tensor& input,  // [m, n]
+                   torch::Tensor& weight, // [1, n]
+                   double epsilon)
+{
+    rmsnorm2d(out, input, weight, epsilon);
+}
+
 void rmsnorm2d_with_add(
     torch::Tensor& out,          // [m ,n]
     torch::Tensor& input,        // [m ,n]

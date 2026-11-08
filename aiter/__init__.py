@@ -88,6 +88,14 @@ from .ops.kvcache_metadata import fused_metadata_kernel_general
 from .ops.blockwise_scaling import *
 from .utility import dtypes,fp4_utils
 from .ops.fused_rmsnorm_rope import *
+from .ops.fused_qk_norm_rope_cache_quant import (
+    fused_qk_norm_rope_2way,
+    fused_qk_norm_rope_cache_block_quant_shuffle,
+    fused_qk_norm_rope_cache_pts_quant_shuffle,
+    fused_qk_norm_rope_cache_quant_shuffle,
+    fused_qk_rmsnorm,
+)
+from .ops.sample import *
 from .ops.moe_routing import (
     RoutingBuffers, allocate_moe_routing, moe_routing_workspace_size,
     moe_routing_prepare_out, moe_routing_scatter_out, moe_routing_gather_out,

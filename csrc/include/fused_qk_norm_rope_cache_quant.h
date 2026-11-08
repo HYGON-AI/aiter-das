@@ -98,4 +98,17 @@ void fused_qk_norm_rope_cache_block_quant_shuffle(
     int64_t max_tokens_per_batch = 0   // max tokens in any single batch (0 = use avg)
 );
 
+// Standalone fused Q/K RMSNorm (no RoPE, no quant, no cache write).
+// 2D grid: blockIdx.y selects Q (0) or K (1), so both run in parallel.
+// q/k: [M, N1] / [M, N2] fp16 or bf16, may be non-contiguous on dim 0.
+// q_out/k_out: optional; allocated contiguous when not supplied.
+std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm(at::Tensor& q,
+                                                    at::Tensor& q_weight,
+                                                    double q_eps,
+                                                    at::Tensor& k,
+                                                    at::Tensor& k_weight,
+                                                    double k_eps,
+                                                    std::optional<at::Tensor> q_out_,
+                                                    std::optional<at::Tensor> k_out_);
+
 } // namespace aiter
