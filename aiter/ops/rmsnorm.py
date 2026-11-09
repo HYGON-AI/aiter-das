@@ -284,7 +284,7 @@ def head_rms_norm(
 # Upstream wires them in as a fast path inside rmsnorm2d_fwd_with_dynamicquant
 # and friends; that is deliberately not done here, because the shape and
 # architecture thresholds upstream uses to pick the fast path are calibrated on
-# AMD CDNA and have to be re-measured on HCU before they can gate production
+# upstream CDNA and have to be re-measured on HCU before they can gate production
 # traffic (see doc/transplant_github_aiter_ops/, risk R12).
 #
 # Capabilities beyond rmsnorm2d_fwd_with_dynamicquant:

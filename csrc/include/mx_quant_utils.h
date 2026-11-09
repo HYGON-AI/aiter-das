@@ -23,7 +23,7 @@ namespace aiter {
 // CEIL / EVEN are dtype-agnostic, only max_pos / max_pow2 constants differ
 // (see PyTorch torchao ScaleCalculationMode for the same design).
 //
-// Names follow AMD Quark RoundMode. Each value is 1:1 mathematically
+// Names follow upstream Quark RoundMode. Each value is 1:1 mathematically
 // equivalent to a PyTorch torchao ScaleCalculationMode:
 //   RoundDown <-> FLOOR, RoundUp <-> RCEIL, Even <-> EVEN, Ceil <-> CEIL.
 enum class MxScaleRoundMode : int {
@@ -32,7 +32,7 @@ enum class MxScaleRoundMode : int {
     RoundUp   = 1, // scale = ceil_pow2(amax / max_pos).
                    //   0% max clipping. (industry default)
     Even      = 2, // floor_pow2(round_pow2_special(amax)) / 2^target_max_pow2.
-                   //   AMD Quark default for MXFP4/MXFP8.
+                   //   upstream Quark default for MXFP4/MXFP8.
     Ceil      = 3, // scale = ceil_pow2(amax) / 2^target_max_pow2.
                    //   0% max clipping but coarser grid than RoundUp.
 };
@@ -44,12 +44,12 @@ constexpr MxScaleRoundMode kDefaultMxScaleRoundMode = MxScaleRoundMode::RoundUp;
 // Note that FP8_E4M3 (a.k.a. e4m3fn) and FP8_E4M3_FNUZ are **different
 // formats** with different max_pos (448 vs 240) and different
 // target_max_pow2 (8 vs 7); they are NOT interchangeable.
-//   * FP8_E4M3      = OCP / AMD gfx950+ / **HCU gfx938, gfx946**.
+//   * FP8_E4M3      = OCP / upstream gfx950+ / **HCU gfx938, gfx946**.
 //                     exp_bias = 7, max_normal = 448.
 //                     Matches opus::finfo<fp8_t>::max() on this fork and the
 //                     448 divisor the per-token e8m0 path in
 //                     csrc/kernels/quant_kernels.cu already uses.
-//   * FP8_E4M3_FNUZ = AMD gfx942 hardware FP8 (MI300 family).
+//   * FP8_E4M3_FNUZ = upstream gfx942 hardware FP8 (MI300 family).
 //                     exp_bias = 8, max_normal = 240. No HCU target has it.
 enum class MxDtype : int {
     FP4_E2M1      = 0, // no MxDtypeConfig here: fp4 is compiled out on HCU
@@ -76,7 +76,7 @@ template <> struct MxDtypeConfig<MxDtype::FP8_E4M3> {
     static constexpr uint32_t even_val_to_add = 0x00080000u;    // 1 << (23 - 3 - 1) = 1 << 19
 };
 
-// AMD gfx942 hardware FP8 (e4m3fnuz): exp_bias = 8 (one bigger than the
+// upstream gfx942 hardware FP8 (e4m3fnuz): exp_bias = 8 (one bigger than the
 // OCP e4m3fn = 7), so max_normal = 240.0 (= 1.875 * 2^7) and the largest
 // pow-2 fitting under it is 128 = 2^7. Mantissa width is the same 3 bits,
 // so the EVEN val_to_add is identical to FP8_E4M3.
