@@ -233,7 +233,7 @@ python -B op_tests/test_rmsnorm2dFusedAddQuant.py --mode 12 -q i8 -m 128 2048 -n
 
 - `v_pk_mul_f32` → 改用 `aiter::pk_mul_f32`（结果写入独立变量）；
 - `v_max3_f32` → TU 内的 `max3_f32` helper，输出写入独立变量（`V_MAX3_F32` 是 GFX9 VOP3 指令，HCU 支持）；
-- `v_rcp_f32` → 改用 `__builtin_amdgcn_rcpf`，本仓库其他 kernel 已是这个写法。
+- `v_rcp_f32` → 改用编译器内建的 `rcpf`，本仓库其他 kernel 已是这个写法。
 
 **(4) opus 标量到 float 的转换必须用 `opus::cast`。** [opus.hpp](../csrc/include/opus/opus.hpp) 按编译器版本定义 `bf16_t`：clang ≥ 20 是真浮点 `__bf16`，clang < 20 是 `unsigned short`（整数）。本 kernel 的 `DTYPE_I` 来自 `hip2opus<scalar_t>`，所以对 `input` / `residual_in` / `weight` 一律用 `opus::cast<float>`——用 `static_cast<float>` 在 DTK 26.04（clang 18）上是**整数转换**，会静默产出量级完全错误的结果，而 DTK 26.10（clang 22）上看不出问题。
 

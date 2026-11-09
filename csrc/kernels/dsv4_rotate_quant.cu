@@ -24,7 +24,7 @@
 //     (gfx938 / gfx946 / gfx92a), which aiter/jit/core.py defines for both the
 //     host and device passes. gfx936 has no packed fp8 conversion.
 //
-// HYGON: upstream's `__builtin_amdgcn_permlanex16` is NOT a portability problem
+// HYGON: upstream's `permlanex16` builtin is NOT a portability problem
 // here -- the lane-swap helper already takes a `__GFX9__` branch that uses
 // ds_bpermute, and every HCU target is GFX9. Verified on gfx938: __GFX9__ is
 // defined and the lane^16 exchange is correct.

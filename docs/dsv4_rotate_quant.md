@@ -76,9 +76,9 @@ Hadamard 蝶形分两段：`log2(vec_size)` 级在线程内的寄存器向量上
 
 Python 侧 `rope_rotate_activation` 仍按 `out.dtype` 分发；传入 `fp4x2` 输出时抛 `NotImplementedError` 并说明原因，而不是静默走错路径。
 
-## 3. 关于 `__builtin_amdgcn_permlanex16`
+## 3. 关于 lane 交换内置函数
 
-移植前把它登记为本算子的首要风险（HCU 可用性未知）。结论是**风险不存在**：上游的 lane 交换 helper 本身就带 `#if defined(__GFX9__)` 分支，在 GFX9 上走 `__builtin_amdgcn_ds_bpermute`，`permlanex16` 只用于非 GFX9。HCU 三个架构都是 GFX9，因此走的一直是 `ds_bpermute` 分支，无需任何回退开发。
+移植前把 `permlanex16` 登记为本算子的首要风险（HCU 可用性未知）。结论是**风险不存在**：上游的 lane 交换 helper 本身就带 `#if defined(__GFX9__)` 分支，在 GFX9 上走 `ds_bpermute` 内建函数，`permlanex16` 只用于非 GFX9。HCU 三个架构都是 GFX9，因此走的一直是 `ds_bpermute` 分支，无需任何回退开发。
 
 gfx938 上已实测 `__GFX9__` 已定义、`ds_bpermute` 的 `lane ^ 16` 交换正确（lane0→16 / lane16→0 / lane63→47）。非 GFX9 分支原样保留，便于与上游对比。
 
