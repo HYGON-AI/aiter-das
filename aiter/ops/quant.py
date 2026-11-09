@@ -491,3 +491,116 @@ def moe_swiglu_dynamic_quant_wrapper(
         beta,
     )
     return output, scales
+
+
+# ============================================================================
+# DSV4 rotate / rope+rotate activation (module_dsv4_rotate_quant), ported from
+# aiter-github.
+#
+# HCU cuts (doc/transplant_github_aiter_ops/): upstream's three fp4 entry
+# points (rotate_activation_fp4quant, rope_rotate_activation_fp4quant,
+# rmsnorm_rope_rotate_activation_fp4quant_kvcache) are not ported -- no HCU
+# target has e2m1 hardware -- so `rope_rotate_activation` dispatches on bf16/
+# fp16 and fp8 only. The fp8 entry needs gfx938 / gfx946 / gfx92a; on gfx936 it
+# is not compiled into the module at all.
+#
+# Constraints: input is [..., head_num, dim] with dim in {128, 256, 512, 1024}
+# and head_num a power of two; `positions` is int64 with one entry per token;
+# rope_dim must be even and divisible by the kernel's vec_size (16, or 32 at
+# dim == 1024).
+# ============================================================================
+
+
+@compile_ops("module_dsv4_rotate_quant", fc_name="rotate_activation", develop=True)
+def _rotate_activation_bf16(out: Tensor, input: Tensor) -> None:
+    """Hadamard-rotate ``input`` into ``out`` (same dtype/shape)."""
+
+
+@compile_ops("module_dsv4_rotate_quant", fc_name="rope_rotate_activation", develop=True)
+def _rope_rotate_activation_bf16(
+    out: Tensor,
+    input: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    rope_dim: int,
+    do_rotate_act: bool = True,
+) -> None:
+    """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then
+    Hadamard-rotate."""
+
+
+@compile_ops(
+    "module_dsv4_rotate_quant", fc_name="rope_rotate_activation_fp8quant", develop=True
+)
+def _rope_rotate_activation_fp8quant(
+    out: Tensor,
+    scale: Tensor,
+    input: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    rope_dim: int,
+    group_size: int = 128,
+    do_rotate_act: bool = True,
+) -> None:
+    """Apply interleaved RoPE to trailing ``rope_dim``, Hadamard-rotate, then
+    fp8-quantize: ``out`` is fp8 and ``scale`` (``[m, dim // group_size]`` fp32)
+    receives the per-(row, ``1 x group_size``) block scales
+    ``scale = absMax / fp8_max``. Needs gfx938 / gfx946.
+    """
+
+
+def rotate_activation(out: Tensor, input: Tensor) -> None:
+    """Hadamard-rotate ``input`` into ``out``. bf16/fp16 only on this fork."""
+    _rotate_activation_bf16(out, input)
+
+
+def rope_rotate_activation(
+    out: Tensor,
+    input: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    rope_dim: int,
+    out_scale: Optional[Tensor] = None,
+    group_size: Optional[int] = None,
+    do_rotate_act: bool = True,
+) -> None:
+    """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then
+    Hadamard-rotate, dispatching on ``out.dtype``:
+
+    - bf16/fp16 ``out``: plain rope+hadamard in place (``out_scale`` ignored).
+    - ``fp8`` ``out``: per-(row, 1xGROUP) fp8-quantize into ``out`` + fp32
+      ``out_scale`` (required; ``group_size`` defaults to 128). gfx938 / gfx946
+      only.
+
+    When ``do_rotate_act`` is False the Hadamard rotate is skipped and only RoPE
+    (plus any quantization) is applied.
+
+    Upstream also accepts an ``fp4x2`` ``out`` with an e8m0 scale, plus a
+    ``shuffle_scale`` / ``round_rope`` pair that only that path uses. Neither is
+    available here: no HCU target has fp4 hardware.
+    """
+    if out.dtype == dtypes.fp8:
+        assert out_scale is not None, "fp8 rope_rotate_activation needs out_scale"
+        _rope_rotate_activation_fp8quant(
+            out,
+            out_scale,
+            input,
+            cos,
+            sin,
+            positions,
+            rope_dim,
+            group_size=128 if group_size is None else group_size,
+            do_rotate_act=do_rotate_act,
+        )
+    elif out.dtype == dtypes.fp4x2:
+        raise NotImplementedError(
+            "fp4x2 rope_rotate_activation is not available on gfx936/gfx938/gfx946: "
+            "no e2m1 hardware support (see doc/transplant_github_aiter_ops/)"
+        )
+    else:
+        _rope_rotate_activation_bf16(
+            out, input, cos, sin, positions, rope_dim, do_rotate_act
+        )

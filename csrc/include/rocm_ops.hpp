@@ -1493,6 +1493,90 @@ namespace py = pybind11;
           py::arg("use_ue8m0") = false,                                  \
           "Per-token-group FP8 dynamic quantization.");
 
+// Fast HIP RMSNorm family (module_rmsnorm_quant), ported from aiter-github.
+// Independent of RMSNORM_PYBIND below: these take aiter_tensor_t and live in
+// their own JIT module. See csrc/include/rmsnorm_quant.h for the HCU
+// architecture cuts (no fp4, fp8/e8m0 only under GPU_ENABLE_FP8,
+// scale_layout_m32k4 rejected).
+// DSV4 rotate / rope+rotate activation (module_dsv4_rotate_quant), ported from
+// aiter-github. See csrc/include/dsv4_rotate_quant.h for the HCU cuts: the
+// three fp4 entry points are not ported at all, and the fp8 one is compiled
+// only under GPU_ENABLE_FP8.
+#define DSV4_ROTATE_QUANT_PYBIND                                                           \
+    m.def("rotate_activation", &aiter::rotate_activation, py::arg("out"), py::arg("input")); \
+    m.def("rope_rotate_activation",                                                        \
+          &aiter::rope_rotate_activation,                                                  \
+          py::arg("out"),                                                                  \
+          py::arg("input"),                                                                \
+          py::arg("cos"),                                                                  \
+          py::arg("sin"),                                                                  \
+          py::arg("positions"),                                                            \
+          py::arg("rope_dim"),                                                             \
+          py::arg("do_rotate_act") = true);                                                \
+    DSV4_ROTATE_QUANT_FP8_PYBIND
+
+#ifdef GPU_ENABLE_FP8
+#define DSV4_ROTATE_QUANT_FP8_PYBIND                                                       \
+    m.def("rope_rotate_activation_fp8quant",                                               \
+          &aiter::rope_rotate_activation_fp8quant,                                          \
+          py::arg("out"),                                                                  \
+          py::arg("scale"),                                                                \
+          py::arg("input"),                                                                \
+          py::arg("cos"),                                                                  \
+          py::arg("sin"),                                                                  \
+          py::arg("positions"),                                                            \
+          py::arg("rope_dim"),                                                             \
+          py::arg("group_size")    = 128,                                                  \
+          py::arg("do_rotate_act") = true);
+#else
+// gfx936: no packed fp8 conversion, so the entry point is not compiled and the
+// Python wrapper raises AttributeError rather than returning zeros.
+#define DSV4_ROTATE_QUANT_FP8_PYBIND
+#endif
+
+#define RMSNORM_QUANT_PYBIND                            \
+    AITER_SET_STREAM_PYBIND;                            \
+    m.def("add_rmsnorm_quant",                          \
+          &aiter::add_rmsnorm_quant,                    \
+          py::arg("out"),                               \
+          py::arg("input"),                             \
+          py::arg("residual_in"),                       \
+          py::arg("residual_out"),                      \
+          py::arg("scale"),                             \
+          py::arg("weight"),                            \
+          py::arg("epsilon"),                           \
+          py::arg("group_size")         = 0,            \
+          py::arg("shuffle_scale")      = false,        \
+          py::arg("gemma_norm")         = false,        \
+          py::arg("scale_layout_m32k4") = false);       \
+    m.def("add_rmsnorm",                                \
+          &aiter::add_rmsnorm,                          \
+          py::arg("out"),                               \
+          py::arg("input"),                             \
+          py::arg("residual_in"),                       \
+          py::arg("residual_out"),                      \
+          py::arg("weight"),                            \
+          py::arg("epsilon"),                           \
+          py::arg("gemma_norm") = false);               \
+    m.def("rmsnorm_quant",                              \
+          &aiter::rmsnorm_quant,                        \
+          py::arg("out"),                               \
+          py::arg("input"),                             \
+          py::arg("scale"),                             \
+          py::arg("weight"),                            \
+          py::arg("epsilon"),                           \
+          py::arg("group_size")         = 0,            \
+          py::arg("shuffle_scale")      = false,        \
+          py::arg("gemma_norm")         = false,        \
+          py::arg("scale_layout_m32k4") = false);       \
+    m.def("rmsnorm",                                    \
+          &aiter::rmsnorm,                              \
+          py::arg("out"),                               \
+          py::arg("input"),                             \
+          py::arg("weight"),                            \
+          py::arg("epsilon"),                           \
+          py::arg("gemma_norm") = false);
+
 #define RMSNORM_PYBIND                                                                             \
     m.def("rms_norm_cu",                                                                           \
           &rms_norm,                                                                               \
