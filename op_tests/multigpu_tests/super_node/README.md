@@ -17,16 +17,19 @@ Fabric 内存完成通信。测试按每节点4张HCU组织，支持以下常用
 每 rank 最大 **64 MiB**（67,108,864字节）的输入，
 并始终受 `max_size / 2` 的容量约束。超过门限时返回不适用，由框架选择
 RCCL等回退后端。
-框架无需传入 `prefill_support=True`；SGLang 的外层筛选与 AITER 包装函数
-内部复检会采用同一策略。默认 `max_size=1 GiB`，本次调整不会改变其预分配
-input/meta 缓冲区大小，实际复制量等于输入大小。
+框架无需传入 `prefill_support=True`。默认共享容量为128MiB，构造参数
+`max_size=None` 时读取 `AITER_AR_BUFFER_SIZE_MB`（正整数MiB，默认128）；
+显式 `max_size` 仍以字节为单位且优先。input/meta预分配约为B/2B，
+实际复制量等于输入大小。SGLang若把消息门限转传为显式容量，需按
+[接入建议](../../../docs/communication/custom_allreduce.md#接口与输入条件)单独迁移，
+不能假定它会采用AITER的新容量默认值。
 
 可在启动所有 rank 前设置正整数环境变量 `AITER_AR_MAX_SIZE_MB`（单位为
 MiB，即1024×1024字节）覆盖普通 AllReduce 门限；未设置时为 `64`，
 例如显式设置 `256` 可用于较大输入的功能验证，不代表性能更优。显式传入
 `prefill_support=True` 的已有调用仍按 `max_size / 2` 检查。
-ReduceScatter 和原先共用此筛选函数的融合入口保留原有64MiB限制；
-AllGather的大小策略保持不变。
+ReduceScatter和融合入口保留 `min(64MiB, B/2)` 限制；AllGather单rank输入
+上限仍为 `B/(2*world_size)`，因此默认容量降低也会降低其可接受大小。
 
 大小门限控制是否选择此后端，不代表所有输入都比NCCL更快。大输入基本
 功能测试可在同节点IPC或超节点Fabric上执行。以下使用已有测试脚本验证

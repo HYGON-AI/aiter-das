@@ -496,7 +496,12 @@ def run_transport(args):
     ca=None
     try:
         os.environ['AITER_AR_TRANSPORT']='auto'
-        ca=car.CustomAllreduce(dist.group.WORLD,device,max_size=16*1024*1024,enable_register_for_capturing=False)
+        with patch.dict(os.environ):
+            os.environ.pop('AITER_AR_BUFFER_SIZE_MB', None)
+            os.environ.pop('AITER_AR_MAX_SIZE_MB', None)
+            ca=car.CustomAllreduce(dist.group.WORLD,device,enable_register_for_capturing=False)
+        assert ca.max_size == ca._pool['input'].max_size == 128 * 1024**2
+        assert ca._all_reduce_max_size == 64 * 1024**2
         assert not ca.disabled and ca.transport=='ipc'
         for dtype in (torch.float16,torch.bfloat16,torch.float32):
             x=torch.empty((4,512),device=device,dtype=dtype)
@@ -514,9 +519,28 @@ def run_transport(args):
         if args.tp6:
             print('CAR_TP6_PASS',rank,world,flush=True)
             return
+        os.environ['AITER_AR_TRANSPORT']='ipc'
+        # Configuration contracts belong to initialization; large-message and
+        # Graph boundaries are already covered by the existing AR suites.
+        for env_value, explicit, expected in [('32', None, 32), ('invalid', 16 * 1024**2, 16)]:
+            with patch.dict(os.environ, {'AITER_AR_BUFFER_SIZE_MB': env_value, 'AITER_AR_MAX_SIZE_MB': '16'}):
+                ca=car.CustomAllreduce(dist.group.WORLD,device,max_size=explicit,enable_register_for_capturing=False)
+                assert not ca.disabled
+                assert ca.max_size == ca._pool['input'].max_size == expected * 1024**2
+                assert ca._all_reduce_max_size == 16 * 1024**2
+                torch.cuda.synchronize();dist.barrier();ca.close();ca=None
+        with patch.dict(os.environ, {'AITER_AR_BUFFER_SIZE_MB': '0'}):
+            expect_value_error(lambda: car.CustomAllreduce(dist.group.WORLD,device))
+        for key in ('AITER_AR_BUFFER_SIZE_MB', 'AITER_AR_MAX_SIZE_MB'):
+            with patch.dict(os.environ, {'AITER_AR_BUFFER_SIZE_MB': '32', 'AITER_AR_MAX_SIZE_MB': '16'}):
+                os.environ[key] = '32' if rank == 0 else '64'
+                with patch.object(car.IPCBufferPool, 'create') as allocate:
+                    expect_value_error(lambda: car.CustomAllreduce(dist.group.WORLD,device))
+                    allocate.assert_not_called()
+            dist.barrier()
+        print('CAR_CONFIG_CONTRACTS_PASS', rank, world, flush=True)
         # Inject one failed rank at three native resource phases; all ranks
         # must leave initialization disabled and release their allocations.
-        os.environ['AITER_AR_TRANSPORT']='ipc'
         for owner,method in ((car.IPCBufferPool,'create'),(car.IPCBufferPool,'get_local_meta'),(car.ops,'init_custom_ar')):
             original=getattr(owner,method)
             def injected(*a,**kw):

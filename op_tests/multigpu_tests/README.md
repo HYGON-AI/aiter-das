@@ -60,7 +60,7 @@ framework/model validation.
 |---|---|---|
 | `test_custom_allreduce_api.py --suite collectives` | Dimension-aware AG/RS, integer bit preservation, input validation, changing Graph inputs, close/recreate | 2, 4, 8 |
 | `test_custom_allreduce_api.py --suite fusions` | RMSNorm/Gemma, padding/strides, FP8 mirrors/scales, MXFP4 packing, QK norm, Graph registration | 2, 4, 8 |
-| `test_custom_allreduce_api.py --suite transport` | IPC selection, collective initialization failures, topology rejection, optional disabled-Fabric check | 2, 4, 8; 6 with `--tp6` |
+| `test_custom_allreduce_api.py --suite transport` | IPC selection, default capacity/environment precedence, rank configuration agreement, collective initialization failures, topology rejection, optional disabled-Fabric check | 2, 4, 8; 6 with `--tp6` |
 | `test_custom_allreduce_api.py --suite reuse` | Immediate input reuse, changing eager/Graph inputs, exact FP16/BF16/FP32 sums and HCU copy-in protection | 2, 4, 8 |
 | `test_custom_allreduce_api.py --suite ar-boundaries` | Mixed packet/LL/tile boundaries, two alternating Graphs, allocation cycles, rank submission skew and staging/admission capacity limits | 2, 4, 8 |
 | `test_custom_allreduce_api.py --suite ar-precision` | Ordered FP32 sums, FP16/BF16 RNE ties, cancellation, Inf/NaN, subnormals, guarded tails and changing Graph inputs | 2, 4, 8 |

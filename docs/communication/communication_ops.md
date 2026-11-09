@@ -55,7 +55,7 @@ native `init_custom_ar` / `allocate_meta_buffer` 末尾增加可选 `transport=0
 | `init_model_parallel_group` / `GroupCoordinator` / `CudaCommunicator` 的新增构造参数 | 不直接传入 AMD 的 `reuse_from` / `is_ep`；`init_model_parallel_group` 也没有 AMD 的 `use_device_communicator` 参数 | 需要在框架适配层安排组复用/EP 语义，不能仅删除参数并假定行为等价 |
 | native `reduce_scatter(_fa, inp, out, m, n, k, split_dim, reg_ptr, reg_bytes)` | 同一组参数使用 `aiter.ops.custom_all_reduce.reduce_scatter_dim` | Hygon 保留的同名 `reduce_scatter` 是五参数首维版本；优先使用 `ca.custom_reduce_scatter` |
 | 内部 `parallel_state.all_reduce_` 或中间类直接 MXFP4 方法 | 使用 `aiter.dist.communication_op` 对应的公共 AR / MXFP4 入口 | 内部 custom-op 参数和类级入口存在差异；两边均提供顶层 MXFP4 接口 |
-| `AITER_CUSTOM_AR_MAX_SIZE`（字节） | 使用 `AITER_AR_MAX_SIZE_MB`（正整数 MiB），同时核对 `max_size` | 环境变量名、单位和容量上限不同；AMD 支持以 0 禁用，Hygon 此变量须为正整数，不支持该禁用方式 |
+| `AITER_CUSTOM_AR_MAX_SIZE`（字节） | `AITER_AR_MAX_SIZE_MB` 配置普通AR门限，`AITER_AR_BUFFER_SIZE_MB` 配置共享容量（均为正整数MiB）；显式 `max_size` 仍优先 | 环境变量名、单位和容量上限不同；AMD支持以0禁用，Hygon这两个变量须为正整数，不支持该禁用方式 |
 
 `init_dist_env(tensor_model_parallel_size=..., rankID=...)` 是共同支持的调用形式。Hygon 还保留 `world_size` 这个 TP 大小别名，并增加 PP/custom-group 参数，具体初始化示例见下文。AMD 的 gfx1250/VMM 专用绑定与 HCU 接口应按各自平台使用；Python 包和 native 模块需使用配套的平台版本。
 
@@ -141,7 +141,7 @@ TP/DP/EP/PP 的 AG 常用签名为 `(input_, use_custom=False, dim=-1)`，RS 为
 ### 容量与后端配置
 
 - 各 rank 使用不同 GPU，按相同顺序调用 collective，输入形状/dtype、选项及回退决策保持一致。直接 CAR 对象使用 CPU/Gloo 组交换元数据。
-- `max_size` 为 staging 容量，默认 1 GiB；普通 AR 门限默认 64 MiB，可通过 `AITER_AR_MAX_SIZE_MB` 调整，但始终受 `max_size/2` 约束。超过门限时由调用方选择 RCCL 等回退后端。融合和 RS 仍受 `min(64 MiB, max_size/2)` 约束。
+- `max_size` 为正整数 staging 容量（字节）；默认 `None` 时读取 `AITER_AR_BUFFER_SIZE_MB`，未设置则为128MiB，显式参数优先。普通 AR 门限默认64MiB，由独立的 `AITER_AR_MAX_SIZE_MB` 调整，但仍受 `max_size/2` 约束。超过门限时由调用方选择RCCL等回退后端。融合和RS仍受 `min(64 MiB, max_size/2)` 约束；AG/QK/MHC等共享接口的大输入需核对容量，详见[容量配置](custom_allreduce.md#接口与输入条件)。
 - 普通 CAR 不需要 kernelID。不设置新变量即包含已启用的 TP2 优化；小载荷 LL 需要在创建通信器前、各 rank 统一设置 `AITER_AR_SMALL_MESSAGE=auto`。它仅自动准入 gfx936/gfx938 单机 IPC 的 TP2/4、FP16/BF16、每 rank ≤32 KiB 等已支持组合，其余回退传统路径；TP8 auto 仍为传统路径。完整配置见 [默认分派](custom_allreduce.md#默认分派与配置)。
 - `AITER_AR_TRANSPORT` 默认 `ipc`，也接受 `auto` / `fabric`。`AITER_ENABLE_SUPERNODE_AR=0` 是编译时 IPC-only 开关；未设置时保留 Fabric 构建，需配套 DTK 头文件与运行时。
 
