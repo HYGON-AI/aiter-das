@@ -443,6 +443,10 @@ def _try_get_triton_config(
     k: int,
     top_k: int,
 ) -> Optional[Dict[str, Any]]:
+
+    if quant_type == MoeQuantType.W4A16 and block_size <= 0:
+        return None
+
     try:
         from boltops.fused_moe.triton.moe_config_utils import get_moe_configs as triton_get_moe_configs
 
