@@ -333,6 +333,7 @@ def run_invalid(aiter, c):
         x, residual, post_layer_mix, comb_res_mix = make_inputs(
             m, 1000, seed)
         hidden = 1000
+        expect = "divisible by 256"
         set_kernel_env(None)
     elif name == "hidden_384":
         # v5 accepts hidden divisible by 128 (not by 256); v3 must reject it.
