@@ -841,12 +841,17 @@ def run_ar_boundaries(args):
             # Simulate one unsupported participant in the capability exchange;
             # all ranks must fall back before allocating or launching LL.
             gather = dist.all_gather_object
+            capability_injected = False
             def one_unsupported(outputs, value, *args, **kwargs):
-                if isinstance(value, tuple) and len(value) == 3 and value[0] == requested:
-                    value = (value[0], value[1], value[2] and rank != 0)
+                nonlocal capability_injected
+                if isinstance(value, tuple) and len(value) == 4 and value[0] == requested:
+                    # Keep mode, capacity and admission limit identical across ranks.
+                    value = (*value[:3], value[3] and rank != 0)
+                    capability_injected = True
                 return gather(outputs, value, *args, **kwargs)
             with patch.object(dist, 'all_gather_object', side_effect=one_unsupported):
                 ca = CustomAllreduce(dist.group.WORLD, local, max_size=64 << 20)
+            assert capability_injected, 'capability exchange was not intercepted'
             assert not ca.disabled and ca.small_ar_mode == 'off'
             torch.testing.assert_close(ca.custom_all_reduce(tiny),
                                        torch.full_like(tiny,world*(world+1)/2),rtol=0,atol=0)
