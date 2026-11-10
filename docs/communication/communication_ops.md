@@ -5,9 +5,9 @@ Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 # Hygon AITER comm 算子接入与接口说明
 
-本文面向在 vLLM/SGLang 中接入 Hygon AITER 通信算子的开发者，介绍接口用法、HCU 适配约定及验证方式，并提供与 AMD AITER 的接口对照。普通 `CustomAllreduce` 和顶层并行组主接口保持共同的调用方式；中间通信器及 native 绑定的差异见下表。**本轮普通 CAR 性能优化保持已有接口名和参数不变。**
+本文面向在 vLLM/SGLang 中接入 Hygon AITER 通信算子的开发者，介绍接口用法、HCU 适配约定及验证方式，并提供与 Upstream AITER 的接口对照。普通 `CustomAllreduce` 和顶层并行组主接口保持共同的调用方式；中间通信器及 native 绑定的差异见下表。**本轮普通 CAR 性能优化保持已有接口名和参数不变。**
 
-接口对照基于 Hygon `186df8da` 与 AMD `06e3bf795e`。AR、AG、RS 分别表示 AllReduce、AllGather、ReduceScatter；TP 表示张量并行 rank 数。HCU 的 PyTorch 设备名仍为 `cuda`。
+接口对照基于 Hygon `186df8da` 与 Upstream `06e3bf795e`。AR、AG、RS 分别表示 AllReduce、AllGather、ReduceScatter；TP 表示张量并行 rank 数。HCU 的 PyTorch 设备名仍为 `cuda`。
 
 - [Hygon AITER comm 算子接入速查](#hygon-aiter-comm-算子接入速查)
 - [初始化、并行组与 Graph 生命周期](#初始化与运行约定)
@@ -38,7 +38,7 @@ Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 | `aiter.ops.custom_all_reduce` 的 MHC 接口、`aiter.ops.triton.comms` 的 Iris 接口 | MHC / Iris 共同入口 | 参数一致；MHC copy-in 与 Iris Graph 限制见对应说明 |
 | `aiter.dist.device_communicators.communicator_pynccl.PyNcclCommunicator` | AR/AG/RS、变长 collective、P2P、窗口注册 | 公共方法签名一致 |
 
-Hygon 为部分共同接口提供可选参数扩展：`custom_fused_ar_rms`、`custom_fused_ar_rms_packed_input`、`custom_fused_ar_rms_quant` 的 `use_1stage` 在 AMD AITER 中为必填，在 Hygon AITER 中提供默认值 `False`；`should_custom_ag(inp)` 增加 `dim=0`，`should_custom_rs(inp, dim)` 增加默认 `dim=0`。接入时可继续显式传入这些参数，保持共同的调用形式。
+Hygon 为部分共同接口提供可选参数扩展：`custom_fused_ar_rms`、`custom_fused_ar_rms_packed_input`、`custom_fused_ar_rms_quant` 的 `use_1stage` 在 Upstream AITER 中为必填，在 Hygon AITER 中提供默认值 `False`；`should_custom_ag(inp)` 增加 `dim=0`，`should_custom_rs(inp, dim)` 增加默认 `dim=0`。接入时可继续显式传入这些参数，保持共同的调用形式。
 
 native `init_custom_ar` / `allocate_meta_buffer` 末尾增加可选 `transport=0`；`qr_get_handle` 的 `out_ptr` 在 Hygon 可省略。FlyDSL `QuickAllReduceInt4` 增加 `small_payload_policy="fp"`，`close()` 增加可选 `collective=True`。这些扩展兼容原有调用形式；INT4/FP8 量化后端与普通 CAR 的精度约定需分别评估。
 
@@ -46,18 +46,18 @@ native `init_custom_ar` / `allocate_meta_buffer` 末尾增加可选 `transport=0
 
 以下差异发生在所列的 **AITER 类/模块** 中，不指 vLLM/SGLang 自己的同名类。只使用上表高层入口的集成通常无需触及这些细节。
 
-| AMD AITER 接口参考 | Hygon AITER 接入约定 | 差异说明 |
+| Upstream AITER 接口参考 | Hygon AITER 接入约定 | 差异说明 |
 |---|---|---|
 | `GroupCoordinator.all_reduce(x, ca_use_new=True, ca_fp8_quant=False)` | `group.all_reduce(x, use_new=True, open_fp8_quant=False)`；`prefill_support` 不变 | 两个关键字名称不同；顶层 TP 包装没有此差异 |
-| `GroupCoordinator.reduce_scatter(x)` | 明确写 `group.reduce_scatter(x, dim=0)`，保留 AMD 默认语义 | AMD 默认 `dim=0`，Hygon 默认 `dim=-1`；顶层 TP RS 两边均默认 0 |
-| `CudaCommunicator.reduce_scatter(x, out, dim=d)` | `out = comm.reduce_scatter(x, dim=d)` | Hygon 分配并返回输出；AMD 写预分配 out 并返回 `None`。若必须保持 out 地址，在适配层写 `out.copy_(comm.reduce_scatter(x, dim=d))`，并计入额外分配/拷贝成本 |
-| `initialize_model_parallel(...)` / `ensure_model_parallel_initialized(...)` 的位置参数 | TP、PP、`backend`、`decode_context_model_parallel_size` 等均用关键字传入 | AMD 第三个位置参数为 DCP 大小，Hygon 为 backend |
-| `init_model_parallel_group` / `GroupCoordinator` / `CudaCommunicator` 的新增构造参数 | 不直接传入 AMD 的 `reuse_from` / `is_ep`；`init_model_parallel_group` 也没有 AMD 的 `use_device_communicator` 参数 | 需要在框架适配层安排组复用/EP 语义，不能仅删除参数并假定行为等价 |
+| `GroupCoordinator.reduce_scatter(x)` | 明确写 `group.reduce_scatter(x, dim=0)`，保留 Upstream 默认语义 | Upstream 默认 `dim=0`，Hygon 默认 `dim=-1`；顶层 TP RS 两边均默认 0 |
+| `CudaCommunicator.reduce_scatter(x, out, dim=d)` | `out = comm.reduce_scatter(x, dim=d)` | Hygon 分配并返回输出；Upstream 写预分配 out 并返回 `None`。若必须保持 out 地址，在适配层写 `out.copy_(comm.reduce_scatter(x, dim=d))`，并计入额外分配/拷贝成本 |
+| `initialize_model_parallel(...)` / `ensure_model_parallel_initialized(...)` 的位置参数 | TP、PP、`backend`、`decode_context_model_parallel_size` 等均用关键字传入 | Upstream 第三个位置参数为 DCP 大小，Hygon 为 backend |
+| `init_model_parallel_group` / `GroupCoordinator` / `CudaCommunicator` 的新增构造参数 | 不直接传入 Upstream 的 `reuse_from` / `is_ep`；`init_model_parallel_group` 也没有 Upstream 的 `use_device_communicator` 参数 | 需要在框架适配层安排组复用/EP 语义，不能仅删除参数并假定行为等价 |
 | native `reduce_scatter(_fa, inp, out, m, n, k, split_dim, reg_ptr, reg_bytes)` | 同一组参数使用 `aiter.ops.custom_all_reduce.reduce_scatter_dim` | Hygon 保留的同名 `reduce_scatter` 是五参数首维版本；优先使用 `ca.custom_reduce_scatter` |
 | 内部 `parallel_state.all_reduce_` 或中间类直接 MXFP4 方法 | 使用 `aiter.dist.communication_op` 对应的公共 AR / MXFP4 入口 | 内部 custom-op 参数和类级入口存在差异；两边均提供顶层 MXFP4 接口 |
-| `AITER_CUSTOM_AR_MAX_SIZE`（字节） | `AITER_AR_MAX_SIZE_MB` 配置普通AR门限，`AITER_AR_BUFFER_SIZE_MB` 配置共享容量（均为正整数MiB）；显式 `max_size` 仍优先 | 环境变量名、单位和容量上限不同；AMD支持以0禁用，Hygon这两个变量须为正整数，不支持该禁用方式 |
+| `AITER_CUSTOM_AR_MAX_SIZE`（字节） | `AITER_AR_MAX_SIZE_MB` 配置普通AR门限，`AITER_AR_BUFFER_SIZE_MB` 配置共享容量（均为正整数MiB）；显式 `max_size` 仍优先 | 环境变量名、单位和容量上限不同；Upstream支持以0禁用，Hygon这两个变量须为正整数，不支持该禁用方式 |
 
-`init_dist_env(tensor_model_parallel_size=..., rankID=...)` 是共同支持的调用形式。Hygon 还保留 `world_size` 这个 TP 大小别名，并增加 PP/custom-group 参数，具体初始化示例见下文。AMD 的 gfx1250/VMM 专用绑定与 HCU 接口应按各自平台使用；Python 包和 native 模块需使用配套的平台版本。
+`init_dist_env(tensor_model_parallel_size=..., rankID=...)` 是共同支持的调用形式。Hygon 还保留 `world_size` 这个 TP 大小别名，并增加 PP/custom-group 参数，具体初始化示例见下文。Upstream 的 gfx1250/VMM 专用绑定与 HCU 接口应按各自平台使用；Python 包和 native 模块需使用配套的平台版本。
 
 ## 初始化与运行约定
 
@@ -151,7 +151,7 @@ CAR 直接调用需在所有 rank 完成 JIT/预热后，嵌套 `with ca.capture
 
 gfx936/gfx938 的高层 IPC communicator 会关闭输入直接注册，即使传入 `enable_register_for_capturing=True` 或框架开启 `AITER_AR_ENABLE_REG_CAPTURE`，CAR 和 Graph 仍正常启用。传统路径使用 capture 内 copy-in；已准入的 LL 从本卡输入发布至通信 scratch。注册请求 True/False 最终使用相同的安全分派，不控制 LL 的启用。应保留高层保护及同步，不通过低层 `registered_input` 绕过限制；Fabric 保持原有注册限制。
 
-普通 AR 与部分 RMS/quant wrapper 在 `ca.capture()` 内但尚未开始实际 Graph capture 的预热阶段返回占位零值，不能当作模型输出消费；Hygon AG/RS 和 QK-RoPE 此时执行真实通信。QK-RoPE 在 communicator disabled 时会抛异常，与 AMD 高层的空输出分支不同，应在框架选路时处理。Iris 不支持 Graph；QR/INT4 的捕获和 collective 关闭要求见 [Quick AllReduce](quick_all_reduce.md)。
+普通 AR 与部分 RMS/quant wrapper 在 `ca.capture()` 内但尚未开始实际 Graph capture 的预热阶段返回占位零值，不能当作模型输出消费；Hygon AG/RS 和 QK-RoPE 此时执行真实通信。QK-RoPE 在 communicator disabled 时会抛异常，与 Upstream 高层的空输出分支不同，应在框架选路时处理。Iris 不支持 Graph；QR/INT4 的捕获和 collective 关闭要求见 [Quick AllReduce](quick_all_reduce.md)。
 
 ## AllGather / ReduceScatter
 
