@@ -11,3 +11,10 @@
 # Rebuild working copies, logs and wheel packages.
 /build/
 /dist/
+
+# AITER JIT build artifacts and local install markers.
+/aiter/jit/build/
+/aiter/jit/*.so
+/aiter/install_mode
+/aiter.egg-info/
+/aiter_meta/
