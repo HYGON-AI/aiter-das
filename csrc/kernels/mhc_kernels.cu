@@ -3459,6 +3459,37 @@ namespace aiter {
     }
 
 
+//! ---- 路径追踪: AITER_MHC_POST_TRACE=1 时每次调用向 stderr 打印实际选中的内核 ----
+//! 环境变量由主机函数读取一次（函数内静态变量），未设置、空串或 "0" 时不输出。
+//! 调用点固定在各实现宏算出 k_blocks 之后，使 auto 选中的版本与关键参数可追溯。
+#define MHC_POST_TRACE_EMIT(ver_name, elems, chunk_bytes, kblocks_value) \
+    do { \
+        if (mhc_post_trace_on) { \
+            std::fprintf(stderr, \
+                "[mhc_post_trace] arch=%s cu=%d m=%d hidden=%d env=%s selected=%s " \
+                "elems_per_thread=%d chunk_bytes=%d k_blocks=%d\n", \
+                arch_id.c_str(), cu_num, m, hidden_size, \
+                (env_post != nullptr ? env_post : "<unset>"), (ver_name), \
+                static_cast<int>(elems), static_cast<int>(chunk_bytes), \
+                static_cast<int>(kblocks_value)); \
+            std::fflush(stderr); \
+        } \
+    } while (0)
+
+//! legacy 没有 chunk_bytes 概念：三项粒度字段填 "-"，追加 residual_block。
+#define MHC_POST_TRACE_EMIT_LEGACY(resblock) \
+    do { \
+        if (mhc_post_trace_on) { \
+            std::fprintf(stderr, \
+                "[mhc_post_trace] arch=%s cu=%d m=%d hidden=%d env=%s selected=legacy " \
+                "elems_per_thread=- chunk_bytes=- k_blocks=- residual_block=%d\n", \
+                arch_id.c_str(), cu_num, m, hidden_size, \
+                (env_post != nullptr ? env_post : "<unset>"), \
+                static_cast<int>(resblock)); \
+            std::fflush(stderr); \
+        } \
+    } while (0)
+
 //! ---- IMPL 宏: 实例化并 launch 指定 mhc_post kernel (老版本，warp-specialized 4 输出路径) ----
 #define MHC_POST_KERNEL_IMPL(kernel_name, hidden_size, residual_block) \
     AITER_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
@@ -3472,6 +3503,7 @@ namespace aiter {
         if (hidden_size % (k_blocks * residual_block) == 0 && hidden_size / k_blocks >= residual_block) break; \
     } \
     int sub_hidden_size = hidden_size / k_blocks; \
+    MHC_POST_TRACE_EMIT_LEGACY(residual_block); \
     dim3 grid(m, k_blocks); \
     dim3 block(block_size); \
     AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post", [&] { \
@@ -3510,6 +3542,7 @@ namespace aiter {
             if (hidden_size % (k_blocks * round_elems_v2) == 0 && hidden_size / k_blocks >= round_elems_v2) break; \
         } \
         int sub_hidden_size = hidden_size / k_blocks; \
+        MHC_POST_TRACE_EMIT("v2", elems_per_thread, (elems_per_thread) * 2, k_blocks); \
         dim3 grid(m, k_blocks); \
         dim3 block(block_size_v2); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v2", [&] { \
@@ -3546,6 +3579,7 @@ namespace aiter {
             if (hidden_size % (k_blocks * round_elems_v3) == 0 && hidden_size / k_blocks >= round_elems_v3) break; \
         } \
         int sub_hidden_size = hidden_size / k_blocks; \
+        MHC_POST_TRACE_EMIT("v3", elems_per_thread, (elems_per_thread) * 2, k_blocks); \
         dim3 grid(m, k_blocks); \
         dim3 block(block_size_v3); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v3", [&] { \
@@ -3583,6 +3617,7 @@ namespace aiter {
             if (hidden_size % (k_blocks * round_elems_v4) == 0 && hidden_size / k_blocks >= round_elems_v4) break; \
         } \
         int sub_hidden_size = hidden_size / k_blocks; \
+        MHC_POST_TRACE_EMIT("v4", elems_per_thread, (elems_per_thread) * 2, k_blocks); \
         dim3 grid(m, k_blocks); \
         dim3 block(block_size_v4); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v4", [&] { \
@@ -3620,6 +3655,7 @@ namespace aiter {
             if (hidden_size % (k_blocks * round_elems_v6) == 0 && hidden_size / k_blocks >= round_elems_v6) break; \
         } \
         int sub_hidden_size = hidden_size / k_blocks; \
+        MHC_POST_TRACE_EMIT("v6", elems_per_thread, (elems_per_thread) * 2, k_blocks); \
         dim3 grid(m, k_blocks); \
         dim3 block(block_size_v6); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v6", [&] { \
@@ -3656,6 +3692,7 @@ namespace aiter {
             if (hidden_size % (k_blocks * round_elems_v7) == 0 && hidden_size / k_blocks >= round_elems_v7) break; \
         } \
         int sub_hidden_size = hidden_size / k_blocks; \
+        MHC_POST_TRACE_EMIT("v7", elems_per_thread, (elems_per_thread) * 2, k_blocks); \
         dim3 grid(m, k_blocks); \
         dim3 block(block_size_v7); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v7", [&] { \
@@ -3698,6 +3735,7 @@ namespace aiter {
             if (hidden_size % (k_blocks * warp_chunk_v5) == 0 && hidden_size / k_blocks >= warp_chunk_v5) break; \
         } \
         int sub_hidden_size = hidden_size / k_blocks; \
+        MHC_POST_TRACE_EMIT("v5", elems_per_lane, (elems_per_lane) * 2, k_blocks); \
         dim3 grid(m, k_blocks); \
         dim3 block(block_size_v5); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v5", [&] { \
@@ -3909,7 +3947,14 @@ namespace aiter {
         const hipStream_t stream = at::hip::getCurrentHIPStream();
         const int cu_num = get_num_cu_func();
         const std::string arch_id = get_gpu_arch();
-        
+
+        //! AITER_MHC_POST_TRACE: 每次调用在 stderr 打印实际选中的内核与参数（只读取一次）
+        static const bool mhc_post_trace_on = []() {
+            const char* trace_env = std::getenv("AITER_MHC_POST_TRACE");
+            return trace_env != nullptr && trace_env[0] != '\0'
+                && std::strcmp(trace_env, "0") != 0;
+        }();
+
         MHC_POST_KERNEL_DISPATCH(hidden_size);
     }
 
