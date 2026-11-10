@@ -7,6 +7,7 @@
 # The original source code was licensed under the MIT license and included
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 import triton
 import triton.language as tl

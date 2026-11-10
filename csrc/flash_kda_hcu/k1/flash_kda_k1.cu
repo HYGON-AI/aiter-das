@@ -3,7 +3,6 @@
 //
 // K1 的主机入口：参数校验、workspace 分配视图与两套 kernel 实例的实例化。
 
-// SPDX-License-Identifier: MIT
 #include "flash_kda_k1.h"
 #include "flash_kda_k1_layout.cuh"
 #include "flash_kda_k1_utils.cuh"

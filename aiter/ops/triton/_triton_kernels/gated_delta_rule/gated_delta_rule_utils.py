@@ -1,4 +1,6 @@
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2023-2026, Songlin Yang, Yu Zhang
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 import contextlib
 import functools

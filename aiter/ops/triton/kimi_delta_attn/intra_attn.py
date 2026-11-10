@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 # Adapted from flash-linear-attention: Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 """
 Intra-chunk attention kernels for chunk_delta_attn forward pass.

@@ -7,7 +7,6 @@
 #ifndef FLASH_KDA_K1_KERNEL_CUH
 #define FLASH_KDA_K1_KERNEL_CUH
 
-// SPDX-License-Identifier: MIT
 #include "flash_kda_k1.h"
 #include "flash_kda_k1_layout.cuh"
 #include "flash_kda_k1_utils.cuh"
