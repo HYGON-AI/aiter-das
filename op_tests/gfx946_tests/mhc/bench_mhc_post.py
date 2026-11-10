@@ -3,8 +3,9 @@
 """Per-version timing harness for mhc_post on gfx946 (relative comparison only).
 
 One invocation measures one AITER_MHC_POST_KERNEL value over a shape list. The
-first call of every cell runs the same bf16 bit-pattern judgement as
-test_mhc_post.py; a failing cell is recorded as "numeric fail" and gets no
+first call of every cell runs the same cancellation-aware bf16 gate as
+test_mhc_post.py (float64 reference, bound max(1 ULP, 8*eps32*S)); a failing
+cell is recorded as "numeric fail" and gets no
 timing. Passing cells are timed with CUDA events (warmup then iters, median).
 If --auto-selection is on (default), each shape is first run once with the
 environment unset to record which version the auto rule selects now.
@@ -35,8 +36,8 @@ VARIANTS = ("v3", "v4", "v5", "v7", "legacy", "v2", "v6")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_mhc_post import (  # noqa: E402
-    captured_stderr, compare_bf16, make_inputs, mhc_post_ref, parse_trace,
-    read_captured, run_dut,
+    captured_stderr, compare_out, make_inputs, parse_trace, read_captured,
+    reference64, run_dut, term_magnitude,
 )
 
 
@@ -61,7 +62,7 @@ def auto_selected(aiter, m, hidden_size, seed):
 
 
 def time_cell(aiter, variant, x, residual, post_layer_mix, comb_res_mix,
-              ref, warmup, iters):
+              ref64, s_terms, warmup, iters):
     m, hidden_size = residual.shape[0], residual.shape[2]
     out = torch.empty(m, 4, hidden_size, dtype=torch.bfloat16, device="cuda")
     dx, dres = x.cuda(), residual.cuda()
@@ -74,7 +75,7 @@ def time_cell(aiter, variant, x, residual, post_layer_mix, comb_res_mix,
     try:
         call()
         torch.cuda.synchronize()
-        verdict = compare_bf16(ref, out.cpu())
+        verdict = compare_out(ref64, s_terms, out.cpu())
         if verdict["violations"]:
             return dict(numeric=verdict, status="numeric fail"), None
         for _ in range(warmup):
@@ -161,9 +162,11 @@ def main():
         if not args.no_auto_selection:
             record["auto_selected"] = auto_selected(aiter, m, hidden, seed)
         x, residual, post_layer_mix, comb_res_mix = make_inputs(m, hidden, seed)
-        ref = mhc_post_ref(x, residual, post_layer_mix, comb_res_mix)
+        ref64 = reference64(x, residual, post_layer_mix, comb_res_mix)
+        s_terms = term_magnitude(x, residual, post_layer_mix, comb_res_mix)
         detail, _ = time_cell(aiter, args.variant, x, residual, post_layer_mix,
-                              comb_res_mix, ref, args.warmup, args.iters)
+                              comb_res_mix, ref64, s_terms, args.warmup,
+                              args.iters)
         record.update(detail)
         results["cases"].append(record)
         print("CASE " + json.dumps(record), flush=True)

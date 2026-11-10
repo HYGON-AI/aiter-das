@@ -14,13 +14,24 @@ Run inside the perf-model container with the PMD chip selector exported:
     python op_tests/gfx946_tests/mhc/test_mhc_post.py --suite v3probe \
         --expect-xcds 1 --json ../../../test_mhc_post/mhc_post_sb_v3probe.json
 Suites, in the order "all" runs them: v3probe (3), auto (36), v3 (36),
-auto_stress (1), v3_stress (1), others (72), invalid (4).
+auto_stress (1), v3_stress (1), others (72), crosskernel (12), invalid (4).
 --case accepts "group:index" or a comma separated list; --list-cases prints them.
 AITER_MHC_POST_TRACE is always enabled, so every case must leave exactly one
 [mhc_post_trace] line in stderr; the line is parsed and stored in the JSON.
-Numerical verdict: zero out-of-tolerance elements. out is judged on the bf16 bit
-pattern (same sign and both normal means |int16 delta| <= 1; otherwise bit
-equality or <= 2**-133). The 5% ratio allowance of checkAllclose is not used.
+Numerical verdict: zero out-of-tolerance elements, judged against a CPU float64
+reference with a cancellation-aware bound:
+
+    |ref64 - out| <= max(1 bf16 ULP(ref64), 8 * eps32 * S)
+    S = |post_layer_mix * x| + sum_h2 |comb_res_mix[h2, h] * residual[h2]|
+
+Non-cancelling elements are held to one bf16 step; cancellation-dominated ones
+(the pilot's failure mode) get a bound that scales with the magnitude of the
+intermediate terms, because float32 rounding of those terms cannot be undone by
+any implementation. The float32 reference is still computed and its bf16 ULP
+statistics are recorded for cross-check, but it is not the gate. The 5% ratio
+allowance of checkAllclose is not used.
+Suite crosskernel asserts that v3, legacy and v4 produce bit-identical outputs
+for the same inputs; run it once to fix the baseline of that gate.
 """
 
 import argparse
@@ -42,8 +53,10 @@ BATCHES = (1, 32, 64, 128, 256, 512, 1024, 2048, 8192)
 HIDDENS = (1280, 2560, 4096, 7168)
 OTHERS = ("legacy", "v2", "v4", "v5", "v6", "v7")
 OTHERS_BATCHES = (1, 32, 1024)
+CROSS_KERNELS = ("v3", "legacy", "v4")
 V3PROBE_HIDDENS = (1280, 2560, 4096)
 SUBNORMAL_FLOOR = 2.0 ** -133
+FP32_EPS = 2.0 ** -24
 TRACE_PREFIX = "[mhc_post_trace] "
 POST_ENV = ("AITER_MHC_POST_KERNEL", "AITER_MHC_POST_TRACE")
 
@@ -100,6 +113,45 @@ def mhc_post_ref(x, residual, post_layer_mix, comb_res_mix):
     """CPU float32 reference, three lines as in op_tests/test_mhc.py."""
     term2 = torch.bmm(comb_res_mix.mT, residual.float())
     return (x.float().unsqueeze(-2) * post_layer_mix + term2).bfloat16()
+
+
+def reference64(x, residual, post_layer_mix, comb_res_mix):
+    """CPU float64 reference; the gate compares against this one."""
+    return (x.double().unsqueeze(-2) * post_layer_mix.double()
+            + torch.bmm(comb_res_mix.double().mT, residual.double()))
+
+
+def term_magnitude(x, residual, post_layer_mix, comb_res_mix):
+    """S = |post*x| + sum_h2 |comb*residual|, the cancellation scale."""
+    return ((x.double().unsqueeze(-2) * post_layer_mix.double()).abs()
+            + torch.bmm(comb_res_mix.double().abs().mT,
+                        residual.double().abs()))
+
+
+def bf16_ulp_at(value):
+    """Spacing to the next bf16 value above |value| (subnormal step 2**-133)."""
+    mag = value.abs()
+    bits = mag.view(torch.int16).to(torch.int32)
+    up = (bits + 1).clamp(max=0x7F7E).to(torch.int16).view(torch.bfloat16)
+    return (up.float().double() - mag.float().double()).abs()
+
+
+def compare_out(ref64, s_terms, act):
+    """Cancellation-aware gate: |ref64-act| <= max(1 bf16 ULP, 8*eps32*S)."""
+    act64 = act.float().double()
+    diff = (ref64 - act64).abs()
+    ulp = bf16_ulp_at(ref64.bfloat16())
+    tol = torch.maximum(ulp, 8.0 * FP32_EPS * s_terms)
+    bad = diff > tol
+    rel = diff / ref64.abs().clamp(min=1e-30)
+    return dict(
+        violations=int(bad.sum()), total=int(act.numel()),
+        max_abs_diff=float(diff.max()),
+        max_over_tol=float((diff / tol.clamp(min=1e-300)).max()),
+        max_over_ulp=float((diff / ulp.clamp(min=1e-300)).max()),
+        max_rel_diff=float(rel.max()),
+        cancellation_zone=int(((8.0 * FP32_EPS * s_terms) > ulp).sum()),
+    )
 
 
 def make_inputs(m, hidden_size, seed, hc_mult=HC_MULT):
@@ -194,13 +246,16 @@ def cases(suite):
     if suite == "others":
         return [case(m, h, "others", kernel=k)
                 for k in OTHERS for m in OTHERS_BATCHES for h in HIDDENS]
+    if suite == "crosskernel":
+        return [case(m, h, "crosskernel")
+                for m in OTHERS_BATCHES for h in HIDDENS]
     if suite == "invalid":
         return [case(32, 1280, "invalid", name=n) for n in INVALID_CASES]
     return []
 
 
 GROUPS = ("v3probe", "auto", "v3", "auto_stress", "v3_stress", "others",
-          "invalid")
+          "crosskernel", "invalid")
 
 
 def select(all_cases, spec):
@@ -240,7 +295,9 @@ def run_numeric(aiter, c):
         forced = FORCED.get(c["kind"])
     x, residual, post_layer_mix, comb_res_mix = make_inputs(
         m, hidden, 20261109 + m + hidden)
-    ref = mhc_post_ref(x, residual, post_layer_mix, comb_res_mix)
+    ref32 = mhc_post_ref(x, residual, post_layer_mix, comb_res_mix)
+    ref64 = reference64(x, residual, post_layer_mix, comb_res_mix)
+    s_terms = term_magnitude(x, residual, post_layer_mix, comb_res_mix)
     set_kernel_env(forced)
     try:
         with captured_stderr() as tmp:
@@ -250,7 +307,8 @@ def run_numeric(aiter, c):
         set_kernel_env(None)
 
     traces, _ = parse_trace(captured)
-    record = dict(out=compare_bf16(ref, out))
+    record = dict(out=compare_out(ref64, s_terms, out),
+                  fp32_ref_check=compare_bf16(ref32, out))
     if len(traces) != 1:
         raise fail_with_detail(
             f"expected exactly 1 [mhc_post_trace] line, got {len(traces)}: "
@@ -283,6 +341,33 @@ def run_numeric(aiter, c):
         raise fail_with_detail(
             f"{record['out']['violations']} out-of-tolerance elements: "
             f"{json.dumps(record['out'])}", record)
+    return record
+
+
+def run_cross_kernel(aiter, c):
+    """v3, legacy and v4 must agree bit-for-bit on identical inputs."""
+    m, hidden = c["m"], c["hidden_size"]
+    x, residual, post_layer_mix, comb_res_mix = make_inputs(
+        m, hidden, 20261109 + m + hidden)
+    outs = {}
+    for kernel in CROSS_KERNELS:
+        set_kernel_env(kernel)
+        try:
+            with captured_stderr() as tmp:
+                outs[kernel] = run_dut(aiter, x, residual,
+                                       post_layer_mix, comb_res_mix)
+            traces, _ = parse_trace(read_captured(tmp))
+        finally:
+            set_kernel_env(None)
+        if len(traces) != 1 or traces[0].get("selected") != kernel:
+            raise fail_with_detail(
+                f"{kernel}: trace {traces} does not confirm selection", {})
+    base = outs["v3"].view(torch.int16)
+    diffs = {k: int((outs[k].view(torch.int16) != base).sum())
+             for k in CROSS_KERNELS[1:]}
+    record = dict(bitwise_diff_vs_v3=diffs, total=int(base.numel()))
+    if any(diffs.values()):
+        raise fail_with_detail(f"cross-kernel bitwise mismatch: {diffs}", record)
     return record
 
 
@@ -470,6 +555,8 @@ def main():
         try:
             if suite == "invalid":
                 detail = run_invalid(aiter, c)
+            elif suite == "crosskernel":
+                detail = run_cross_kernel(aiter, c)
             else:
                 detail = run_numeric(aiter, c)
             save(dict(record, status="PASS", **detail))
