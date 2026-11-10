@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """FlashKDA 的独立 Triton 参考与数值判定。
 
 参考路径固定为 ``aiter.ops.triton.kimi_delta_attn.flash_kda.flash_kda_fwd``：

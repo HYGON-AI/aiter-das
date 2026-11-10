@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 #pragma once
 
 // FlashKDA 外部 state 布局的纯坐标 helper。

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """FlashKDA 测试共享夹具：环境隔离、目标设备、输入构造。
 
 边界（重要）：

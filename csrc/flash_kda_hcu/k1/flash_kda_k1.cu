@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 //
 // K1 的主机入口：参数校验、workspace 分配视图与两套 kernel 实例的实例化。
 

@@ -1,9 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 import torch
 import triton
 import triton.language as tl
 
 from ..gated_delta_rule_utils import (
-    IS_AMD,
+    IS_HCU,
     RCP_LN2,
     autotune_cache_kwargs,
     gated_delta_rule_autotune_configs,
@@ -146,7 +148,7 @@ def fused_cumsum_kkt(
     return g_cumsum, A
 
 
-if IS_AMD:
+if IS_HCU:
     _CUMSUM_KKT_CONFIGS = [
         triton.Config({"BK": 32}, num_warps=4, num_stages=2),
         triton.Config({"BK": 32}, num_warps=2, num_stages=2),
@@ -160,7 +162,7 @@ else:
         triton.Config({"BK": BK}, num_warps=nw, num_stages=ns)
         for BK in [32, 64]
         for nw in [2, 4]
-        for ns in ([2, 3] if IS_AMD else [2, 3, 4])
+        for ns in ([2, 3] if IS_HCU else [2, 3, 4])
     ]
 
 _CUMSUM_KKT_DEFAULT_CONFIG = triton.Config({"BK": 32}, num_warps=4, num_stages=2)

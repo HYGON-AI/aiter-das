@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 #
 # FlashKDA 融合 K1 的 Triton prepare kernel（按 chunk 并行处理 token）。
 # 只被 `flash_kda.py` 的 host forward 使用；测试可直接取该 kernel 做阶段计时。

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """把 ``perf_sweep.py`` 的实测 CSV 与性能表（``bw1000 同口径 ms`` 列）逐行比对。
 
 expected CSV 列（表头需包含）：

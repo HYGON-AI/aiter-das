@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # FlashKDA HCU 接入验收（方案 A：在 DTK 配套运行时环境中执行）
 #   1) 环境自检  2) 重建 module_flash_kda_hcu  3) 契约/精度测试  4) 性能 sweep  5) 与性能表比对
 #

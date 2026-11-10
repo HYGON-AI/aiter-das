@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 //
 // K2 的 global→LDS 直写：kd/qd 与 kr|gt 合并区各一条发射入口（只发不等，
 // 落地与跨 wave 可见性由调用点的等待 + CTA barrier 收口）。

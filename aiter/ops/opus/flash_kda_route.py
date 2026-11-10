@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """定长输入的分段路由（冷路径适配）。
 
 分段粒度与 workspace 布局的唯一事实来源是 native `flash_kda::make_workspace_layout`

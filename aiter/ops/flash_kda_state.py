@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """State dtype resolution for FlashKDA fixed-shape initial/final state.
 
 CPU-only helper shared by the public API and the private K1/K2 wrappers.  It does

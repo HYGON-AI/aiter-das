@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 import os
 
@@ -180,7 +181,7 @@ def chunk_kimi_delta_attn(
     *,
     state_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """与 AMD AITER 兼容的 FlashKDA forward 入口。
+    """与上游 AITER 兼容的 FlashKDA forward 入口。
 
     HCU 成功路径只调用一次 native forward（校验、连续化、workspace 分配与全部
     kernel launch 都在 native 内完成）；Triton 与 auto 回退仍走原兼容处理。

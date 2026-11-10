@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 // FlashKDA 主机侧统一前向入口。
 // 负责参数校验、输出与 workspace 准备，并在当前 HIP stream 上

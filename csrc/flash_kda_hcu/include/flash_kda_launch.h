@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 #pragma once
 
 // FlashKDA 私有 host 参数与 raw launch 声明（跨 TU 使用，不含 kernel 定义）。

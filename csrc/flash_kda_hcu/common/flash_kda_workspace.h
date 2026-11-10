@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 #pragma once
 
 // FlashKDA workspace 布局与路由：纯 host、无 torch 依赖，供 native forward 与

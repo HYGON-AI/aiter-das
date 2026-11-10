@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 //
 // 分段 K2（affine pass / scan / replay）的私有公共头：布局常量、gt/kr 合并区
 // 寻址、fragment 别名与四 wave 协作搬运。只被 k2/ 下的实现文件包含。

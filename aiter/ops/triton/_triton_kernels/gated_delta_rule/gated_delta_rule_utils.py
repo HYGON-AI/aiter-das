@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2023-2026, Songlin Yang, Yu Zhang
 
 import contextlib
@@ -460,15 +461,15 @@ def map_triton_backend_to_torch_device() -> str:
     return {"cuda": "cuda", "hip": "cuda", "xpu": "xpu"}.get(backend, backend)
 
 
-# For AMD GPUs, the triton backend is 'hip', while for Nvidia GPUs, the triton backend is 'cuda'.
-# However, the torch backend is 'cuda' for both Nvidia and AMD GPUs.
-# Therefore, we need to check the triton backend to determine the actual GPU vendor.
+# HCU 上 triton backend 是 'hip'，Nvidia GPU 上是 'cuda'；
+# 但 torch backend 在两者上都是 'cuda'，
+# 因此需要用 triton backend 区分实际设备厂商。
 device = get_available_device() if get_available_device() != "hip" else "cuda"
 device_torch_lib = getattr(torch, device)
 device_platform = get_available_device()
 device_name = map_triton_backend_to_torch_device()
 
-IS_AMD = device_platform == "hip"
+IS_HCU = device_platform == "hip"
 IS_INTEL = device_platform == "xpu"
 IS_NVIDIA = device_platform == "cuda"
 IS_INTEL_ALCHEMIST = IS_INTEL and "Intel(R) Arc(TM) A" in torch.xpu.get_device_name(0)
@@ -478,7 +479,7 @@ IS_NVIDIA_HOPPER = IS_NVIDIA and (
 )
 USE_CUDA_GRAPH = IS_NVIDIA and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 
-# Nvidia Ampere or newer, haven't check AMD and intel yet.
+# Nvidia Ampere 及更新；HCU 与 intel 未验证。
 IS_TF32_SUPPORTED = IS_NVIDIA and torch.cuda.get_device_capability(0)[0] >= 8
 IS_GATHER_SUPPORTED = hasattr(triton.language, "gather")
 IS_TMA_SUPPORTED = (
@@ -567,7 +568,7 @@ else:
 def _register_aliases():
     current_module = sys.modules[__name__]
     for key in (
-        "IS_AMD",
+        "IS_HCU",
         "IS_INTEL",
         "IS_NVIDIA",
         "IS_INTEL_ALCHEMIST",

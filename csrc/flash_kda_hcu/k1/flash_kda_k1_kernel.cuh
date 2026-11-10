@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 //
 // K1 的设备侧实现：定长（含尾块）与 packed 变长共用一个 kernel 模板。
 // kernel 用 `Metadata` 参数包区分 FixedTailInfo / VarlenInfo，host 在下方 TU 选实例。

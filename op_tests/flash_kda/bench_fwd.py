@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """沿用官方 FlashKDA 的输入与计时方式，仅将调用入口适配到 AITER。
 
 对照：https://github.com/MoonshotAI/FlashKDA/blob/d7e3b3a9f448500630fa60fb5200f4f9c9b1fc72/benchmarks/bench_fwd.py

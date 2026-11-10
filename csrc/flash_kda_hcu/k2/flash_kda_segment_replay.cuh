@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 //
 // Replay：用 scan 得到的 segment_initial_states 逐段重放，产出 out 与 final_state。
 

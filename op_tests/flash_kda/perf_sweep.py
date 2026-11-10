@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """FlashKDA HCU 接入验收：性能 sweep（对齐性能表的分组与计时口径）。
 
 产出 CSV，供 ``perf_compare.py`` 与性能表 ``bw1000 同口径 ms`` 列逐行比对。

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Prefill causal conv1d (fused split q/k/v) — Triton ``@triton.jit`` kernels.
 
 Two interchangeable kernels: a 1D per-token kernel (serial token loop, any conv

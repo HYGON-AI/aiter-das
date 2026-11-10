@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 //
 // peer direct 使用的 device helper；保留原有数值、调度与舍入规则。
 #pragma once
@@ -8,6 +9,7 @@
 #include <hip/hip_runtime.h>
 
 #include "flash_kda_k1_layout.cuh"
+#include "flash_kda_hw_ops.cuh"
 
 #include <cmath>
 #include <type_traits>
@@ -74,33 +76,20 @@ namespace kda_peer
 
     __device__ __forceinline__ float exp_fast(float value)
     {
-#if defined(__gfx936__)
-        return __builtin_amdgcn_exp2f(value * kLog2E);
-#else
-        return expf(value);
-#endif
+        return kda_hw::exp2_fast(value * kLog2E);
     }
 
     // gate 前缀已带 log2(e) 缩放，因此沿用与 exp_fast 相同的原生
     // 指数降阶，不再多做一次换底乘法。
     __device__ __forceinline__ float gate_exp2(float prefix_log2)
     {
-#if defined(__gfx936__)
-        return __builtin_amdgcn_exp2f(prefix_log2);
-#else
-        return exp2f(prefix_log2);
-#endif
+        return kda_hw::exp2_fast(prefix_log2);
     }
 
     __device__ __forceinline__ float sigmoid(float value)
     {
-#if defined(__gfx936__)
-        const float denominator =
-            1.0f + __builtin_amdgcn_exp2f(-value * kLog2E);
-        return __builtin_amdgcn_rcpf(denominator);
-#else
-        return 1.0f / (1.0f + expf(-value));
-#endif
+        const float denominator = 1.0f + kda_hw::exp2_fast(-value * kLog2E);
+        return kda_hw::rcp_fast(denominator);
     }
 
     // beta 的装载与消费分开：sigmoid 准备期间保持裸位型存活，
@@ -126,21 +115,12 @@ namespace kda_peer
     }
 
     // 归一化时全部 lane 活跃；小于 16 的 XOR 距离
-    // 落在各自的 16-lane 行内，故固定 swizzle 无需边界检查。
+    // 落在各自的 16-lane 行内，故固定宽度交换无需边界检查。
     template <int Delta>
     __device__ __forceinline__ float norm_xor(float value)
     {
         static_assert(Delta == 1 || Delta == 2 || Delta == 4 || Delta == 8);
-#if defined(__gfx936__)
-        int bits;
-        __builtin_memcpy(&bits, &value, sizeof(bits));
-        // 位模式：每个 32-lane 半区内部 lane' = ((lane & 31) | 0) ^ Delta。
-        bits = __builtin_amdgcn_ds_swizzle(bits, 0x001f | (Delta << 10));
-        __builtin_memcpy(&value, &bits, sizeof(value));
-        return value;
-#else
         return __shfl_xor(value, Delta, 16);
-#endif
     }
 
     __device__ __forceinline__ at::BFloat16 multiply_bf16(

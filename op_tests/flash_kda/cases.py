@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """FlashKDA 测试共享输入构造、case 表与小型索引 oracle。
 
 这里是**普通 helper**：不导入任何 `test_*` 模块，也不驱动 GPU。测试与 benchmark

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """FlashKDA 的 K2 Python 层：参数校验、workspace 视图与 native 绑定。
 
 只保留 `module_flash_kda_hcu` 里真实注册的入口（见

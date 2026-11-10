@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 //
 // 段间 scan：扫描各段仿射状态（state_next = A*state + b），写回各段真实输入态。
 

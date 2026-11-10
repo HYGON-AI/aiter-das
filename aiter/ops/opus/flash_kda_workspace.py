@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Native K1/K2 阶段接口共用的 workspace 与元数据契约。
 
 只描述形状与别名关系，不含任何 GPU 值。字节布局与索引的唯一事实来源是

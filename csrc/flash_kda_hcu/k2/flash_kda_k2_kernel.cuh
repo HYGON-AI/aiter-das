@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 //
 // K2 kernel：每个 CTA 负责 (sequence b, head h) 的 kV16/gridDim.x 个 V 列
 // （4 个 wave × 每 wave kK2VSlice=16 列），wave 之间协作搬运本 chunk 的 LDS。
@@ -8,6 +9,7 @@
 
 #include "flash_kda_k2_common.cuh"
 #include "flash_kda_k2_step.cuh"
+#include "flash_kda_hw_ops.cuh"
 
 namespace
 {
@@ -222,9 +224,9 @@ namespace
 #pragma unroll 1
             for (int chunk = 0; chunk < chunks; ++chunk)
             {
-                __builtin_amdgcn_sched_barrier(0);
+                kda_hw::sched_barrier();
                 asm volatile("s_barrier" ::: "memory"); // A: 跨 wave 发布 + 保护 WAR
-                __builtin_amdgcn_sched_barrier(0);
+                kda_hw::sched_barrier();
                 // 整个 chunk 体都在 step 里：取数段 (1)(2)(3) → 边界 1（lgkmcnt）→
                 // 第一组 MMAC → 边界 2（vmcnt）→ 第二组计算 → 写回段 → C 屏障 + 发布下一代。
                 kda_k2_step<FullChunks>(

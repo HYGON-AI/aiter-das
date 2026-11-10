@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """K1（定长 / packed 变长）：直接写出 K2 消费的 C16 workspace。
 
 定长入口支持任意正 T，尾块由 native fixed-tail 实例按 `FixedTailInfo{tokens=T}`

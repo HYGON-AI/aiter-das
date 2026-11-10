@@ -14,14 +14,14 @@ import triton
 import triton.language as tl
 from torch import nn
 
-from ..gated_delta_rule_utils import IS_AMD, autotune_cache_kwargs, input_guard
+from ..gated_delta_rule_utils import IS_HCU, autotune_cache_kwargs, input_guard
 
 # Backward-pass autotune config space. Forward kernels deliberately do not
 # autotune (see ``l2norm_fwd_kernel`` for the rationale); only the bwd
 # kernels still use this list because the bwd path is autograd-only and
 # its dispatch overhead is not on a critical inference loop.
 BT_LIST = [8, 16, 32, 64, 128]
-NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if IS_AMD else [1, 2, 4, 8, 16, 32]
+NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if IS_HCU else [1, 2, 4, 8, 16, 32]
 
 
 # Default forward-kernel tile config (MBLOCK=32, num_warps=4): a robust

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """FlashKDA 内部安全回归：workspace 几何、metadata 边界、写回 guard、graph/stream。
 
 这里放的是**必要内部契约**，不是用户 API：workspace 字节几何、metadata 索引、

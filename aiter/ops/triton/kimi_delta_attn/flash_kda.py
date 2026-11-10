@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 #
 # FlashKDA 的 host 层：支持性判定、分段规划与 forward。
 # 设备代码在 `flash_kda_prepare_kernel.py`（融合 K1）与

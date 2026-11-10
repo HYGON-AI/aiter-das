@@ -15,7 +15,7 @@ import triton
 import triton.language as tl
 
 from ..gated_delta_rule_utils import (
-    IS_AMD,
+    IS_HCU,
     IS_NVIDIA_HOPPER,
     RCP_LN2,
     USE_CUDA_GRAPH,
@@ -32,8 +32,8 @@ from ..utils import (
 from ..utils.op import exp
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
-# Workaround: AMD ROCm Triton compiler fails with num_stages=4 in stream pipeline
-NUM_STAGES_FWD = [2, 3] if IS_AMD else [2, 3, 4]
+# Workaround: HCU ROCm Triton compiler fails with num_stages=4 in stream pipeline
+NUM_STAGES_FWD = [2, 3] if IS_HCU else [2, 3, 4]
 
 
 @triton.jit
@@ -323,7 +323,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
             for num_warps in [2, 4]
             for num_stages in (
-                [3, 2] if IS_AMD else ([4, 3, 2] if check_shared_mem("ampere") else [1])
+                [3, 2] if IS_HCU else ([4, 3, 2] if check_shared_mem("ampere") else [1])
             )
             for BV in [64, 32]
         ]

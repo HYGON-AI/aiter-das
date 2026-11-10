@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """FlashKDA 统一 native 入口的 Python 适配（内部模块，不是用户接口）。
 
 用户入口见 `aiter/ops/flash_kda.py`。本模块只保留冷加载、唯一 native 绑定与内部

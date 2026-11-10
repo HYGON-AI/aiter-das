@@ -1170,8 +1170,8 @@ def compile_ops(
                 if d_args.get("require_aicc", False) and not _aicc_available():
                     raise RuntimeError(
                         f"[aiter] module '{md_name}' 需要海光 aicc 编译器（DTK）。"
-                        f"该模块使用 __amdgpu_buffer_rsrc_t / __builtin_amdgcn_make_buffer_rsrc，"
-                        f"标准 hipcc 不支持这两个内建，用 hipcc 编译会失败或产出不可用模块。"
+                        f"该模块使用了 aicc 专有的 buffer 描述符类型与构造内建，"
+                        f"标准 hipcc 不支持这些内建，用 hipcc 编译会失败或产出不可用模块。"
                         f"请安装 DTK 并确保 '/opt/dtk/bin/aicc' 或 PATH 中的 aicc 可用；"
                         f"当前选择的编译器: {os.environ.get('HIPCC') or shutil.which('hipcc') or 'unknown'}"
                     )

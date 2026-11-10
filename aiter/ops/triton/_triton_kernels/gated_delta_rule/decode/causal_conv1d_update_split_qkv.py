@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Decode causal_conv1d_update (fused split q/k/v) — Triton/Gluon kernels.
 
 Host-side launch wrapper lives in the public namespace

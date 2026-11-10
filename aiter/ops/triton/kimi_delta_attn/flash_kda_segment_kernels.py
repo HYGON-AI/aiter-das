@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 #
 # FlashKDA 的段间 Triton kernel：分段 replay、段间 scan 与 K2 autotune 分桶。
 

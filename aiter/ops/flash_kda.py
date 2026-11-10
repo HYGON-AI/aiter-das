@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """FlashKDA 用户主入口：一个 forward、一个 scratch 大小查询。
 
 本模块是 FlashKDA 的**用户契约**，其余 Python 层（`aiter.ops.opus.*` 的 K1/K2/分段

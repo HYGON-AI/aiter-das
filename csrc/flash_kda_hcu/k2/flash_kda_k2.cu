@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 //
 // FlashKDA 定长 / packed 变长 K2（gfx936）的主机入口。
 //

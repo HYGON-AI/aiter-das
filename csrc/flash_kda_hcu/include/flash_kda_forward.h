@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 #pragma once
 
 // FlashKDA 统一 native forward 的公开契约（host 侧唯一入口）。

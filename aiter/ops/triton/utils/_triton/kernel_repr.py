@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 def _sanitize_constexpr_value(value):
     if value is None:
         return "NONE"

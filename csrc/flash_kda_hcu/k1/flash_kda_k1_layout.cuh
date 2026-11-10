@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 #pragma once
+
+#include "flash_kda_hw_ops.cuh"
 
 namespace kda_detail
 {
@@ -63,9 +66,9 @@ namespace kda_detail
     {
         const unsigned int address = static_cast<unsigned int>(
             reinterpret_cast<unsigned long long>(dst + kdqd_prelayout_u16(packed)));
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         asm volatile("ds_write_b32 %0, %1" ::"v"(address), "v"(value) : "memory");
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
     }
 
     __device__ __forceinline__ Vec4Bf16 load_kdqd_a_fragment(
@@ -74,10 +77,10 @@ namespace kda_detail
         const unsigned int address = static_cast<unsigned int>(
             reinterpret_cast<unsigned long long>(src + tile * 256 + group * 64 + row * 4));
         Vec4Bf16 value;
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         asm volatile("ds_read_b64 %0, %1\n\ts_waitcnt lgkmcnt(0)"
                      : "=v"(value) : "v"(address) : "memory");
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         return value;
     }
 
@@ -88,12 +91,12 @@ namespace kda_detail
         const unsigned int address = static_cast<unsigned int>(
             reinterpret_cast<unsigned long long>(src + linear));
         Vec8Bf16 value;
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         asm volatile("ds_read_b128 %0, %1\n\ts_waitcnt lgkmcnt(0)"
                      : "=v"(value) : "v"(address) : "memory");
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         asm volatile("global_store_dwordx4 %0, %1, off" ::"v"(dst + linear), "v"(value) : "memory");
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
     }
 
     __device__ __forceinline__ Vec4F32 mmac_bf16(

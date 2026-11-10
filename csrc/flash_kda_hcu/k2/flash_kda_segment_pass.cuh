@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 //
 // PassA：逐段计算 affine 转换的 A（transition）与 b（update）两半。
 

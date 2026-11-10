@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 //
 // K2 的 chunk 体（split-step）：处理一个 chunk，并在尾部发布下一代的 LDS 直写。
 // 发射序、等待立即数与 barrier 顺序见函数内注释；改动必须同步重推"在飞"账。
@@ -8,6 +9,7 @@
 
 #include "flash_kda_k2_common.cuh"
 #include "flash_kda_k2_load.cuh"
+#include "flash_kda_hw_ops.cuh"
 
 namespace
 {
@@ -65,9 +67,9 @@ namespace
             kda_c16_asm::wait_vmcnt_only<6>();
         // kd/qd 的 LDS 直写由 4 个 wave 协作写同一块：各 wave 完成自己的请求后由 barrier
         // 发布**当前 kd/qd 的结果**给全体 wave，然后才 ds_read。
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         asm volatile("s_barrier" ::: "memory");
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 
         // ===== 本代 V 的全局读（在 kd/qd ds_read 之前发出）=====
         //   谓词用 `FullChunks || token_s < tokens`：满块档编译期真，尾块档无效 lane
@@ -139,9 +141,9 @@ namespace
 
         // (4) 第一组 MMAC 消费 rk/rq 前，收口本代 16 条 LDS 读（8 kd + 8 qd）。
         // 下一代的 kd/qd 直写计在 VMEM 域，不占 lgkmcnt，故 `lgkmcnt(0)` 不动它。
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         kda_c16_asm::wait_lgkmcnt_only<0>();
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 
         // ===== 第一组 MMAC：kh^T = h^T·kd^T / oq^T = h^T·qd^T（消费 rk/rq）=====
         vec4_fp32 kh_acc{0, 0, 0, 0};
@@ -165,14 +167,14 @@ namespace
         // 在飞 18 条时有 next ⇒ `vmcnt(12)` 退掉 store×4 + kr|gt×2；无 next 时 16 条 ⇒ `vmcnt(10)`。
         // 只发 vmcnt（不动 LGKM，保住其他 LDS 读的在飞），随后 barrier 让全体 wave 的
         // kr|gt 切片对本 wave 的 ds_read 可见。
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         if (has_next)
             kda_c16_asm::wait_vmcnt_only<12>();
         else
             kda_c16_asm::wait_vmcnt_only<10>();
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         asm volatile("s_barrier" ::: "memory");
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         // 先读 gt 的 i=0..3（pair 0-1），另一半在 M2 之后
 #pragma unroll
         for (int i = 0; i < 4; ++i)
@@ -195,7 +197,7 @@ namespace
         // 把"收 beta/v 的 VM 等待"与 8 个 32 位分量放进同一个 ASM：
         //   wait 后原值透传（"+v" 读改写）⇒ `u=(v-kh)*beta` 及后续打包/MMAC 通过**寄存器依赖**
         //   连到这次等待，而不只依赖 memory clobber。lgkmcnt(15) = 不等 LDS。
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         // 首次消费 beta/v/inv 前：VM 发射序（老→新）
         //   = v4 → beta4 → inv1 → mqk1 → 下一代 kd/qd 两条直写
         //   ⇒ 有 next 保留 **3**（mqk + 两条下一代直写），保证 beta/v/inv 就绪；
@@ -203,15 +205,15 @@ namespace
         //   结构：纯等待在分支里（CTA-uniform 的 has_next）；relay 必须在分支外、
         //   且取较宽值 3（前序等待已把在飞压到 ≤3，故 relay 的等待自动 no-op），
         //   它只负责把寄存器依赖绑到消费者。
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         if (has_next)
             kda_c16_asm::wait_vmcnt_only<3>();
         else
             kda_c16_asm::wait_vmcnt_only<1>();
         kda_c16_asm::ready8<3, 15>(beta_reg[0], beta_reg[1], beta_reg[2], beta_reg[3],
                                    v_raw[0], v_raw[1], v_raw[2], v_raw[3]);
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
+        kda_hw::sched_barrier();
         // ===== 第二组：u / U^T / out^T / h_reg 更新（消费 v/beta/inv/mqk/kr/gt 寄存器）=====
         float u[4] = {};
 #pragma unroll
@@ -257,7 +259,7 @@ namespace
         // ===== 发 B 半的 gt/kr LDS 读（M2-1 之后、mqk 消费之前）=====
         // A 半先发、B 半后发 ⇒ LDS 读顺序仍是 [A 8 条][B 8 条]，后面的 `lgkmcnt(8)`
         // 因此正好"退 A、留 B"。
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         {
             const unsigned int kr_lds_base_b = static_cast<unsigned int>(
                 reinterpret_cast<uintptr_t>(kr_a) + kr_voff(flash_kda_state_layout::natural_kr_row(row), group));
@@ -276,14 +278,14 @@ namespace
         // 消费 mqk 前：VM 在飞（老→新）= mqk1 → 下一代 kd1 → 下一代 qd1
         //   ⇒ 有 next 留 2（两条下一代直写继续飞），末块留 0。
         // 纯等待放在分支里；relay 在分支外取较宽值 2（在飞已 ≤2 ⇒ 自动 no-op），只绑依赖。
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         if (has_next)
             kda_c16_asm::wait_vmcnt_only<2>();
         else
             kda_c16_asm::wait_vmcnt_only<0>();
         kda_c16_asm::ready1<2, 15>(mqk_reg);
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
+        kda_hw::sched_barrier();
         const auto a_mqk = __builtin_bit_cast(flash_kda_k2_fragments::vec4_bf16, mqk_reg);
         flash_kda_k2_fragments::vec4_bf16 a_U_f16{};
 #pragma unroll
@@ -295,9 +297,9 @@ namespace
         // ===== M3 取数等待：只等 A 半的 LDS 读 =====
         // 此刻 LGKM 在飞 = A 半 8 条 + B 半 8 条；`lgkmcnt(8)` 退掉 A 半、B 半继续在飞
         // （计数降到不大于 N 才放行），随后先做 M3 的 pair 0-1。
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         kda_c16_asm::wait_lgkmcnt_only<8>();
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 #pragma unroll
         for (int pair = 0; pair < 2; ++pair)
         {
@@ -327,9 +329,9 @@ namespace
         }
 
         // A 半算完 ⇒ 收口 B 半（此时在飞只剩它的 8 条），再做 pair 2-3
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         kda_c16_asm::wait_lgkmcnt_only<0>();
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 #pragma unroll
         for (int pair = 2; pair < kKeyDim / 32; ++pair)
         {
@@ -384,11 +386,11 @@ namespace
         // 下一代的 4608 B（kr 4096 + gt 512，每 wave 两条请求）。
         // 这些请求的落地在下一轮读取 kr|gt 之前收口（见本函数中段的 vmcnt(12/10)），
         // 本条不新增等待。
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         kda_c16_asm::wait_lgkmcnt_only<0>();
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         asm volatile("s_barrier" ::: "memory"); // C: 可见性会合 + 保护单缓冲 WAR
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         if (has_next)
             issue_krgt_to_lds<kWaves>(tid, next_workspace_chunk_index, ws_krgt_a, kr_a);
     }

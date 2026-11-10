@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """FlashKDA 公共契约：入口签名、原位写出、错误类型、state dtype 与后端选择。
 
 这里只放**用户可见契约**：不测私有分派函数，也不重复 `test_fwd.py` 的数值门。

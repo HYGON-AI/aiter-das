@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 #pragma once
 //
 // KDA K2 的设备访存与等待封装（内联汇编）。
 //
 // 约定：
 //   * 所有 global / LDS 访存（含 store）手写内联汇编；每个 asm 块、尤其每条
-//     `s_waitcnt` 前后用 `__builtin_amdgcn_sched_barrier(0)` 钉死 —— 等待点与发射点的
+//     `s_waitcnt` 前后用 `kda_hw::sched_barrier()` 钉死 —— 等待点与发射点的
 //     相对顺序由调用方负责（vmcnt 立即数的正确性依赖"wait 之前已经发出哪些请求"）。
 //   * 调用点只表达语义（等哪一代、等几条），不手写指令顺序。
 //   * wave 均匀的地址走 `soffset`（u32，必须 wave 均匀）；per-lane 的值只能进 `voffset`。
@@ -25,6 +26,8 @@
 //   分段文件的等待点注释），本头只提供机制。
 // ---------------------------------------------------------------------------
 
+#include "flash_kda_hw_ops.cuh"
+
 #if defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
 #define KDA_C16_ASM_MEM 1
 #else
@@ -42,7 +45,7 @@ namespace kda_c16_asm
     __device__ __forceinline__ void sched_pin()
     {
 #if KDA_C16_ASM_MEM
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 #endif
     }
 
@@ -64,9 +67,9 @@ namespace kda_c16_asm
     __device__ __forceinline__ void wait_vmcnt_only()
     {
 #if KDA_C16_ASM_MEM
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         asm volatile("s_waitcnt vmcnt(%0) lgkmcnt(15)" ::"n"(N) : "memory");
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 #endif
     }
 
@@ -74,9 +77,9 @@ namespace kda_c16_asm
     __device__ __forceinline__ void wait_lgkmcnt_only()
     {
 #if KDA_C16_ASM_MEM
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         asm volatile("s_waitcnt vmcnt(63) lgkmcnt(%0)" ::"n"(N) : "memory");
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 #endif
     }
 
@@ -84,9 +87,9 @@ namespace kda_c16_asm
     __device__ __forceinline__ void wait_all_drained()
     {
 #if KDA_C16_ASM_MEM
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)" ::: "memory");
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 #endif
     }
 
@@ -96,12 +99,12 @@ namespace kda_c16_asm
     __device__ __forceinline__ void wait_buffer_data_arrived()
     {
 #if KDA_C16_ASM_MEM
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         if constexpr (Sync)
             asm volatile("s_waitcnt vmcnt(%0) lgkmcnt(15)\n\ts_barrier\n" ::"n"(N) : "memory");
         else
             asm volatile("s_waitcnt vmcnt(%0) lgkmcnt(15)\n" ::"n"(N) : "memory");
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 #endif
     }
 
@@ -110,12 +113,12 @@ namespace kda_c16_asm
     __device__ __forceinline__ void wait_lds_data_arrived()
     {
 #if KDA_C16_ASM_MEM
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         if constexpr (Sync)
             asm volatile("s_waitcnt vmcnt(63) lgkmcnt(%0)\n\ts_barrier\n" ::"n"(N) : "memory");
         else
             asm volatile("s_waitcnt vmcnt(63) lgkmcnt(%0)\n" ::"n"(N) : "memory");
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 #endif
     }
 
@@ -124,12 +127,12 @@ namespace kda_c16_asm
     __device__ __forceinline__ void wait_all_buffer_data_arrived()
     {
 #if KDA_C16_ASM_MEM
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         if constexpr (Sync)
             asm volatile("s_waitcnt vmcnt(0) lgkmcnt(15)\n\ts_barrier\n" ::: "memory");
         else
             asm volatile("s_waitcnt vmcnt(0) lgkmcnt(15)\n" ::: "memory");
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 #endif
     }
 
@@ -137,9 +140,9 @@ namespace kda_c16_asm
     __device__ __forceinline__ void wait_all_warp_arrived()
     {
 #if KDA_C16_ASM_MEM
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         asm volatile("s_barrier\n" ::: "memory");
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 #endif
     }
 
@@ -161,9 +164,9 @@ namespace kda_c16_asm
     __device__ __forceinline__ void wait_vmcnt_lgkmcnt()
     {
 #if KDA_C16_ASM_MEM
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         asm volatile("s_waitcnt vmcnt(%0) lgkmcnt(%1)" ::"n"(VM), "n"(LGKM) : "memory");
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 #endif
     }
 
@@ -192,11 +195,11 @@ namespace kda_c16_asm
     const unsigned int lds_lane0 =                                                                       \
         static_cast<unsigned int>(reinterpret_cast<unsigned long long>(shared_addr) +                    \
                                   static_cast<unsigned long long>(lds_offset));                          \
-    __builtin_amdgcn_sched_barrier(0);                                                                   \
+    kda_hw::sched_barrier();                                                                   \
     asm volatile("s_mov_b32 m0, %1\n\t" MNEMONIC " %0, %2, %3, offen offset:0, lds\n" ::"v"(gvOffset_v), \
                  "s"(lds_lane0), "s"(rsrc), "s"(gvOffset_s)                                              \
                  : "memory");                                                                            \
-    __builtin_amdgcn_sched_barrier(0);
+    kda_hw::sched_barrier();
 #else
 #define KDA_C16_ASM_MEM_BODY(MNEMONIC, lds_offset, gvOffset_s, gvOffset_v) \
     (void)shared_addr;                                                     \
@@ -230,11 +233,11 @@ namespace kda_c16_asm
 
 #if KDA_C16_ASM_MEM
 #define KDA_C16_ASM_REG_BODY(MNEMONIC, gvOffset_s, gvOffset_v, dst) \
-    __builtin_amdgcn_sched_barrier(0);                              \
+    kda_hw::sched_barrier();                              \
     asm volatile(MNEMONIC " %0, %1, %2, %3, offen offset:0\n"       \
                  : "=v"(dst)                                        \
                  : "v"(gvOffset_v), "s"(rsrc), "s"(gvOffset_s));    \
-    __builtin_amdgcn_sched_barrier(0);
+    kda_hw::sched_barrier();
 #else
 #define KDA_C16_ASM_REG_BODY(MNEMONIC, gvOffset_s, gvOffset_v, dst) \
     (void)rsrc;                                                     \
@@ -272,11 +275,11 @@ namespace kda_c16_asm
 
 #if KDA_C16_ASM_MEM
 #define KDA_C16_ASM_STORE_BODY(MNEMONIC, gvOffset_s, gvOffset_v, src)                      \
-    __builtin_amdgcn_sched_barrier(0);                                                     \
+    kda_hw::sched_barrier();                                                     \
     asm volatile(MNEMONIC " %0, %1, %2, %3, offen offset:0\n" ::"v"(src), "v"(gvOffset_v), \
                  "s"(rsrc), "s"(gvOffset_s)                                                \
                  : "memory");                                                              \
-    __builtin_amdgcn_sched_barrier(0);
+    kda_hw::sched_barrier();
 #else
 #define KDA_C16_ASM_STORE_BODY(MNEMONIC, gvOffset_s, gvOffset_v, src) \
     (void)src;                                                        \
@@ -312,9 +315,9 @@ namespace kda_c16_asm
     __device__ __forceinline__ void ds_read_b16(unsigned int lds_addr, DstType &dst)
     {
 #if KDA_C16_ASM_MEM
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         asm volatile("ds_read_u16 %0, %1\n" : "=v"(dst) : "v"(lds_addr));
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 #endif
     }
 
@@ -322,9 +325,9 @@ namespace kda_c16_asm
     __device__ __forceinline__ void ds_read_b32(unsigned int lds_addr, DstType &dst)
     {
 #if KDA_C16_ASM_MEM
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         asm volatile("ds_read_b32 %0, %1\n" : "=v"(dst) : "v"(lds_addr));
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 #endif
     }
 
@@ -332,9 +335,9 @@ namespace kda_c16_asm
     __device__ __forceinline__ void ds_read_b64(unsigned int lds_addr, DstType &dst)
     {
 #if KDA_C16_ASM_MEM
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         asm volatile("ds_read_b64 %0, %1\n" : "=v"(dst) : "v"(lds_addr));
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 #endif
     }
 
@@ -342,9 +345,9 @@ namespace kda_c16_asm
     __device__ __forceinline__ void ds_read_b128(unsigned int lds_addr, DstType &dst)
     {
 #if KDA_C16_ASM_MEM
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         asm volatile("ds_read_b128 %0, %1\n" : "=v"(dst) : "v"(lds_addr));
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 #endif
     }
 
@@ -353,9 +356,9 @@ namespace kda_c16_asm
     __device__ __forceinline__ void ds_write_b128(unsigned int lds_addr, SrcType src)
     {
 #if KDA_C16_ASM_MEM
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
         asm volatile("ds_write_b128 %0, %1\n" ::"v"(lds_addr), "v"(src) : "memory");
-        __builtin_amdgcn_sched_barrier(0);
+        kda_hw::sched_barrier();
 #endif
     }
 

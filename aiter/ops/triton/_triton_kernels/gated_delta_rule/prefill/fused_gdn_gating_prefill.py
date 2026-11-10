@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Fused sigmoid + gdn_gating kernel for prefill."""
 
 import torch

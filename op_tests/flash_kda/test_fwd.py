@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """FlashKDA 数值覆盖：定长（F01–F08）与变长（V01–V06）对照独立 Triton 参考。
 
 参考路径固定为 `reference.triton_reference`（`kimi_delta_attn.flash_kda.flash_kda_fwd`），

@@ -1,5 +1,6 @@
 #include "flash_kda_launch.h"
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 //
 // 分段 K2 的主机入口：affine pass → 段间 scan → replay。
 

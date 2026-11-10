@@ -16,7 +16,7 @@ import triton
 import triton.language as tl
 
 from ..gated_delta_rule_utils import (
-    IS_AMD,
+    IS_HCU,
     autotune_cache_kwargs,
     gated_delta_rule_autotune_configs,
 )
@@ -63,7 +63,7 @@ def _should_use_split_path(execution_mode: str, nt: int, is_varlen: bool) -> boo
     return nt > _SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX
 
 
-if IS_AMD:
+if IS_HCU:
     _SOLVE_TRIL_RECOMPUTE_CONFIGS = [
         triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=2),
         triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
@@ -427,7 +427,7 @@ def fused_solve_tril_recompute_w_u_kernel(
 # Output layout is [B, H, T, K/V] head-major so the downstream hidden-state
 # kernel (chunk_delta_h) sees the same tensors as the fused path.
 # =============================================================================
-if IS_AMD:
+if IS_HCU:
     # Fixed BK=BV=64, autotune over num_warps x num_stages.
     _RECOMPUTE_WU_HM_CONFIGS = [
         triton.Config({"BK": 64, "BV": 64}, num_warps=nw, num_stages=ns)

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 //
 // K2 的私有公共头：类型、workspace 布局常量、数值转换与 MUBUF 描述符。
 // 只被 k2/ 下的实现文件包含，不进入任何公开头。
