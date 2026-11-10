@@ -710,6 +710,13 @@ def clear_build(md_name):
         shutil.rmtree(path)
 
 
+def _aicc_available() -> bool:
+    """海光 aicc/dcc 编译器是否可用（flash_kda 等模块依赖其专有内建）。"""
+    if shutil.which("aicc"):
+        return True
+    return os.path.exists("/opt/dtk/bin/aicc")
+
+
 def build_module(
     md_name,
     srcs,
@@ -1159,6 +1166,15 @@ def compile_ops(
                     md_name, build_module_name=build_module_name
                 )
                 d_args.update(custom_build_args)
+
+                if d_args.get("require_aicc", False) and not _aicc_available():
+                    raise RuntimeError(
+                        f"[aiter] module '{md_name}' 需要海光 aicc 编译器（DTK）。"
+                        f"该模块使用 __amdgpu_buffer_rsrc_t / __builtin_amdgcn_make_buffer_rsrc，"
+                        f"标准 hipcc 不支持这两个内建，用 hipcc 编译会失败或产出不可用模块。"
+                        f"请安装 DTK 并确保 '/opt/dtk/bin/aicc' 或 PATH 中的 aicc 可用；"
+                        f"当前选择的编译器: {os.environ.get('HIPCC') or shutil.which('hipcc') or 'unknown'}"
+                    )
 
                 if d_args.get("skip_if", False):
                     logger.info(f"skip build [{md_name}] due to skip_if condition")

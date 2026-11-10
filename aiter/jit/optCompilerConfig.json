@@ -999,5 +999,29 @@
         "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
+    },
+    "module_flash_kda_hcu": {
+        "require_aicc": true,
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/flash_kda_hcu_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/flash_kda_hcu/flash_kda_forward.cu'",
+            "f'{AITER_CSRC_DIR}/flash_kda_hcu/k2/flash_kda_k2.cu'",
+            "f'{AITER_CSRC_DIR}/flash_kda_hcu/k2/flash_kda_segment.cu'",
+            "f'{AITER_CSRC_DIR}/flash_kda_hcu/k1/flash_kda_k1.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "module_vgpr_compiler_flag(module_name)",
+            "'-Rpass-analysis=kernel-resource-usage'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/flash_kda_hcu/include'",
+            "f'{AITER_CSRC_DIR}/flash_kda_hcu/common'",
+            "f'{AITER_CSRC_DIR}/opus_gemm/include'",
+            "f'{AITER_CSRC_DIR}/flash_kda_hcu/k1'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
     }
 }
