@@ -554,7 +554,8 @@ def main():
     reused = {}
     if args.resume:
         old = json.loads(args.resume.read_text())
-        assert old["identity"] == identity and old["complete"], "resume identity mismatch"
+        # An interrupted run leaves complete=False; PASS records are still valid.
+        assert old["identity"] == identity, "resume identity mismatch"
         reused = {r["id"]: r for r in old["cases"] if r["status"] == "PASS"}
 
     def save(record):
