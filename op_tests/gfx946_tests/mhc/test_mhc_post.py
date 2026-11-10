@@ -21,11 +21,14 @@ AITER_MHC_POST_TRACE is always enabled, so every case must leave exactly one
 Numerical verdict: zero out-of-tolerance elements, judged against a CPU float64
 reference with a cancellation-aware bound:
 
-    |ref64 - out| <= max(1 bf16 ULP(ref64), 8 * eps32 * S)
+    |trunc_bf16(ref64) - out| <= max(1 bf16 ULP(ref64), 8 * eps32 * S)
     S = |post_layer_mix * x| + sum_h2 |comb_res_mix[h2, h] * residual[h2]|
 
-Non-cancelling elements are held to one bf16 step; cancellation-dominated ones
-(the pilot's failure mode) get a bound that scales with the magnitude of the
+The target is the exact value truncated onto the bf16 grid, because opus converts
+float to bf16 by truncation (OPUS_FP32_to_BF16_DEFAULT=2, opus.hpp:38). The
+device output matches trunc(float32 reference) on 99.99% of elements; the rest
+are cancellation cases. Non-cancelling elements are held to one bf16 step;
+cancellation-dominated ones get a bound that scales with the magnitude of the
 intermediate terms, because float32 rounding of those terms cannot be undone by
 any implementation. The float32 reference is still computed and its bf16 ULP
 statistics are recorded for cross-check, but it is not the gate. The 5% ratio
@@ -136,10 +139,27 @@ def bf16_ulp_at(value):
     return (up.float().double() - mag.float().double()).abs()
 
 
+def trunc_bf16(value64):
+    """Round float64 values toward zero onto the bf16 grid (no double rounding)."""
+    nearest = value64.bfloat16()
+    above = nearest.abs().float().double() > value64.abs()
+    bits = nearest.abs().view(torch.int16).to(torch.int32)
+    cut = torch.where(above, bits - 1, bits).clamp(min=0)
+    truncated = cut.to(torch.int16).view(torch.bfloat16)
+    return torch.where(nearest < 0, -truncated, truncated)
+
+
 def compare_out(ref64, s_terms, act):
-    """Cancellation-aware gate: |ref64-act| <= max(1 bf16 ULP, 8*eps32*S)."""
+    """Cancellation-aware gate against the RTZ target:
+    |trunc_bf16(ref64) - act| <= max(1 bf16 ULP(ref64), 8*eps32*S).
+
+    opus converts float to bf16 by truncation (OPUS_FP32_to_BF16_DEFAULT=2), so
+    the target is the exact value truncated onto the bf16 grid, not rounded.
+    """
+    target = trunc_bf16(ref64)
     act64 = act.float().double()
-    diff = (ref64 - act64).abs()
+    diff = (target - act64).abs()
+    vs_exact = (ref64 - act64).abs()
     ulp = bf16_ulp_at(ref64.bfloat16())
     tol = torch.maximum(ulp, 8.0 * FP32_EPS * s_terms)
     bad = diff > tol
@@ -147,6 +167,7 @@ def compare_out(ref64, s_terms, act):
     return dict(
         violations=int(bad.sum()), total=int(act.numel()),
         max_abs_diff=float(diff.max()),
+        max_abs_diff_vs_exact=float(vs_exact.max()),
         max_over_tol=float((diff / tol.clamp(min=1e-300)).max()),
         max_over_ulp=float((diff / ulp.clamp(min=1e-300)).max()),
         max_rel_diff=float(rel.max()),
