@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """
-Minimal perf model (gfx946) correctness check for topk_plain, derived from
-op_tests/ci_tests/test_topk_plain.py.
+Minimal perf model (gfx946) correctness check for topk_plain
 
 Each case calls the operator exactly once on a tiny input. Inputs are built on
 CPU and the reference/comparisons run on CPU, so only topk_plain is simulated.
@@ -16,7 +15,7 @@ from aiter.ops.topk_plain import topk_plain
 
 torch.manual_seed(0)
 
-BATCH, HIDDEN, TOPK = 2, 512, 64
+BATCH, HIDDEN, TOPK = 960, 512, 64
 
 
 def run_case(dtype, largest):

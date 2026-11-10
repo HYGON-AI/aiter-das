@@ -57,6 +57,10 @@ inline constexpr LaunchPolicy topk_per_row{
     "AITER_TOPK_PER_ROW_DIE_MODE", "AITER_TOPK_PER_ROW_DIE_CHUNK",
     "AITER_TOPK_PER_ROW_DIE_MASK", "AITER_TOPK_PER_ROW_LOG_LAUNCH",
     "topk_per_row", "topk_per_row", true};
+inline constexpr LaunchPolicy topk_plain{
+    "AITER_TOPK_PLAIN_DIE_MODE", "AITER_TOPK_PLAIN_DIE_CHUNK",
+    "AITER_TOPK_PLAIN_DIE_MASK", "AITER_TOPK_PLAIN_LOG_LAUNCH",
+    "topk_plain", "topk_plain", true};
 } // namespace launch_policy
 namespace launch_detail {
 inline unsigned int read_unsigned(const char* name, unsigned int fallback)

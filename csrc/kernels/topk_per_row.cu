@@ -1902,9 +1902,24 @@ void standalone_stable_radix_topk_one_block_(void* buf,
         bufs                                = static_cast<decltype(bufs)>(aligned_pointers[0]);
     }
 
-    radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES, false, phase>
-        <<<batch_size, BlockSize, 0, stream>>>(
-            in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min, bufs, next_n);
+    aiter::launch_kernel(
+      aiter::launch_policy::topk_per_row,
+      radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES, false, phase>,
+      dim3(batch_size),
+      dim3(BlockSize),
+      static_cast<size_t>(0),
+      stream,
+      in,
+      in_idx,
+      len,
+      rowStarts,
+      rowEnds,
+      k,
+      out,
+      out_idx,
+      select_min,
+      bufs,
+      next_n);
 }
 
 template <typename T,

@@ -42,6 +42,7 @@
 #include <hipcub/util_type.hpp>
 
 #include "dispatch_utils.h"
+#include "hip_kernel_launch.h"
 #include "py_itfs_common.h"
 #include "warp_sort.h"
 #include "quick_all_reduce_base.h"
@@ -2373,8 +2374,20 @@ void topk_kernel_launcher(int block_per_batch,
     }
 
     // First pass: Sort/Filter kernel - outputs DataT
-    topk_kernel<<<batch_size * block_per_batch, block_dim, lds_size, stream>>>(
-        in, static_cast<IdxT*>(nullptr), batch_size, len, k, result_val, result_idx, sentinel);
+    aiter::launch_kernel(aiter::launch_policy::topk_plain,
+        topk_kernel,
+        dim3(batch_size * block_per_batch),
+        dim3(block_dim),
+        static_cast<size_t>(lds_size),
+        stream,
+        in,
+        static_cast<const IdxT*>(nullptr),
+        batch_size,
+        len,
+        k,
+        result_val,
+        result_idx,
+        sentinel);
 
     if(block_per_batch > 1)
     {
@@ -2392,8 +2405,20 @@ void topk_kernel_launcher(int block_per_batch,
         // Merge kernel reads DataT (converts to ComputeT internally), outputs DataT
         auto topk_merge_kernel =
             get_kernel_function_pointer<greater, BlockTopkMerge, DataT, IdxT>(capacity);
-        topk_merge_kernel<<<batch_size, block_dim, lds_size, stream>>>(
-            tmp_val, tmp_idx, batch_size, merge_len, k, out, out_idx, sentinel);
+            aiter::launch_kernel(aiter::launch_policy::topk_plain,
+                topk_merge_kernel,
+                dim3(batch_size),
+                dim3(block_dim),
+                static_cast<size_t>(lds_size),
+                stream,
+                tmp_val,
+                static_cast<const IdxT*>(nullptr),
+                batch_size,
+                merge_len,
+                k,
+                out,
+                out_idx,
+                sentinel);
 
         HIP_CHECK(hipFree(tmp_val));
         HIP_CHECK(hipFree(tmp_idx));
