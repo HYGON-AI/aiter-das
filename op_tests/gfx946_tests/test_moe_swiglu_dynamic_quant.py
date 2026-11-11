@@ -55,7 +55,7 @@ from aiter.ops.quant import moe_swiglu_dynamic_quant_wrapper
 
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 LOG2E = 1.44269504088896340736
-# The device silu uses __builtin_amdgcn_exp2f, a ~1 ULP hardware approximation.
+# The device silu uses a hardware exp2, a ~1 ULP approximation.
 # The reference is evaluated at the nominal result and at +/- this relative
 # perturbation; the accepted band is the elementwise envelope of the three runs.
 EXP2_ULP = 2.0 ** -22
@@ -63,7 +63,7 @@ MAX_EXPERTS = 64  # mirrors kMoeSwigluMaxExperts in csrc/kernels/quant_kernels.c
 
 
 def topology():
-    """Report XCDs per GPU agent via HSA_AMD_AGENT_INFO_NUM_XCC (0xA111)."""
+    """Report XCDs per GPU agent via HSA attribute 0xA111."""
     class Agent(ctypes.Structure):
         _fields_ = [("handle", ctypes.c_uint64)]
     hsa = ctypes.CDLL(ctypes.util.find_library("hsa-runtime64") or "libhsa-runtime64.so.1")
