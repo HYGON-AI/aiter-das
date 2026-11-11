@@ -61,6 +61,9 @@ inline constexpr LaunchPolicy topk_plain{
     "AITER_TOPK_PLAIN_DIE_MODE", "AITER_TOPK_PLAIN_DIE_CHUNK",
     "AITER_TOPK_PLAIN_DIE_MASK", "AITER_TOPK_PLAIN_LOG_LAUNCH",
     "topk_plain", "topk_plain", true};
+inline constexpr LaunchPolicy kv_cache{
+    "AITER_KV_CACHE_DIE_MODE", "AITER_KV_CACHE_DIE_CHUNK", "AITER_KV_CACHE_DIE_MASK",
+    "AITER_KV_CACHE_LOG_LAUNCH", "KV cache", "kv_cache", false};
 } // namespace launch_policy
 namespace launch_detail {
 inline unsigned int read_unsigned(const char* name, unsigned int fallback)

@@ -7,6 +7,7 @@
 #include "aiter_hip_common.h"
 #include "dispatch_utils.h"
 #include "hip_float8.h"
+#include "hip_kernel_launch.h"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 // =====================================================================================================================
@@ -5101,8 +5102,10 @@ void fused_mrope_rms_set_kv(const T* qkv,
 #define DISPATCH_NEOX(HEAD_SIZE, IS_INTERLEAVED)                                     \
     if(is_neox_style)                                                                \
     {                                                                                \
-        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, true, true, IS_INTERLEAVED, M, KVT>  \
-            <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                         \
+        aiter::launch_kernel(                                                        \
+            aiter::launch_policy::kv_cache,                                          \
+            fused_mrope_rms_kv_kernel<T, HEAD_SIZE, true, true, IS_INTERLEAVED, M, KVT>, \
+            numBlocks, threadsPerBlock, stream, qkv,                                 \
                                                         q_w,                         \
                                                         k_w,                         \
                                                         cos_sin,                     \
@@ -5131,8 +5134,10 @@ void fused_mrope_rms_set_kv(const T* qkv,
     }                                                                                \
     else                                                                             \
     {                                                                                \
-        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, false, true, IS_INTERLEAVED, M, KVT> \
-            <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                         \
+        aiter::launch_kernel(                                                        \
+            aiter::launch_policy::kv_cache,                                          \
+            fused_mrope_rms_kv_kernel<T, HEAD_SIZE, false, true, IS_INTERLEAVED, M, KVT>, \
+            numBlocks, threadsPerBlock, stream, qkv,                                 \
                                                         q_w,                         \
                                                         k_w,                         \
                                                         cos_sin,                     \
@@ -5222,8 +5227,10 @@ void fused_rope_rms_set_kv(const T* qkv,
 #define DISPATCH_NEOX(HEAD_SIZE)                                             \
     if(is_neox_style)                                                        \
     {                                                                        \
-        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, true, false, false, 1, KVT>  \
-            <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                 \
+        aiter::launch_kernel(                                                \
+            aiter::launch_policy::kv_cache,                                  \
+            fused_mrope_rms_kv_kernel<T, HEAD_SIZE, true, false, false, 1, KVT>, \
+            numBlocks, threadsPerBlock, stream, qkv,                         \
                                                         q_w,                 \
                                                         k_w,                 \
                                                         cos_sin,             \
@@ -5252,8 +5259,10 @@ void fused_rope_rms_set_kv(const T* qkv,
     }                                                                        \
     else                                                                     \
     {                                                                        \
-        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, false, false, false, 1, KVT> \
-            <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                 \
+        aiter::launch_kernel(                                                \
+            aiter::launch_policy::kv_cache,                                  \
+            fused_mrope_rms_kv_kernel<T, HEAD_SIZE, false, false, false, 1, KVT>, \
+            numBlocks, threadsPerBlock, stream, qkv,                         \
                                                         q_w,                 \
                                                         k_w,                 \
                                                         cos_sin,             \
