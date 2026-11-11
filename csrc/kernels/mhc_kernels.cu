@@ -55,6 +55,7 @@
 #include <hipcub/hipcub.hpp>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 
 
 static_assert(opus::get_warp_size() == 64, "HCU expects wave64");
@@ -144,6 +145,29 @@ static_assert(opus::get_warp_size() == 64, "HCU expects wave64");
 #else
     #define AITER_HCU_HAS_MMAC_TF32 0
     #define AITER_HCU_HAS_MMAC_TF32_LIT_LTS 0
+#endif
+
+//! ====================================================================
+//! AITER_MHC_PMD_RECIP_GUARD —— perf-model 仿真器的 fp32 倒数／除法 workaround
+//! --------------------------------------------------------------------
+//! 现象: 在 perf-model(PMD) 上, fp32 除法序列
+//!   v_div_scale_f32 / v_rcp_f32 / v_div_fmas_f32 / v_div_fixup_f32
+//! 在结果的二进制指数绝对值约 >= 96 时, 把指数偏移 96:
+//!   1/(1+2.075e29) -> 0.38179708 (正确 4.8e-30)
+//!   1/1e29         -> 0.792282   (正确 1e-29)
+//! PMD 的 gfx946 与 gfx938 两个模型错得逐位相同。
+//! 对照实验: 同一探针在 dcugemm 真机 (gfx938, BW1101) 上全部正确, 相对差 < 1e-6
+//!   ⇒ 触发源是仿真器的 defect, 不是硬件行为。
+//! 处理: 本文件两处「极端比值」除法只在 __gfx946__ 编译目标下加保护, 其余架构走
+//!   原始表达式、与改动前逐位一致。真机上这两处保护与原始表达式的差异 <= 1e-20。
+//! 待办: gfx946 真机实测确认没有该现象后, 把本宏置 0 并删除两处保护分支, 统一改回
+//!   原始除法; 在此之前不要把该 workaround 当作 kernel 缺陷的修复。
+//! 关联: step2 执行记录 3.5.1 节的 PMD 与真机对照表。
+//! ====================================================================
+#if defined(__gfx946__)
+    #define AITER_MHC_PMD_RECIP_GUARD 1
+#else
+    #define AITER_MHC_PMD_RECIP_GUARD 0
 #endif
 
 namespace aiter {
@@ -842,6 +866,8 @@ namespace aiter {
         __syncthreads();
 
         //! Generated code stages C through shared memory to convert MMAC layout to row-major.
+#if defined(__gfx938__) || AITER_HCU_HAS_MMAC_K8
+        //! lit_lts / K=8 path keeps the 4 slots consecutive per lane (n = l/16*4 + s).
         #pragma unroll
         for (int i = 0; i < 4; i++) {
             int base = ((tid >> 6) * 1024)
@@ -851,6 +877,22 @@ namespace aiter {
             *reinterpret_cast<float4*>(s.f + base) =
                 *reinterpret_cast<float4*>(out_frag + i);
         }
+#else
+        //! HCU K=4 fallback (gfx946/gfx92a): lane quarter a holds n = s*4 + a, so the four slots
+        //! sit at stride 4, not consecutive. Stage every slot at its true column; the read-back
+        //! below then sees the same layout the lit_lts path produces.
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int row = (tid >> 6) * 32 + (i >> 1) * 16 + (tid & 15);
+            int a = (tid & 63) >> 4;
+            #pragma unroll
+            for (int slot = 0; slot < 4; slot++) {
+                int col = (i & 1) * 16 + slot * 4 + a;
+                int swz = (col >> 2) ^ (tid & 7);
+                s.f[row * 32 + swz * 4 + (col & 3)] = out_frag[i][slot];
+            }
+        }
+#endif
 
         __syncthreads();
 
@@ -1291,7 +1333,19 @@ namespace aiter {
         const int k_offset = sub_hidden_size * blockIdx.y;   //! 本 block 起始 hidden 列
         const int land_id = threadIdx.x % warp_size;
         const int m_oob = m < m_idx + num_rows ? (m - m_idx) : num_rows;
-        auto sigmoid = [](float x) { return 1.0f / (1.0f + __expf(-x)); };
+        //! 1/(1+exp(-x)). On __gfx946__ only, add the perf-model workaround described at
+        //! AITER_MHC_PMD_RECIP_GUARD: exp(-x) > 1e20 means the true sigmoid is below 1e-20,
+        //! which is irrelevant next to hc_pre_eps = 1e-6, so short-circuit instead of
+        //! dividing (the simulator would return ~0.38 there). Other architectures keep the
+        //! plain expression, bit-identical to before the workaround existed.
+        auto sigmoid = [](float x) {
+            float t = __expf(-x);
+#if AITER_MHC_PMD_RECIP_GUARD
+            return t > 1e20f ? 0.0f : 1.0f / (1.0f + t);
+#else
+            return 1.0f / (1.0f + t);
+#endif
+        };
         static_assert(block_size >= num_rows * hc_mult3, "block_size must be >= num_rows * hc_mult3");
         //! ---- STEP 0: 已合并到 STEP 2 ----
         //! 新版 STEP 2 中每个 s_hc_mult3 slot 只被一个线程写入一次（无 atomic），
@@ -1541,6 +1595,12 @@ namespace aiter {
             // comb = comb.softmax(-1) + eps
             float row_max = reduce_in_4threads(comb_mix_v, fmaxf);
             comb_mix_v = expf(comb_mix_v - row_max);
+#if AITER_MHC_PMD_RECIP_GUARD
+            //! perf-model workaround (see AITER_MHC_PMD_RECIP_GUARD): keep the divisions below
+            //! out of the extreme-ratio range the simulator mis-handles. Anything below 1e-20
+            //! is negligible once hc_sinkhorn_eps (default 1e-6) is added.
+            comb_mix_v = comb_mix_v < 1e-20f ? 0.0f : comb_mix_v;
+#endif
             float row_sum = reduce_in_4threads(comb_mix_v, sum_f);
             comb_mix_v = comb_mix_v / row_sum + hc_sinkhorn_eps;
             // comb = comb / (comb.sum(-2) + eps)
@@ -1655,7 +1715,19 @@ namespace aiter {
         const int lane_id = tid & (warp_size - 1);
         const int warp_id = tid / warp_size;
 
-        auto sigmoid = [](float x) { return 1.0f / (1.0f + __expf(-x)); };
+        //! 1/(1+exp(-x)). On __gfx946__ only, add the perf-model workaround described at
+        //! AITER_MHC_PMD_RECIP_GUARD: exp(-x) > 1e20 means the true sigmoid is below 1e-20,
+        //! which is irrelevant next to hc_pre_eps = 1e-6, so short-circuit instead of
+        //! dividing (the simulator would return ~0.38 there). Other architectures keep the
+        //! plain expression, bit-identical to before the workaround existed.
+        auto sigmoid = [](float x) {
+            float t = __expf(-x);
+#if AITER_MHC_PMD_RECIP_GUARD
+            return t > 1e20f ? 0.0f : 1.0f / (1.0f + t);
+#else
+            return 1.0f / (1.0f + t);
+#endif
+        };
         auto sum_f = [](float a, float b) { return a + b; };
 
         //! ============================================================
@@ -1737,6 +1809,10 @@ namespace aiter {
 
                 float row_max = reduce_in_4threads(comb_mix_v, fmaxf);
                 comb_mix_v = expf(comb_mix_v - row_max);
+#if AITER_MHC_PMD_RECIP_GUARD
+                //! Same perf-model workaround as the legacy stage-2 kernel.
+                comb_mix_v = comb_mix_v < 1e-20f ? 0.0f : comb_mix_v;
+#endif
                 float row_sum = reduce_in_4threads(comb_mix_v, sum_f);
                 comb_mix_v = comb_mix_v / row_sum + hc_sinkhorn_eps;
                 float col_sum = reduce_cross_4threads(comb_mix_v, sum_f);
@@ -1934,6 +2010,36 @@ namespace aiter {
         if (removed_v2_v4) { \
             TORCH_WARN("AITER_MHC_PRE_BIG_FUSE_KERNEL=", env_pre, " was removed after negative benchmarks; fallback to legacy dispatch."); \
         } \
+        int f_block = 0, f_rows = 0, f_cols = 0; \
+        const bool use_forced = \
+            !use_v3 && env_pre && \
+            std::sscanf(env_pre, "b%d,n%d,k%d", &f_block, &f_rows, &f_cols) == 3; \
+        const bool par = (n_splits >= 4 && (m) <= 2048); \
+        int sel_block, sel_rows, sel_cols; \
+        bool sel_par; \
+        const char* sel_src; \
+        if (use_forced) { \
+            sel_block = f_block; sel_rows = f_rows; sel_cols = f_cols; \
+            sel_par = par && f_block >= f_rows * 128; sel_src = "forced"; \
+        } else if ((m & 1) != 0) { \
+            /*! Odd token counts use 1 row/block to keep the main num_rows=2 path branch-free. */ \
+            sel_block = (64 + 64 * 2); sel_rows = 1; sel_cols = 256; \
+            sel_par = par; sel_src = "odd_m"; \
+        } else if ((m) <= cu_num * 12 || get_gpu_arch() != "gfx942") { \
+            sel_block = (64 + 64 * 4); sel_rows = 2; sel_cols = 256; \
+            sel_par = par; sel_src = "default"; \
+        } else { \
+            sel_block = (64 + 64 * 2); sel_rows = 2; sel_cols = 128; \
+            sel_par = false; sel_src = "gfx942_large_m"; \
+        } \
+        if (std::getenv("AITER_MHC_PRE_TRACE")) { \
+            std::fprintf(stderr, \
+                "[mhc_stage2_dispatch] arch=%s cu=%d m=%d n_splits=%d hidden=%d env=%s src=%s " \
+                "block_size=%d num_rows=%d residual_block=%d parallel_splitk_reduce=%d\n", \
+                get_gpu_arch().c_str(), cu_num, (m), n_splits, hidden_size, \
+                env_pre ? env_pre : "<unset>", sel_src, sel_block, sel_rows, sel_cols, \
+                sel_par ? 1 : 0); \
+        } \
         if (use_v3) { \
             /*! v3: hidden_block_v3 = elems × 64 = 512/256/128, 选最大可用 b 粒度 */ \
             if (hidden_size % 512 == 0) { \
@@ -1945,21 +2051,34 @@ namespace aiter {
             } else { \
                 TORCH_CHECK(false, "hidden_size must be divisible by 128 for v3"); \
             } \
-        } else if ((m & 1) != 0) { \
-            /*! Odd token counts use 1 row/block to keep the main num_rows=2 path branch-free. */ \
-            if (n_splits >= 4 && m <= 2048) { \
-                MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 2), 4, 1, 256, true); \
-            } else { \
-                MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 2), 4, 1, 256, false); \
-            } \
-        } else if (m <= cu_num * 12 || get_gpu_arch() != "gfx942") { \
-            if (n_splits >= 4 && m <= 2048) { \
-                MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 4), 4, 2, 256, true); \
-            } else { \
-                MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 4), 4, 2, 256, false); \
-            } \
-        } else { \
+        } else if (sel_block == 320 && sel_rows == 2 && sel_cols == 256 && sel_par) { \
+            /*! 候选与强制组合共用这一条按编译期常量分派的结构。 */ \
+            /*! 强制取值只接受「block shape 候选范围」表里编译得过且整除成立的组合。 */ \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 4), 4, 2, 256, true); \
+        } else if (sel_block == 320 && sel_rows == 2 && sel_cols == 256 && !sel_par) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 4), 4, 2, 256, false); \
+        } else if (sel_block == 192 && sel_rows == 1 && sel_cols == 256 && sel_par) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 2), 4, 1, 256, true); \
+        } else if (sel_block == 192 && sel_rows == 1 && sel_cols == 256 && !sel_par) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 2), 4, 1, 256, false); \
+        } else if (sel_block == 192 && sel_rows == 2 && sel_cols == 256) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 2), 4, 2, 256, false); \
+        } else if (sel_block == 128 && sel_rows == 1 && sel_cols == 256 && sel_par) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64), 4, 1, 256, true); \
+        } else if (sel_block == 128 && sel_rows == 1 && sel_cols == 256 && !sel_par) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64), 4, 1, 256, false); \
+        } else if (sel_block == 128 && sel_rows == 2 && sel_cols == 128) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64), 4, 2, 128, false); \
+        } else if (sel_block == 320 && sel_rows == 4 && sel_cols == 256) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 4), 4, 4, 256, false); \
+        } else if (sel_block == 192 && sel_rows == 4 && sel_cols == 256) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 2), 4, 4, 256, false); \
+        } else if (sel_block == 192 && sel_rows == 2 && sel_cols == 128) { \
             MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 2), 4, 2, 128, false); \
+        } else { \
+            TORCH_CHECK(false, "unsupported stage-2 block shape: src=", sel_src, \
+                        " block_size=", sel_block, " num_rows=", sel_rows, \
+                        " residual_block=", sel_cols); \
         } \
     } while (0)
 
