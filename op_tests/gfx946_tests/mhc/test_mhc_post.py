@@ -43,6 +43,7 @@ import hashlib
 import inspect
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -392,6 +393,35 @@ def run_cross_kernel(aiter, c):
     return record
 
 
+SUB_REJECT_CODE = """
+import torch, aiter
+x = torch.zeros(32, {hidden}, dtype=torch.bfloat16, device="cuda")
+res = torch.zeros(32, 4, {hidden}, dtype=torch.bfloat16, device="cuda")
+plm = torch.zeros(32, 4, 1, dtype=torch.float32, device="cuda")
+comb = torch.zeros(32, 4, 4, dtype=torch.float32, device="cuda")
+out = torch.empty(32, 4, {hidden}, dtype=torch.bfloat16, device="cuda")
+aiter.mhc_post(out, x, res, plm, comb)
+print("NO_REJECT")
+"""
+
+
+def subprocess_rejects(hidden, kernel, expect):
+    """AITER_CHECK aborts the process in this build, so reject paths run in a child."""
+    env = dict(os.environ)
+    if kernel is None:
+        env.pop("AITER_MHC_POST_KERNEL", None)
+    else:
+        env["AITER_MHC_POST_KERNEL"] = kernel
+    proc = subprocess.run([sys.executable, "-c",
+                           SUB_REJECT_CODE.format(hidden=hidden)],
+                          capture_output=True, text=True, env=env, timeout=1800)
+    tail = [line for line in proc.stderr.strip().splitlines()[-4:]]
+    return dict(exit=proc.returncode,
+                rejected=(proc.returncode != 0 and expect in proc.stderr),
+                no_reject_marker="NO_REJECT" in proc.stdout,
+                stderr_tail=tail)
+
+
 def run_invalid(aiter, c):
     """The four semantics checks of the plan: warn+fallback, then three errors."""
     name = c["name"]
@@ -412,13 +442,18 @@ def run_invalid(aiter, c):
             set_kernel_env(None)
         out_auto = run_dut(aiter, x, residual, post_layer_mix, comb_res_mix)
         traces, _ = parse_trace(captured)
+        py_warn = any("Unknown AITER_MHC_POST_KERNEL" in str(w.message)
+                      for w in caught)
+        stderr_warn = "Unknown AITER_MHC_POST_KERNEL" in captured
         record.update(
             warnings=[str(w.message) for w in caught],
+            stderr_has_warning=stderr_warn,
             trace=traces[0] if traces else None,
             equal_to_auto=bool(torch.equal(out_bogus, out_auto)))
-        if not any("Unknown AITER_MHC_POST_KERNEL" in w.message.__str__()
-                   for w in caught):
-            raise fail_with_detail("no Unknown AITER_MHC_POST_KERNEL warning", record)
+        if not (py_warn or stderr_warn):
+            raise fail_with_detail(
+                "no Unknown AITER_MHC_POST_KERNEL warning in warnings or stderr",
+                record)
         if len(traces) != 1:
             raise fail_with_detail(
                 f"expected exactly 1 trace line, got {len(traces)}", record)
@@ -436,11 +471,13 @@ def run_invalid(aiter, c):
             m, hidden, seed, hc_mult=2)
         expect = "hc_mult only supports 4"
     elif name == "hidden_1000":
-        x, residual, post_layer_mix, comb_res_mix = make_inputs(
-            m, 1000, seed)
-        hidden = 1000
-        expect = "divisible by 256"
-        set_kernel_env(None)
+        # Not divisible by 256: every candidate rejects it via AITER_CHECK,
+        # which aborts rather than throws in this build.
+        record["reject"] = subprocess_rejects(1000, None, "divisible by 256")
+        if not record["reject"]["rejected"]:
+            raise fail_with_detail(
+                "hidden=1000 was not rejected by the child process", record)
+        return record
     elif name == "hidden_384":
         # v5 accepts hidden divisible by 128 (not by 256); v3 must reject it.
         x, residual, post_layer_mix, comb_res_mix = make_inputs(m, 384, seed)
@@ -455,16 +492,8 @@ def run_invalid(aiter, c):
         if record["v5_out"]["violations"]:
             raise fail_with_detail(
                 f"v5 rejected a legal hidden=384 shape: {record['v5_out']}", record)
-        set_kernel_env("v3")
-        try:
-            run_dut(aiter, x, residual, post_layer_mix, comb_res_mix)
-            record["v3_rejected"] = False
-        except RuntimeError as exc:
-            record["v3_error"] = str(exc)
-            record["v3_rejected"] = "divisible by 256" in str(exc)
-        finally:
-            set_kernel_env(None)
-        if not record.get("v3_rejected"):
+        record["v3_reject"] = subprocess_rejects(384, "v3", "divisible by 256")
+        if not record["v3_reject"]["rejected"]:
             raise fail_with_detail("v3 did not reject hidden=384", record)
         return record
     else:
