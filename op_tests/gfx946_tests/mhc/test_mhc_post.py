@@ -68,6 +68,7 @@ POST_ENV = ("AITER_MHC_POST_KERNEL", "AITER_MHC_POST_TRACE")
 FORCED = dict(auto=None, auto_stress=None, v3="v3", v3_stress="v3", v3probe="v3")
 
 INVALID_CASES = ("bogus_env", "hc_mult", "hidden_1000", "hidden_384")
+GPU_CHIP_ENV = None  # remembered for child processes, which re-init the model
 
 
 def fail_with_detail(message, record):
@@ -408,6 +409,8 @@ print("NO_REJECT")
 def subprocess_rejects(hidden, kernel, expect):
     """AITER_CHECK aborts the process in this build, so reject paths run in a child."""
     env = dict(os.environ)
+    if GPU_CHIP_ENV:
+        env["GPU_CHIP"] = GPU_CHIP_ENV
     if kernel is None:
         env.pop("AITER_MHC_POST_KERNEL", None)
     else:
@@ -568,9 +571,11 @@ def main():
     # Every case runs with tracing on: the trace line is the path evidence.
     os.environ["AITER_MHC_POST_TRACE"] = "1"
     set_kernel_env(None)
+    global GPU_CHIP_ENV
+    GPU_CHIP_ENV = os.environ.get("GPU_CHIP")
     identity = dict(
         arch=props.gcnArchName, cu_num=props.multi_processor_count,
-        topology=topology, gpu_chip=os.environ.get("GPU_CHIP"),
+        topology=topology, gpu_chip=GPU_CHIP_ENV,
         module=str(so), aiter_file=aiter.__file__,
         module_sha256=hashlib.sha256(so.read_bytes()).hexdigest(),
         test_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
