@@ -1080,6 +1080,11 @@ namespace aiter {
                 use_k8_runtime = use_k8_auto;
             }
         }
+        if (std::getenv("AITER_MHC_PRE_TRACE")) {
+            fprintf(stderr, "[mhc_pre_stage1_trace] entry=legacy arch=%s m=%d hc_hidden=%d tile_k=%d split_k=%d auto=%d mmac_k=%d\n",
+                    gfx_arch.c_str(), m, hc_hidden_size, tile_k, split_k,
+                    use_k8_auto ? 1 : 0, use_k8_runtime ? 8 : 4);
+        }
 
         if (forced_tile_n == 16) {
             if (tile_k == 64) {
@@ -1174,6 +1179,11 @@ namespace aiter {
             } else if (std::strcmp(env_k, "auto") == 0 || std::strcmp(env_k, "AUTO") == 0) {
                 use_k8_runtime = use_k8_auto;
             }
+        }
+        if (std::getenv("AITER_MHC_PRE_TRACE")) {
+            fprintf(stderr, "[mhc_pre_stage1_trace] entry=m128 arch=%s m=%d hc_hidden=%d split_k=%d auto=%d mmac_k=%d\n",
+                    gfx_arch.c_str(), m, hc_hidden_size, split_k,
+                    use_k8_auto ? 1 : 0, use_k8_runtime ? 8 : 4);
         }
 
         if (use_tf32) {
