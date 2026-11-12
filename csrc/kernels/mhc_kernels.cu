@@ -1053,15 +1053,23 @@ namespace aiter {
         //
         // 启发式: m_blocks >= 4 OR (m_blocks >= 2 且 hc_hidden_size >= 16384) → K=8;
         //         否则 → K=4。
-        // 架构门控: 上述形状启发式只在 hcu_mmac_k8_available() 为真的目标上生效,
-        //         否则一律 K=4（gfx946 属此类：K=8 builtin 不存在，申请 K=8 只会
-        //         被编译期降级成另一套展开结构）。
-        // 优先级: env var > 架构门控 > 形状启发式 (用户可显式覆盖)。
+        // 架构门控 + m 分档（2026-11-12 实测裁定）:
+        //   - K=8 builtin 真实存在的目标（gfx928/936/938）：原启发式原样生效，逐位不变。
+        //   - 其余目标（gfx946 等，K=8 在编译期被展开成另一套 K=4 结构）：
+        //     实测 m <= 1024 时直接申请 K=4 实例更快（128x1280 -22.5%、128x7168 -5.1%、
+        //     1024x1280 -21.9%、1024x7168 -4.3%）；m=8192x1280 反转 +0.64%，
+        //     即大 m 下 K=8 实例反而略快。故以 m=1024 为分界：不超过则 K=4，
+        //     超过则沿用原形状启发式（该区间 m_blocks >= 17，实际总取 K=8）。
+        //     大 shape 的进一步调优不在本轮范围。
+        // 优先级: env var > 架构门控与 m 分档 > 形状启发式 (用户可显式覆盖)。
         // ============================================================
+        constexpr int kMmacK8CrossoverM = 1024;
         const std::string gfx_arch = get_gpu_arch();
-        bool use_k8_auto = hcu_mmac_k8_available(gfx_arch) &&
-                           ((m_blocks >= 4) ||
-                            (m_blocks >= 2 && hc_hidden_size >= 16384));
+        const bool k8_capable = hcu_mmac_k8_available(gfx_arch);
+        const bool shape_prefers_k8 = (m_blocks >= 4) ||
+                                      (m_blocks >= 2 && hc_hidden_size >= 16384);
+        bool use_k8_auto = k8_capable ? shape_prefers_k8
+                                      : (m > kMmacK8CrossoverM && shape_prefers_k8);
         bool use_k8_runtime = use_k8_auto;
         if (const char* env_k = std::getenv("AITER_MHC_PRE_GEMM_MMAC_K")) {
             if (std::strcmp(env_k, "4") == 0) {
@@ -1144,12 +1152,19 @@ namespace aiter {
         dim3 block(block_size);
         dim3 grid(m_blocks, n_blocks, split_k);
 
-        //! K=8 自动选择：只有 hcu_mmac_k8_available() 为真的目标才申请 K=8 实例。
-        //! 原判据 "get_gpu_arch() != gfx936" 把「未知架构」当成「K=8 可用」，
-        //! gfx946 / gfx92a / gfx942 都会申请一个编译期必然降级的实例。
-        //! gfx936 依旧排除：其 K=8 builtin 存在但本 kernel 上收益为负。
+        //! K=8 自动选择（2026-11-12 实测裁定，与 legacy 入口同一套规则）：
+        //!   - K=8 builtin 真实存在且本 kernel 上收益为正的目标（gfx928/938）→ K=8。
+        //!     gfx936 虽然 builtin 存在，但本 kernel 上收益为负，保持排除。
+        //!   - 其余目标（gfx946 / gfx92a / gfx942）：m <= 1024 直接申请 K=4 实例；
+        //!     m > 1024 沿用原行为（申请 K=8，编译期降级）。分界线依据为 legacy
+        //!     入口的实测（本入口两个模板实例指令条数相等，见 step3 记录）。
+        //!     原判据 "get_gpu_arch() != gfx936" 把「未知架构」当成「K=8 可用」，
+        //!     这是本轮修正的起点。
+        constexpr int kMmacK8CrossoverM = 1024;
         const std::string gfx_arch = get_gpu_arch();
-        bool use_k8_auto = hcu_mmac_k8_available(gfx_arch) && gfx_arch != "gfx936";
+        const bool k8_capable = hcu_mmac_k8_available(gfx_arch);
+        bool use_k8_auto = k8_capable ? (gfx_arch != "gfx936")
+                                      : (m > kMmacK8CrossoverM);
         bool use_k8_runtime = use_k8_auto;
         if (const char* env_k = std::getenv("AITER_MHC_PRE_GEMM_MMAC_K")) {
             if (std::strcmp(env_k, "4") == 0) {
