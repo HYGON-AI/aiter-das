@@ -1,5 +1,29 @@
 # 分组量化与 MXFP4 验证
 
+## 独立接口 per_token_group_quant_fp8
+
+`test_per_token_group_quant_fp8.py` 从上级 `gfx946_tests` 迁移到本目录。它与下面的 `test_grouped_quant.py` 测试不同的公共入口。
+输入支持 FP16/BF16/FP32，输出为 E4M3FN/E5M2；`use_ue8m0=True` 仍写 FP32 scale，
+只是将其向上取为2的幂。测试使用 CPU 参考，严格比对 FP8 字节并检查输出保护区。
+
+```bash
+python op_tests/gfx946_tests/grouped_quant/test_per_token_group_quant_fp8.py --list
+# 设置本文 PMD 环境后：首次从当前源码重建，随后复用同一模块
+GPU_CHIP=sb python op_tests/gfx946_tests/grouped_quant/test_per_token_group_quant_fp8.py --suite all --expect-xcds 1 --rebuild --json sb.json
+GPU_CHIP=sbx2 python op_tests/gfx946_tests/grouped_quant/test_per_token_group_quant_fp8.py --suite all --expect-xcds 2 --json sbx2.json
+GPU_CHIP=sbx2 python op_tests/gfx946_tests/grouped_quant/test_per_token_group_quant_fp8.py --suite route --die-mode linear --chunk 2 --expect-xcds 2 --json linear2.json
+```
+
+`all` 包括36个数值用例及入参/启动配置拒绝检查；`quick` 仅4例；`route` 仅两个5TG
+用例；`config` 只做拒绝检查；`build --rebuild` 只重建/加载，不发射量化 kernel。
+每例只运行一次，无预热计时；最大输入16512元素。脚本强制从所在 checkout 导入，
+打印实际包、SO路径与哈希；gfx946 验证一个 GPU 的 HSA XCD 数并检查 `--expect-xcds`。
+多 die 的实际路由须结合每个 dispatch 的 `completedWGs`，数值通过本身不足以证明分发。
+不同 PMD 进程请使用独立工作目录保存统计。真机回归可指定 `--require-arch gfx936`
+或 `--require-arch gfx938`，不传 `--expect-xcds`。
+
+## per_group_quant_hip 与 MXFP4
+
 从 AITER 根目录执行，依赖仅为标准库、Torch 和 AITER。输入在 CPU 确定性生成；量化字节、scale 字节或 FP32 值逐项精确比较。没有临时目录的 import、输入文件或定义依赖。
 
 容器同时存在旧 wheel 时，先 `export PYTHONPATH="$PWD"` 明确选中当前 AITER 源码包；输出 ENV 的 `aiter` 路径和 SUMMARY 的模块路径/哈希用于核验。不要将历史临时 JIT 目录设为测试依赖。
