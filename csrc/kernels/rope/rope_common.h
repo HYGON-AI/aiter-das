@@ -389,22 +389,22 @@ struct OpUncachedFwd
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
 
-        for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        for(int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
+                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did, size_half_r);
 
             for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
             {
                 float input_0, input_1;
                 load_payload<RotateStyle, StrideDInEq1>(
-                    &input_0, &input_1, p_input, did, hid, stride_i_d, stride_i_h, size_half_r);
+                    &input_0, &input_1, p_input + did_start * stride_i_d, did, hid, stride_i_d, stride_i_h, size_half_r);
 
                 const float output_0 = input_0 * cos_0 - input_1 * sin_0;
                 const float output_1 = input_1 * cos_1 + input_0 * sin_1;
                 store_payload<RotateStyle, StrideDOutEq1>(
-                    p_output, output_0, output_1, did, hid, stride_o_d, stride_o_h, size_half_r);
+                    p_output + did_start * stride_o_d, output_0, output_1, did, hid, stride_o_d, stride_o_h, size_half_r);
             }
         }
 
@@ -459,18 +459,18 @@ struct OpUncachedFwd
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
 
-        for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        for(int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
+                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did, size_half_r);
 
             for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
             {
                 float input_x_0, input_x_1, input_y_0, input_y_1;
                 load_payload<RotateStyle, StrideDInXEq1>(&input_x_0,
                                                          &input_x_1,
-                                                         p_input_x,
+                                                         p_input_x + did_start * stride_ix_d,
                                                          did,
                                                          hid,
                                                          stride_ix_d,
@@ -478,7 +478,7 @@ struct OpUncachedFwd
                                                          size_half_r);
                 load_payload<RotateStyle, StrideDInYEq1>(&input_y_0,
                                                          &input_y_1,
-                                                         p_input_y,
+                                                         p_input_y + did_start * stride_iy_d,
                                                          did,
                                                          hid,
                                                          stride_iy_d,
@@ -489,7 +489,7 @@ struct OpUncachedFwd
                 const float output_x_1 = input_x_1 * cos_1 + input_x_0 * sin_1;
                 const float output_y_0 = input_y_0 * cos_0 - input_y_1 * sin_0;
                 const float output_y_1 = input_y_1 * cos_1 + input_y_0 * sin_1;
-                store_payload<RotateStyle, StrideDOutXEq1>(p_output_x,
+                store_payload<RotateStyle, StrideDOutXEq1>(p_output_x + did_start * stride_ox_d,
                                                            output_x_0,
                                                            output_x_1,
                                                            did,
@@ -497,7 +497,7 @@ struct OpUncachedFwd
                                                            stride_ox_d,
                                                            stride_ox_h,
                                                            size_half_r);
-                store_payload<RotateStyle, StrideDOutYEq1>(p_output_y,
+                store_payload<RotateStyle, StrideDOutYEq1>(p_output_y + did_start * stride_oy_d,
                                                            output_y_0,
                                                            output_y_1,
                                                            did,
@@ -512,7 +512,7 @@ struct OpUncachedFwd
                 float input_x_0, input_x_1;
                 load_payload<RotateStyle, StrideDInXEq1>(&input_x_0,
                                                          &input_x_1,
-                                                         p_input_x,
+                                                         p_input_x + did_start * stride_ix_d,
                                                          did,
                                                          hid,
                                                          stride_ix_d,
@@ -521,7 +521,7 @@ struct OpUncachedFwd
 
                 const float output_x_0 = input_x_0 * cos_0 - input_x_1 * sin_0;
                 const float output_x_1 = input_x_1 * cos_1 + input_x_0 * sin_1;
-                store_payload<RotateStyle, StrideDOutXEq1>(p_output_x,
+                store_payload<RotateStyle, StrideDOutXEq1>(p_output_x + did_start * stride_ox_d,
                                                            output_x_0,
                                                            output_x_1,
                                                            did,
@@ -536,7 +536,7 @@ struct OpUncachedFwd
                 float input_y_0, input_y_1;
                 load_payload<RotateStyle, StrideDInYEq1>(&input_y_0,
                                                          &input_y_1,
-                                                         p_input_y,
+                                                         p_input_y + did_start * stride_iy_d,
                                                          did,
                                                          hid,
                                                          stride_iy_d,
@@ -545,7 +545,7 @@ struct OpUncachedFwd
 
                 const float output_y_0 = input_y_0 * cos_0 - input_y_1 * sin_0;
                 const float output_y_1 = input_y_1 * cos_1 + input_y_0 * sin_1;
-                store_payload<RotateStyle, StrideDOutYEq1>(p_output_y,
+                store_payload<RotateStyle, StrideDOutYEq1>(p_output_y + did_start * stride_oy_d,
                                                            output_y_0,
                                                            output_y_1,
                                                            did,
@@ -607,18 +607,18 @@ struct OpUncachedBwd
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
 
-        for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        for(int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
+                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did, size_half_r);
 
             for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
             {
                 float output_grad_0, output_grad_1;
                 load_payload<RotateStyle, StrideDOutGradsEq1>(&output_grad_0,
                                                               &output_grad_1,
-                                                              p_output_grads,
+                                                              p_output_grads + did_start * stride_o_d,
                                                               did,
                                                               hid,
                                                               stride_o_d,
@@ -627,7 +627,7 @@ struct OpUncachedBwd
 
                 const float input_grad_0 = output_grad_0 * cos_0 + output_grad_1 * sin_0;
                 const float input_grad_1 = output_grad_1 * cos_1 - output_grad_0 * sin_1;
-                store_payload<RotateStyle, StrideDInGradsEq1>(p_input_grads,
+                store_payload<RotateStyle, StrideDInGradsEq1>(p_input_grads + did_start * stride_i_d,
                                                               input_grad_0,
                                                               input_grad_1,
                                                               did,
@@ -689,18 +689,18 @@ struct OpUncachedBwd
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
 
-        for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        for(int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
+                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did, size_half_r);
 
             for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
             {
                 float output_grad_x_0, output_grad_x_1, output_grad_y_0, output_grad_y_1;
                 load_payload<RotateStyle, StrideDOutGradsXEq1>(&output_grad_x_0,
                                                                &output_grad_x_1,
-                                                               p_output_grads_x,
+                                                               p_output_grads_x + did_start * stride_ox_d,
                                                                did,
                                                                hid,
                                                                stride_ox_d,
@@ -708,7 +708,7 @@ struct OpUncachedBwd
                                                                size_half_r);
                 load_payload<RotateStyle, StrideDOutGradsYEq1>(&output_grad_y_0,
                                                                &output_grad_y_1,
-                                                               p_output_grads_y,
+                                                               p_output_grads_y + did_start * stride_oy_d,
                                                                did,
                                                                hid,
                                                                stride_oy_d,
@@ -719,7 +719,7 @@ struct OpUncachedBwd
                 const float input_grad_x_1 = output_grad_x_1 * cos_1 - output_grad_x_0 * sin_1;
                 const float input_grad_y_0 = output_grad_y_0 * cos_0 + output_grad_y_1 * sin_0;
                 const float input_grad_y_1 = output_grad_y_1 * cos_1 - output_grad_y_0 * sin_1;
-                store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x,
+                store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x + did_start * stride_ix_d,
                                                                input_grad_x_0,
                                                                input_grad_x_1,
                                                                did,
@@ -727,7 +727,7 @@ struct OpUncachedBwd
                                                                stride_ix_d,
                                                                stride_ix_h,
                                                                size_half_r);
-                store_payload<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y,
+                store_payload<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y + did_start * stride_iy_d,
                                                                input_grad_y_0,
                                                                input_grad_y_1,
                                                                did,
@@ -742,7 +742,7 @@ struct OpUncachedBwd
                 float output_grad_x_0, output_grad_x_1;
                 load_payload<RotateStyle, StrideDOutGradsXEq1>(&output_grad_x_0,
                                                                &output_grad_x_1,
-                                                               p_output_grads_x,
+                                                               p_output_grads_x + did_start * stride_ox_d,
                                                                did,
                                                                hid,
                                                                stride_ox_d,
@@ -751,7 +751,7 @@ struct OpUncachedBwd
 
                 const float input_grad_x_0 = output_grad_x_0 * cos_0 + output_grad_x_1 * sin_0;
                 const float input_grad_x_1 = output_grad_x_1 * cos_1 - output_grad_x_0 * sin_1;
-                store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x,
+                store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x + did_start * stride_ix_d,
                                                                input_grad_x_0,
                                                                input_grad_x_1,
                                                                did,
@@ -766,7 +766,7 @@ struct OpUncachedBwd
                 float output_grad_y_0, output_grad_y_1;
                 load_payload<RotateStyle, StrideDOutGradsYEq1>(&output_grad_y_0,
                                                                &output_grad_y_1,
-                                                               p_output_grads_y,
+                                                               p_output_grads_y + did_start * stride_oy_d,
                                                                did,
                                                                hid,
                                                                stride_oy_d,
@@ -775,7 +775,7 @@ struct OpUncachedBwd
 
                 const float input_grad_y_0 = output_grad_y_0 * cos_0 + output_grad_y_1 * sin_0;
                 const float input_grad_y_1 = output_grad_y_1 * cos_1 - output_grad_y_0 * sin_1;
-                store_payload<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y,
+                store_payload<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y + did_start * stride_iy_d,
                                                                input_grad_y_0,
                                                                input_grad_y_1,
                                                                did,
@@ -838,22 +838,22 @@ struct OpCachedFwd
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
 
-        for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        for(int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
+                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did, size_half_r);
 
             for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
             {
                 float input_0, input_1;
                 load_payload<RotateStyle, StrideDInEq1>(
-                    &input_0, &input_1, p_input, did, hid, stride_i_d, stride_i_h, size_half_r);
+                    &input_0, &input_1, p_input + did_start * stride_i_d, did, hid, stride_i_d, stride_i_h, size_half_r);
 
                 const float output_0 = input_0 * cos_0 - input_1 * sin_0;
                 const float output_1 = input_1 * cos_1 + input_0 * sin_1;
                 store_payload<RotateStyle, StrideDOutEq1>(
-                    p_output, output_0, output_1, did, hid, stride_o_d, stride_o_h, size_half_r);
+                    p_output + did_start * stride_o_d, output_0, output_1, did, hid, stride_o_d, stride_o_h, size_half_r);
             }
         }
 
@@ -909,18 +909,18 @@ struct OpCachedFwd
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
 
-        for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        for(int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
+                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did, size_half_r);
 
             for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
             {
                 float input_x_0, input_x_1, input_y_0, input_y_1;
                 load_payload<RotateStyle, StrideDInXEq1>(&input_x_0,
                                                          &input_x_1,
-                                                         p_input_x,
+                                                         p_input_x + did_start * stride_ix_d,
                                                          did,
                                                          hid,
                                                          stride_ix_d,
@@ -928,7 +928,7 @@ struct OpCachedFwd
                                                          size_half_r);
                 load_payload<RotateStyle, StrideDInYEq1>(&input_y_0,
                                                          &input_y_1,
-                                                         p_input_y,
+                                                         p_input_y + did_start * stride_iy_d,
                                                          did,
                                                          hid,
                                                          stride_iy_d,
@@ -939,7 +939,7 @@ struct OpCachedFwd
                 const float output_x_1 = input_x_1 * cos_1 + input_x_0 * sin_1;
                 const float output_y_0 = input_y_0 * cos_0 - input_y_1 * sin_0;
                 const float output_y_1 = input_y_1 * cos_1 + input_y_0 * sin_1;
-                store_payload<RotateStyle, StrideDOutXEq1>(p_output_x,
+                store_payload<RotateStyle, StrideDOutXEq1>(p_output_x + did_start * stride_ox_d,
                                                            output_x_0,
                                                            output_x_1,
                                                            did,
@@ -947,7 +947,7 @@ struct OpCachedFwd
                                                            stride_ox_d,
                                                            stride_ox_h,
                                                            size_half_r);
-                store_payload<RotateStyle, StrideDOutYEq1>(p_output_y,
+                store_payload<RotateStyle, StrideDOutYEq1>(p_output_y + did_start * stride_oy_d,
                                                            output_y_0,
                                                            output_y_1,
                                                            did,
@@ -962,7 +962,7 @@ struct OpCachedFwd
                 float input_x_0, input_x_1;
                 load_payload<RotateStyle, StrideDInXEq1>(&input_x_0,
                                                          &input_x_1,
-                                                         p_input_x,
+                                                         p_input_x + did_start * stride_ix_d,
                                                          did,
                                                          hid,
                                                          stride_ix_d,
@@ -971,7 +971,7 @@ struct OpCachedFwd
 
                 const float output_x_0 = input_x_0 * cos_0 - input_x_1 * sin_0;
                 const float output_x_1 = input_x_1 * cos_1 + input_x_0 * sin_1;
-                store_payload<RotateStyle, StrideDOutXEq1>(p_output_x,
+                store_payload<RotateStyle, StrideDOutXEq1>(p_output_x + did_start * stride_ox_d,
                                                            output_x_0,
                                                            output_x_1,
                                                            did,
@@ -986,7 +986,7 @@ struct OpCachedFwd
                 float input_y_0, input_y_1;
                 load_payload<RotateStyle, StrideDInYEq1>(&input_y_0,
                                                          &input_y_1,
-                                                         p_input_y,
+                                                         p_input_y + did_start * stride_iy_d,
                                                          did,
                                                          hid,
                                                          stride_iy_d,
@@ -995,7 +995,7 @@ struct OpCachedFwd
 
                 const float output_y_0 = input_y_0 * cos_0 - input_y_1 * sin_0;
                 const float output_y_1 = input_y_1 * cos_1 + input_y_0 * sin_1;
-                store_payload<RotateStyle, StrideDOutYEq1>(p_output_y,
+                store_payload<RotateStyle, StrideDOutYEq1>(p_output_y + did_start * stride_oy_d,
                                                            output_y_0,
                                                            output_y_1,
                                                            did,
@@ -1058,18 +1058,18 @@ struct OpCachedBwd
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
 
-        for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        for(int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
+                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did, size_half_r);
 
             for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
             {
                 float output_grad_0, output_grad_1;
                 load_payload<RotateStyle, StrideDOutGradsEq1>(&output_grad_0,
                                                               &output_grad_1,
-                                                              p_output_grads,
+                                                              p_output_grads + did_start * stride_o_d,
                                                               did,
                                                               hid,
                                                               stride_o_d,
@@ -1078,7 +1078,7 @@ struct OpCachedBwd
 
                 const float input_grad_0 = output_grad_0 * cos_0 + output_grad_1 * sin_0;
                 const float input_grad_1 = output_grad_1 * cos_1 - output_grad_0 * sin_1;
-                store_payload<RotateStyle, StrideDInGradsEq1>(p_input_grads,
+                store_payload<RotateStyle, StrideDInGradsEq1>(p_input_grads + did_start * stride_i_d,
                                                               input_grad_0,
                                                               input_grad_1,
                                                               did,
@@ -1141,18 +1141,18 @@ struct OpCachedBwd
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
 
-        for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        for(int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
+                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did, size_half_r);
 
             for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
             {
                 float output_grad_x_0, output_grad_x_1, output_grad_y_0, output_grad_y_1;
                 load_payload<RotateStyle, StrideDOutGradsXEq1>(&output_grad_x_0,
                                                                &output_grad_x_1,
-                                                               p_output_grads_x,
+                                                               p_output_grads_x + did_start * stride_ox_d,
                                                                did,
                                                                hid,
                                                                stride_ox_d,
@@ -1160,7 +1160,7 @@ struct OpCachedBwd
                                                                size_half_r);
                 load_payload<RotateStyle, StrideDOutGradsYEq1>(&output_grad_y_0,
                                                                &output_grad_y_1,
-                                                               p_output_grads_y,
+                                                               p_output_grads_y + did_start * stride_oy_d,
                                                                did,
                                                                hid,
                                                                stride_oy_d,
@@ -1171,7 +1171,7 @@ struct OpCachedBwd
                 const float input_grad_x_1 = output_grad_x_1 * cos_1 - output_grad_x_0 * sin_1;
                 const float input_grad_y_0 = output_grad_y_0 * cos_0 + output_grad_y_1 * sin_0;
                 const float input_grad_y_1 = output_grad_y_1 * cos_1 - output_grad_y_0 * sin_1;
-                store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x,
+                store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x + did_start * stride_ix_d,
                                                                input_grad_x_0,
                                                                input_grad_x_1,
                                                                did,
@@ -1179,7 +1179,7 @@ struct OpCachedBwd
                                                                stride_ix_d,
                                                                stride_ix_h,
                                                                size_half_r);
-                store_payload<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y,
+                store_payload<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y + did_start * stride_iy_d,
                                                                input_grad_y_0,
                                                                input_grad_y_1,
                                                                did,
@@ -1194,7 +1194,7 @@ struct OpCachedBwd
                 float output_grad_x_0, output_grad_x_1;
                 load_payload<RotateStyle, StrideDOutGradsXEq1>(&output_grad_x_0,
                                                                &output_grad_x_1,
-                                                               p_output_grads_x,
+                                                               p_output_grads_x + did_start * stride_ox_d,
                                                                did,
                                                                hid,
                                                                stride_ox_d,
@@ -1203,7 +1203,7 @@ struct OpCachedBwd
 
                 const float input_grad_x_0 = output_grad_x_0 * cos_0 + output_grad_x_1 * sin_0;
                 const float input_grad_x_1 = output_grad_x_1 * cos_1 - output_grad_x_0 * sin_1;
-                store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x,
+                store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x + did_start * stride_ix_d,
                                                                input_grad_x_0,
                                                                input_grad_x_1,
                                                                did,
@@ -1218,7 +1218,7 @@ struct OpCachedBwd
                 float output_grad_y_0, output_grad_y_1;
                 load_payload<RotateStyle, StrideDOutGradsYEq1>(&output_grad_y_0,
                                                                &output_grad_y_1,
-                                                               p_output_grads_y,
+                                                               p_output_grads_y + did_start * stride_oy_d,
                                                                did,
                                                                hid,
                                                                stride_oy_d,
@@ -1227,7 +1227,7 @@ struct OpCachedBwd
 
                 const float input_grad_y_0 = output_grad_y_0 * cos_0 + output_grad_y_1 * sin_0;
                 const float input_grad_y_1 = output_grad_y_1 * cos_1 - output_grad_y_0 * sin_1;
-                store_payload<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y,
+                store_payload<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y + did_start * stride_iy_d,
                                                                input_grad_y_0,
                                                                input_grad_y_1,
                                                                did,
@@ -2341,10 +2341,11 @@ __global__ void kn_entry_1c_2d_cached(scalar_t* __restrict__ p_output,
     const uint64_t sid         = Hid * img_width + Wid;
     const uint64_t bid         = blockIdx.z;
     const uint64_t size_half_d = size_d >> 1;
+    const uint64_t size_f = ReuseFreqsFrontPart ? size_half_d / 2 : size_half_d;
 
     const int offset_h_i = bid * stride_i_b + sid * stride_i_s;
     const int offset_h_o = bid * stride_o_b + sid * stride_o_s;
-    const int offset_h_f = Hid * size_half_d;
+    const int offset_h_f = Hid * size_f;
     Op::template apply_1c<RotateStyle,
                           ReuseFreqsFrontPart,
                           NopeFirst,
@@ -2356,7 +2357,7 @@ __global__ void kn_entry_1c_2d_cached(scalar_t* __restrict__ p_output,
                                         p_sin_h + offset_h_f,
                                         size_h,
                                         size_half_d,
-                                        size_half_d,
+                                        size_f,
                                         stride_i_h,
                                         stride_i_d,
                                         stride_o_h,
@@ -2364,7 +2365,7 @@ __global__ void kn_entry_1c_2d_cached(scalar_t* __restrict__ p_output,
 
     const int offset_w_i = offset_h_i + size_half_d * stride_i_d;
     const int offset_w_o = offset_h_o + size_half_d * stride_o_d;
-    const int offset_w_f = Wid * size_half_d;
+    const int offset_w_f = Wid * size_f;
     Op::template apply_1c<RotateStyle,
                           ReuseFreqsFrontPart,
                           NopeFirst,
@@ -2376,7 +2377,7 @@ __global__ void kn_entry_1c_2d_cached(scalar_t* __restrict__ p_output,
                                         p_sin_w + offset_w_f,
                                         size_h,
                                         size_half_d,
-                                        size_half_d,
+                                        size_f,
                                         stride_i_h,
                                         stride_i_d,
                                         stride_o_h,
@@ -2408,9 +2409,10 @@ __global__ void kn_entry_1c_2d_cached_inplace(scalar_t* __restrict__ p_inout,
     const uint64_t sid         = Hid * img_width + Wid;
     const uint64_t bid         = blockIdx.z;
     const uint64_t size_half_d = size_d >> 1;
+    const uint64_t size_f = ReuseFreqsFrontPart ? size_half_d / 2 : size_half_d;
 
     const int offset_h   = bid * stride_b + sid * stride_s;
-    const int offset_h_f = Hid * size_half_d;
+    const int offset_h_f = Hid * size_f;
     Op::template apply_1c<RotateStyle,
                           ReuseFreqsFrontPart,
                           NopeFirst,
@@ -2422,14 +2424,14 @@ __global__ void kn_entry_1c_2d_cached_inplace(scalar_t* __restrict__ p_inout,
                                       p_sin_h + offset_h_f,
                                       size_h,
                                       size_half_d,
-                                      size_half_d,
+                                      size_f,
                                       stride_h,
                                       stride_d,
                                       stride_h,
                                       stride_d);
 
     const int offset_w   = offset_h + size_half_d * stride_d;
-    const int offset_w_f = Wid * size_half_d;
+    const int offset_w_f = Wid * size_f;
     Op::template apply_1c<RotateStyle,
                           ReuseFreqsFrontPart,
                           NopeFirst,
@@ -2441,7 +2443,7 @@ __global__ void kn_entry_1c_2d_cached_inplace(scalar_t* __restrict__ p_inout,
                                       p_sin_w + offset_w_f,
                                       size_h,
                                       size_half_d,
-                                      size_half_d,
+                                      size_f,
                                       stride_h,
                                       stride_d,
                                       stride_h,
@@ -2690,11 +2692,12 @@ void dispatch_1c_sbhd_uncached(scalar_t* __restrict__ p_output,
         LAUNCH_KERNEL_STRIDE_EQUAL_1_1_STRIDES(
             RotateStyle,
             stride_i_d,
-            kn_entry_1c_sbhd_uncached_inplace<Op,
+            aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_1c_sbhd_uncached_inplace<Op,
                                               RotateStyle,
                                               ReuseFreqsFrontPart,
                                               NopeFirst,
-                                              Stride0Eq1><<<grid, block, 0, stream>>>(p_output,
+                                              Stride0Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output,
                                                                                       p_freqs,
                                                                                       size_h,
                                                                                       size_d,
@@ -2709,13 +2712,13 @@ void dispatch_1c_sbhd_uncached(scalar_t* __restrict__ p_output,
         LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(RotateStyle,
                                                stride_o_d,
                                                stride_i_d,
-                                               kn_entry_1c_sbhd_uncached<Op,
+                                               aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_1c_sbhd_uncached<Op,
                                                                          RotateStyle,
                                                                          ReuseFreqsFrontPart,
                                                                          NopeFirst,
                                                                          Stride0Eq1,
-                                                                         Stride1Eq1>
-                                               <<<grid, block, 0, stream>>>(p_output,
+                                                                         Stride1Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output,
                                                                             p_input,
                                                                             p_freqs,
                                                                             size_h,
@@ -2786,13 +2789,13 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
             RotateStyle,
             stride_ix_d,
             stride_iy_d,
-            kn_entry_2c_sbhd_uncached_inplace<Op,
+            aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_2c_sbhd_uncached_inplace<Op,
                                               RotateStyle,
                                               ReuseFreqsFrontPart,
                                               NopeFirst,
                                               Stride0Eq1,
-                                              Stride1Eq1>
-            <<<grid, block, 0, stream>>>(p_output_x,
+                                              Stride1Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output_x,
                                          p_output_y,
                                          p_freqs,
                                          size_h_x,
@@ -2815,15 +2818,15 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
                                                stride_oy_d,
                                                stride_ix_d,
                                                stride_iy_d,
-                                               kn_entry_2c_sbhd_uncached<Op,
+                                               aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_2c_sbhd_uncached<Op,
                                                                          RotateStyle,
                                                                          ReuseFreqsFrontPart,
                                                                          NopeFirst,
                                                                          Stride0Eq1,
                                                                          Stride1Eq1,
                                                                          Stride2Eq1,
-                                                                         Stride3Eq1>
-                                               <<<grid, block, 0, stream>>>(p_output_x,
+                                                                         Stride3Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output_x,
                                                                             p_output_y,
                                                                             p_input_x,
                                                                             p_input_y,
@@ -2889,12 +2892,12 @@ void dispatch_1c_sbhd_cached(scalar_t* __restrict__ p_output,
 
         LAUNCH_KERNEL_STRIDE_EQUAL_1_1_STRIDES(RotateStyle,
                                                stride_i_d,
-                                               kn_entry_1c_sbhd_cached_inplace<Op,
+                                               aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_1c_sbhd_cached_inplace<Op,
                                                                                RotateStyle,
                                                                                ReuseFreqsFrontPart,
                                                                                NopeFirst,
-                                                                               Stride0Eq1>
-                                               <<<grid, block, 0, stream>>>(p_output,
+                                                                               Stride0Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output,
                                                                             p_cos,
                                                                             p_sin,
                                                                             size_h,
@@ -2910,13 +2913,13 @@ void dispatch_1c_sbhd_cached(scalar_t* __restrict__ p_output,
         LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(RotateStyle,
                                                stride_o_d,
                                                stride_i_d,
-                                               kn_entry_1c_sbhd_cached<Op,
+                                               aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_1c_sbhd_cached<Op,
                                                                        RotateStyle,
                                                                        ReuseFreqsFrontPart,
                                                                        NopeFirst,
                                                                        Stride0Eq1,
-                                                                       Stride1Eq1>
-                                               <<<grid, block, 0, stream>>>(p_output,
+                                                                       Stride1Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output,
                                                                             p_input,
                                                                             p_cos,
                                                                             p_sin,
@@ -2988,13 +2991,13 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
         LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(RotateStyle,
                                                stride_ix_d,
                                                stride_iy_d,
-                                               kn_entry_2c_sbhd_cached_inplace<Op,
+                                               aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_2c_sbhd_cached_inplace<Op,
                                                                                RotateStyle,
                                                                                ReuseFreqsFrontPart,
                                                                                NopeFirst,
                                                                                Stride0Eq1,
-                                                                               Stride1Eq1>
-                                               <<<grid, block, 0, stream>>>(p_output_x,
+                                                                               Stride1Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output_x,
                                                                             p_output_y,
                                                                             p_cos,
                                                                             p_sin,
@@ -3018,15 +3021,15 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
                                                stride_oy_d,
                                                stride_ix_d,
                                                stride_iy_d,
-                                               kn_entry_2c_sbhd_cached<Op,
+                                               aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_2c_sbhd_cached<Op,
                                                                        RotateStyle,
                                                                        ReuseFreqsFrontPart,
                                                                        NopeFirst,
                                                                        Stride0Eq1,
                                                                        Stride1Eq1,
                                                                        Stride2Eq1,
-                                                                       Stride3Eq1>
-                                               <<<grid, block, 0, stream>>>(p_output_x,
+                                                                       Stride3Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output_x,
                                                                             p_output_y,
                                                                             p_input_x,
                                                                             p_input_y,
@@ -3096,12 +3099,12 @@ void dispatch_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
         LAUNCH_KERNEL_STRIDE_EQUAL_1_1_STRIDES(
             RotateStyle,
             stride_i_d,
-            kn_entry_1c_sbhd_cached_indirect_inplace<Op,
+            aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_1c_sbhd_cached_indirect_inplace<Op,
                                                      RotateStyle,
                                                      ReuseFreqsFrontPart,
                                                      NopeFirst,
-                                                     Stride0Eq1>
-            <<<grid, block, 0, stream>>>(p_output,
+                                                     Stride0Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output,
                                          p_cos,
                                          p_sin,
                                          p_indirect_buffer,
@@ -3119,13 +3122,13 @@ void dispatch_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
         LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(RotateStyle,
                                                stride_o_d,
                                                stride_i_d,
-                                               kn_entry_1c_sbhd_cached_indirect<Op,
+                                               aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_1c_sbhd_cached_indirect<Op,
                                                                                 RotateStyle,
                                                                                 ReuseFreqsFrontPart,
                                                                                 NopeFirst,
                                                                                 Stride0Eq1,
-                                                                                Stride1Eq1>
-                                               <<<grid, block, 0, stream>>>(p_output,
+                                                                                Stride1Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output,
                                                                             p_input,
                                                                             p_cos,
                                                                             p_sin,
@@ -3202,13 +3205,13 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
             RotateStyle,
             stride_ix_d,
             stride_iy_d,
-            kn_entry_2c_sbhd_cached_indirect_inplace<Op,
+            aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_2c_sbhd_cached_indirect_inplace<Op,
                                                      RotateStyle,
                                                      ReuseFreqsFrontPart,
                                                      NopeFirst,
                                                      Stride0Eq1,
-                                                     Stride1Eq1>
-            <<<grid, block, 0, stream>>>(p_output_x,
+                                                     Stride1Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output_x,
                                          p_output_y,
                                          p_cos,
                                          p_sin,
@@ -3234,15 +3237,15 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                stride_oy_d,
                                                stride_ix_d,
                                                stride_iy_d,
-                                               kn_entry_2c_sbhd_cached_indirect<Op,
+                                               aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_2c_sbhd_cached_indirect<Op,
                                                                                 RotateStyle,
                                                                                 ReuseFreqsFrontPart,
                                                                                 NopeFirst,
                                                                                 Stride0Eq1,
                                                                                 Stride1Eq1,
                                                                                 Stride2Eq1,
-                                                                                Stride3Eq1>
-                                               <<<grid, block, 0, stream>>>(p_output_x,
+                                                                                Stride3Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output_x,
                                                                             p_output_y,
                                                                             p_input_x,
                                                                             p_input_y,
@@ -3315,12 +3318,12 @@ void dispatch_1c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output,
         LAUNCH_KERNEL_STRIDE_EQUAL_1_1_STRIDES(
             RotateStyle,
             stride_i_d,
-            kn_entry_1c_sbhd_cached_indirect2_inplace<Op,
+            aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_1c_sbhd_cached_indirect2_inplace<Op,
                                                       RotateStyle,
                                                       ReuseFreqsFrontPart,
                                                       NopeFirst,
-                                                      Stride0Eq1>
-            <<<grid, block, 0, stream>>>(p_output,
+                                                      Stride0Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output,
                                          p_cos,
                                          p_sin,
                                          p_indirect_buffer_0,
@@ -3340,13 +3343,13 @@ void dispatch_1c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output,
             RotateStyle,
             stride_o_d,
             stride_i_d,
-            kn_entry_1c_sbhd_cached_indirect2<Op,
+            aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_1c_sbhd_cached_indirect2<Op,
                                               RotateStyle,
                                               ReuseFreqsFrontPart,
                                               NopeFirst,
                                               Stride0Eq1,
-                                              Stride1Eq1>
-            <<<grid, block, 0, stream>>>(p_output,
+                                              Stride1Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output,
                                          p_input,
                                          p_cos,
                                          p_sin,
@@ -3425,13 +3428,13 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
             RotateStyle,
             stride_ix_d,
             stride_iy_d,
-            kn_entry_2c_sbhd_cached_indirect2_inplace<Op,
+            aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_2c_sbhd_cached_indirect2_inplace<Op,
                                                       RotateStyle,
                                                       ReuseFreqsFrontPart,
                                                       NopeFirst,
                                                       Stride0Eq1,
-                                                      Stride1Eq1>
-            <<<grid, block, 0, stream>>>(p_output_x,
+                                                      Stride1Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output_x,
                                          p_output_y,
                                          p_cos,
                                          p_sin,
@@ -3459,15 +3462,15 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
             stride_oy_d,
             stride_ix_d,
             stride_iy_d,
-            kn_entry_2c_sbhd_cached_indirect2<Op,
+            aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_2c_sbhd_cached_indirect2<Op,
                                               RotateStyle,
                                               ReuseFreqsFrontPart,
                                               NopeFirst,
                                               Stride0Eq1,
                                               Stride1Eq1,
                                               Stride2Eq1,
-                                              Stride3Eq1>
-            <<<grid, block, 0, stream>>>(p_output_x,
+                                              Stride3Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output_x,
                                          p_output_y,
                                          p_input_x,
                                          p_input_y,
@@ -3534,12 +3537,12 @@ void dispatch_1c_thd_uncached(scalar_t* __restrict__ p_output,
 
         LAUNCH_KERNEL_STRIDE_EQUAL_1_1_STRIDES(RotateStyle,
                                                stride_i_d,
-                                               kn_entry_1c_thd_uncached_inplace<Op,
+                                               aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_1c_thd_uncached_inplace<Op,
                                                                                 RotateStyle,
                                                                                 ReuseFreqsFrontPart,
                                                                                 NopeFirst,
-                                                                                Stride0Eq1>
-                                               <<<grid, block, 0, stream>>>(p_output,
+                                                                                Stride0Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output,
                                                                             p_cu_seqlens,
                                                                             p_freqs,
                                                                             size_h,
@@ -3554,13 +3557,13 @@ void dispatch_1c_thd_uncached(scalar_t* __restrict__ p_output,
         LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(RotateStyle,
                                                stride_o_d,
                                                stride_i_d,
-                                               kn_entry_1c_thd_uncached<Op,
+                                               aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_1c_thd_uncached<Op,
                                                                         RotateStyle,
                                                                         ReuseFreqsFrontPart,
                                                                         NopeFirst,
                                                                         Stride0Eq1,
-                                                                        Stride1Eq1>
-                                               <<<grid, block, 0, stream>>>(p_output,
+                                                                        Stride1Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output,
                                                                             p_input,
                                                                             p_cu_seqlens,
                                                                             p_freqs,
@@ -3616,12 +3619,12 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
 
         LAUNCH_KERNEL_STRIDE_EQUAL_1_1_STRIDES(RotateStyle,
                                                stride_i_d,
-                                               kn_entry_1c_2d_cached_inplace<Op,
+                                               aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_1c_2d_cached_inplace<Op,
                                                                              RotateStyle,
                                                                              ReuseFreqsFrontPart,
                                                                              NopeFirst,
-                                                                             Stride0Eq1>
-                                               <<<grid, block, 0, stream>>>(p_output,
+                                                                             Stride0Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output,
                                                                             p_cos_h,
                                                                             p_sin_h,
                                                                             p_cos_w,
@@ -3639,13 +3642,13 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
         LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(RotateStyle,
                                                stride_o_d,
                                                stride_i_d,
-                                               kn_entry_1c_2d_cached<Op,
+                                               aiter::launch_kernel(aiter::launch_policy::rope,
+                kn_entry_1c_2d_cached<Op,
                                                                      RotateStyle,
                                                                      ReuseFreqsFrontPart,
                                                                      NopeFirst,
                                                                      Stride0Eq1,
-                                                                     Stride1Eq1>
-                                               <<<grid, block, 0, stream>>>(p_output,
+                                                                     Stride1Eq1, scalar_t, scalar_f_t>, grid, block, 0, stream, p_output,
                                                                             p_input,
                                                                             p_cos_h,
                                                                             p_sin_h,
