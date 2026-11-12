@@ -499,7 +499,9 @@ fla_prefetch_k_to_lds(Element *k_lds_base, const Element *k_gmem_src,
                 ir * kLanesInRow * kNWarps;
             offset_v = load_row < valid_t ? offset_v : -1;
         }
-#if defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx946__)
+        fla_buffer_load_dwordx4_to_lds_inline(buffer_rsrc, target_addr, offset_v);
+#elif defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
         if constexpr (CheckBounds || !FLA_BV16_INLINE_K_LDS) {
             auto *lds_addr =
                 reinterpret_cast<__attribute__((address_space(3))) int *>(

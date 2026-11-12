@@ -3,6 +3,7 @@
 
 #include "chunk_fwd_o_kernel.h"
 #include "static_switch.h"
+#include "hip_kernel_launch.h"
 
 namespace FLA_NAMESPACE {
 
@@ -20,7 +21,7 @@ void launch_chunk_fwd_o_grid(ChunkFwdOParams &params, const dim3 grid,
     BOOL_SWITCH(params.use_g, UseG, [&] {
     BOOL_SWITCH(params.use_g_gamma, UseGGamma, [&] {
     BOOL_SWITCH(params.use_exp2, UseExp2, [&] {
-        hipLaunchKernelGGL(
+        aiter::launch_kernel(aiter::launch_policy::fla,
             (chunk_fwd_o_demo_kernel<Element, UseG, UseGGamma, UseExp2,
                                      IsVarlen, UseChunkIndices,
                                      SingleSeqVarlen, UseSafeExp, FullChunk>),

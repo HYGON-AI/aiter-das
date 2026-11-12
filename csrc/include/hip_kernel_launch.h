@@ -67,6 +67,9 @@ inline constexpr LaunchPolicy sampling{
 inline constexpr LaunchPolicy rope{
     "AITER_ROPE_DIE_MODE", "AITER_ROPE_DIE_CHUNK", "AITER_ROPE_DIE_MASK",
     "AITER_ROPE_LOG_LAUNCH", "RoPE", "rope", true};
+inline constexpr LaunchPolicy fla{
+    "AITER_FLA_DIE_MODE", "AITER_FLA_DIE_CHUNK", "AITER_FLA_DIE_MASK",
+    "AITER_FLA_LOG_LAUNCH", "FLA", "FLA", true};
 inline constexpr LaunchPolicy kv_cache{
     "AITER_KV_CACHE_DIE_MODE", "AITER_KV_CACHE_DIE_CHUNK", "AITER_KV_CACHE_DIE_MASK",
     "AITER_KV_CACHE_LOG_LAUNCH", "KV cache", "kv_cache", false};

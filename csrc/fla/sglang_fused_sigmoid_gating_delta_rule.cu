@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "fla.h"
+#include "hip_kernel_launch.h"
 
 #ifndef AITER_HIP_KERNEL_LAUNCH_CHECK
 #if defined(C10_CUDA_KERNEL_LAUNCH_CHECK)
@@ -859,11 +860,12 @@ void launch_leaf(const GdnParams<scalar_t>& p, int N, hipStream_t stream)
                 using AType = typename decltype(a_tag)::type;
                 dispatch_gate_dtype(p.b_dtype, [&](auto b_tag) {
                     using BType = typename decltype(b_tag)::type;
-                    sglang_fused_sigmoid_gating_delta_rule_update_kernel<
+                    aiter::launch_kernel(aiter::launch_policy::fla,
+                      sglang_fused_sigmoid_gating_delta_rule_update_kernel<
                         scalar_t, NumChunk, LPR, VRows, kBlockThreads, FullVec, IsKda,
                         HasCache, CacheReplaySSM, UseLowerBound, Fp32StateCache,
                         ReplaySameDtype, AType, BType>
-                        <<<grid, dim3(kBlockThreads), 0, stream>>>(p);
+                        , grid, dim3(kBlockThreads), 0, stream, p);
                 });
             });
         };

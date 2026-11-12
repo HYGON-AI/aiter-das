@@ -5,6 +5,7 @@
 #include "static_switch.h"
 #include "kernel_traits.h"
 #include "fla_fwd_kernel.h"
+#include "hip_kernel_launch.h"
 
 namespace FLA_NAMESPACE {
 
@@ -55,7 +56,7 @@ void run_chunk_gated_delta_rule_fwd_impl(Delta_rule_params &params, hipStream_t 
     dim3 grid(grid_x, grid_y, 1);
     dim3 block(kThreads, 1, 1);
 
-    hipLaunchKernelGGL(
+    aiter::launch_kernel(aiter::launch_policy::fla,
         (chunk_gated_delta_rule_fwd_kernel<Kernel_traits, Delta_rule_params>),
         grid, block, smem_size, stream, params);
 }

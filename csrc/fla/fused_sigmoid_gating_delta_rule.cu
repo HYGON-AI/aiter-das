@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "fla.h"
+#include "hip_kernel_launch.h"
 
 #ifndef AITER_HIP_KERNEL_LAUNCH_CHECK
 #if defined(C10_CUDA_KERNEL_LAUNCH_CHECK)
@@ -434,9 +435,10 @@ void launch_final(const FsgParams<scalar_t>& p, int N, hipStream_t stream)
     const dim3 grid(static_cast<unsigned>(N),
                     static_cast<unsigned>(p.HV),
                     static_cast<unsigned>((p.V + RowsPerBlock - 1) / RowsPerBlock));
-    vllm_fused_sigmoid_gating_delta_rule_update_kernel<
-        scalar_t, NumChunk, GroupSize, kBlockThreads, kVRows, UseNorm, IsKda>
-        <<<grid, dim3(kBlockThreads), 0, stream>>>(p);
+    aiter::launch_kernel(aiter::launch_policy::fla,
+        vllm_fused_sigmoid_gating_delta_rule_update_kernel<
+            scalar_t, NumChunk, GroupSize, kBlockThreads, kVRows, UseNorm, IsKda>,
+        grid, dim3(kBlockThreads), 0, stream, p);
 }
 
 template <typename scalar_t, int NumChunk, int GroupSize>
