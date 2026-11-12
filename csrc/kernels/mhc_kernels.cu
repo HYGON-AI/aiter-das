@@ -171,6 +171,24 @@ static_assert(opus::get_warp_size() == 64, "HCU expects wave64");
 #endif
 
 namespace aiter {
+    //! ====================================================================
+    //! hcu_mmac_k8_available —— K=8 MMAC 的运行时能力判定（主机侧）
+    //! --------------------------------------------------------------------
+    //! 架构名单与编译期门控 AITER_HCU_HAS_MMAC_K8 保持一致：只有 gfx928 /
+    //! gfx936 / gfx938 上 K=8 builtin 真实存在。其余目标（含 gfx946）即便
+    //! 申请 K=8 实例，编译期也只会展开成两条 K=4，宿主侧却多付一次判据与
+    //! 打包，且指令结构与直接申请 K=4 并不相同（gfx946 legacy tile_k=128
+    //! 实测：K=8 实例 80 条 v_mmac_16x16x4_f32，K=4 实例 128 条）。
+    //!
+    //! 第一阶段两个主机入口的 K=8 自动选择统一走这里，取代原先两处各写一套
+    //! 的判据（m128 用 "不等于 gfx936"、legacy 只看 m_blocks 与 hc_hidden_size）。
+    //! 环境变量 AITER_MHC_PRE_GEMM_MMAC_K 的显式覆盖优先级仍高于本函数。
+    //! ====================================================================
+    static inline bool hcu_mmac_k8_available(const std::string& arch)
+    {
+        return arch == "gfx928" || arch == "gfx936" || arch == "gfx938";
+    }
+
     void mhc_pre_gemm_sqrsum_stage1_m128(
         torch::Tensor& out,
         torch::Tensor& sqrsum,
@@ -1035,10 +1053,15 @@ namespace aiter {
         //
         // 启发式: m_blocks >= 4 OR (m_blocks >= 2 且 hc_hidden_size >= 16384) → K=8;
         //         否则 → K=4。
-        // 优先级: env var > 启发式 (用户可显式覆盖)。
+        // 架构门控: 上述形状启发式只在 hcu_mmac_k8_available() 为真的目标上生效,
+        //         否则一律 K=4（gfx946 属此类：K=8 builtin 不存在，申请 K=8 只会
+        //         被编译期降级成另一套展开结构）。
+        // 优先级: env var > 架构门控 > 形状启发式 (用户可显式覆盖)。
         // ============================================================
-        bool use_k8_auto = (m_blocks >= 4) ||
-                           (m_blocks >= 2 && hc_hidden_size >= 16384);
+        const std::string gfx_arch = get_gpu_arch();
+        bool use_k8_auto = hcu_mmac_k8_available(gfx_arch) &&
+                           ((m_blocks >= 4) ||
+                            (m_blocks >= 2 && hc_hidden_size >= 16384));
         bool use_k8_runtime = use_k8_auto;
         if (const char* env_k = std::getenv("AITER_MHC_PRE_GEMM_MMAC_K")) {
             if (std::strcmp(env_k, "4") == 0) {
@@ -1121,7 +1144,12 @@ namespace aiter {
         dim3 block(block_size);
         dim3 grid(m_blocks, n_blocks, split_k);
 
-        bool use_k8_auto = get_gpu_arch() != "gfx936";
+        //! K=8 自动选择：只有 hcu_mmac_k8_available() 为真的目标才申请 K=8 实例。
+        //! 原判据 "get_gpu_arch() != gfx936" 把「未知架构」当成「K=8 可用」，
+        //! gfx946 / gfx92a / gfx942 都会申请一个编译期必然降级的实例。
+        //! gfx936 依旧排除：其 K=8 builtin 存在但本 kernel 上收益为负。
+        const std::string gfx_arch = get_gpu_arch();
+        bool use_k8_auto = hcu_mmac_k8_available(gfx_arch) && gfx_arch != "gfx936";
         bool use_k8_runtime = use_k8_auto;
         if (const char* env_k = std::getenv("AITER_MHC_PRE_GEMM_MMAC_K")) {
             if (std::strcmp(env_k, "4") == 0) {
