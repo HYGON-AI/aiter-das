@@ -1,84 +1,95 @@
-# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+"""prefill/decode 索引 TopK 验证，K=2048；包含 indices-only 和 values 路径。
+
+使用前：在指定容器中按同目录 README.md 配置 Torch/HIP、PMD 库路径和 clang18。
+从仓库根目录设置测试脚本绝对路径，再在各自独立的结果目录执行下面的命令，
+避免不同进程覆盖 m5out；GPU_CHIP 必须在 Python 启动前设置。
+  test_py="$PWD/op_tests/gfx946_tests/moe_topk/test_topk_per_row.py"
+
+首次运行或算子源码变更后，先重编译并加载对应模块（不发射 TopK kernel）：
+  GPU_CHIP=sb python "$test_py" --suite build --rebuild --json build.json
+单 die（1 XCD），运行全部数值用例和启动配置检查：
+  GPU_CHIP=sb python "$test_py" --suite all --expect-xcds 1 --json single.json
+多 die（一张 GPU、2 XCD），复用上一步构建的模块：
+  GPU_CHIP=sbx2 python "$test_py" --suite all --expect-xcds 2 --json dual.json
+显式多 die 分发，使用多个 workgroup 检查 chunk=2：
+  GPU_CHIP=sbx2 python "$test_py" --suite route --expect-xcds 2 --die-mode linear --chunk 2 --json linear2.json
+
+默认 quick 只跑少量用例；full 只做数值，all 额外做配置拒绝检查。
+all 共7个数值用例。加 --ops prefill 或 --ops decode 可只测一个接口。
+--list 列出用例且不初始化 GPU；--case prefill_indices 可只运行一个用例。
+每例仅调用一次算子，无预热/计时；JSON 保存逐例结果、拓扑及源码/模块哈希。
+--expect-xcds 核验实际拓扑；数值 PASS 之外还须用 completedWGs 确认跨 XCD 执行。
+--die-mode off 仅表示普通启动 API，不等同单 die；本测试不验收 Graph 或性能。
 """
-Minimal perf model (gfx946) correctness check for topk_per_row (k=2048),
-derived from op_tests/test_topk_per_row.py.
+import _index_topk_common as common
 
-Each mode runs exactly once on two rows: prefill mixes a short row (identity
-indices + -1 padding) with a row just over K; decode uses next_n=2 so the two
-rows have different valid lengths. References and checks run on CPU.
-
-Run: GPU_CHIP=sb python op_tests/gfx946_tests/test_topk_per_row.py
-"""
-import torch
-import aiter
-from aiter.ops.topk_per_row import TOPK, topk_per_row_decode, topk_per_row_prefill
-
-SEQ_LEN = TOPK + 64
-
-
-def check_row(logits_row, got, length, row):
-    """got must select exactly the top-min(length, K) scores of logits_row[:length]."""
-    got = got.long()
-    valid = min(length, TOPK)
-    selected = got[got >= 0]
-    assert int((got == -1).sum()) == TOPK - valid, f"row={row}: padding mismatch"
-    assert selected.numel() == valid, f"row={row}: expected {valid} indices, got {selected.numel()}"
-    assert selected.unique().numel() == valid, f"row={row}: duplicate indices"
-    assert int(selected.min()) >= 0 and int(selected.max()) < length, f"row={row}: index out of range"
-    if length <= TOPK:
-        assert torch.equal(got[:length], torch.arange(length)), f"row={row}: short row not identity"
-        return
-    expected = logits_row[:length].topk(TOPK).values
-    actual = logits_row[selected].sort(descending=True).values
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+PREFIX = "AITER_TOPK_PER_ROW"
+TOPK = 2048
+CASES = [
+    dict(name="prefill_indices", op="prefill", rows=5, cols=2128, quick=True, route=True, config=True),
+    dict(name="prefill_values", op="prefill", rows=5, cols=2128, values=True, route=True),
+    dict(name="prefill_bins4096", op="prefill", rows=2, cols=8192),
+    dict(name="decode_n1", op="decode", rows=5, cols=2112, next_n=1, route=True, config=True),
+    dict(name="decode_n2", op="decode", rows=4, cols=2112, next_n=2, quick=True),
+    dict(name="decode_n4", op="decode", rows=4, cols=2112, next_n=4),
+    dict(name="decode_n3", op="decode", rows=3, cols=2112, next_n=3),
+]
+for _case in CASES:
+    _case["prefix"] = PREFIX
 
 
-@torch.inference_mode()
-def test_prefill():
-    lengths = [48, SEQ_LEN] * 48
-    logits = torch.randn(len(lengths), SEQ_LEN, generator=torch.Generator().manual_seed(0))
-    row_starts = torch.zeros(len(lengths), dtype=torch.int32)
-    row_ends = torch.tensor(lengths, dtype=torch.int32)
+def prepare(case):
+    torch = common.torch
+    from aiter.ops.topk_per_row import top_k_per_row_prefill, top_k_per_row_decode
+    rows, cols = case["rows"], case["cols"]
+    cpu = common.scores(rows, cols)
+    x = cpu.cuda()
+    ids, collect_ids = common.guarded((rows, TOPK), torch.int32)
+    values, collect_values = common.guarded((rows, TOPK), torch.float32)
+    starts = torch.zeros(rows, dtype=torch.int32)
+    if case["op"] == "prefill":
+        starts = torch.tensor([i % 4 for i in range(rows)], dtype=torch.int32)
+        lengths = torch.tensor(([0, 31, TOPK, TOPK + 61, TOPK + 7] if rows == 5
+                                else [cols - 8] * rows), dtype=torch.int32)
+        ends = starts + lengths
+        dstarts, dends = starts.cuda(), ends.cuda()
 
-    got, values = topk_per_row_prefill(
-        logits.cuda(), row_starts.cuda(), row_ends.cuda(), return_values=True
-    )
-    got, values = got.cpu(), values.cpu()
-    assert got.shape == (len(lengths), TOPK)
-    for i, length in enumerate(lengths):
-        check_row(logits[i], got[i], length, i)
-        valid = min(length, TOPK)
-        gathered = logits[i].gather(0, got[i, :valid].long())
-        torch.testing.assert_close(values[i, :valid], gathered, rtol=1e-5, atol=1e-5)
+        def call():
+            top_k_per_row_prefill(x, dstarts, dends, ids, rows, x.stride(0), x.stride(1),
+                                 values if case.get("values") else None)
+    else:
+        next_n = case["next_n"]
+        seq = torch.full((rows // next_n,), cols, dtype=torch.int32)
+        if seq.numel() > 1:
+            seq[0] = next_n + 15
+        lengths = seq.repeat_interleave(next_n) - next_n + torch.arange(rows) % next_n + 1
+        dseq = seq.cuda()
+
+        def call():
+            top_k_per_row_decode(x, next_n, dseq, ids, rows, x.stride(0), x.stride(1))
+
+    def check():
+        got = collect_ids()
+        vals = collect_values()
+        for row in range(rows):
+            start, length = int(starts[row]), int(lengths[row])
+            common.check_selected(cpu[row, start:start + length], got[row], TOPK,
+                                  values=vals[row] if case.get("values") else None,
+                                  identity_short=True)
+            if case.get("values") and length < TOPK:
+                assert (vals[row, length:] == 0).all(), "value padding mismatch"
+        if not case.get("values"):
+            assert (vals == -777).all(), "unused values buffer changed"
+        assert torch.equal(x.cpu(), cpu)
+        return dict(output_sha256=common.digest(got.sort(-1).values),
+                    values_sha256=common.digest(vals) if case.get("values") else None)
+
+    return call, check, dict(input_sha256=common.digest(cpu))
 
 
-@torch.inference_mode()
-def test_decode(batch=48, next_n=2):
-    num_rows = batch * next_n
-    logits = torch.randn(num_rows, SEQ_LEN, generator=torch.Generator().manual_seed(2))
-    seq_lens = torch.full((batch,), SEQ_LEN, dtype=torch.int32)
-
-    got = topk_per_row_decode(logits.cuda(), next_n, seq_lens.cuda()).cpu()
-    assert got.shape == (num_rows, TOPK)
-    for i in range(num_rows):
-        row_end = SEQ_LEN - next_n + (i % next_n) + 1
-        check_row(logits[i], got[i], row_end, i)
-
-
-TESTS = {
-    "topk_per_row[prefill, return_values]": test_prefill,
-    "topk_per_row[decode, next_n=2]": test_decode,
-}
-
-failures = []
-for name, fn in TESTS.items():
-    try:
-        fn()
-        aiter.logger.info(f"{name} passed~")
-    except AssertionError as e:
-        aiter.logger.error(f"{name} failed!\n{e}")
-        failures.append(name)
-
-if failures:
-    raise AssertionError(f"topk_per_row correctness failures: {failures}")
+if __name__ == "__main__":
+    common.main("module_topk_per_row", CASES, prepare, [PREFIX],
+                ["csrc/kernels/topk_per_row.cu", "csrc/pybind/topk_per_row_pybind.cu",
+                 "aiter/ops/topk_per_row.py"], __file__)

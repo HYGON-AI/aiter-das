@@ -1,82 +1,93 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Single-launch correctness check for kpool_topk.
+"""kpool_topk 的小规模 CPU 参考验证：优化/回退、页表、offset、尾 token 和补行。
 
-Inputs and the reference are built on CPU;
-kpool_topk itself runs on the device.
+使用前：在指定容器中按同目录 README.md 配置 Torch/HIP、PMD 库路径和 clang18。
+从仓库根目录设置测试脚本绝对路径，再在各自独立的结果目录执行下面的命令，
+避免不同进程覆盖 m5out；GPU_CHIP 必须在 Python 启动前设置。
+  test_py="$PWD/op_tests/gfx946_tests/moe_topk/test_kpool_topk.py"
 
-Run: GPU_CHIP=sb python op_tests/test_kpool_topk.py
+首次运行或算子源码变更后，先重编译并加载对应模块（不发射 TopK kernel）：
+  GPU_CHIP=sb python "$test_py" --suite build --rebuild --json build.json
+单 die（1 XCD），运行全部数值用例和启动配置检查：
+  GPU_CHIP=sb python "$test_py" --suite all --expect-xcds 1 --json single.json
+多 die（一张 GPU、2 XCD），复用上一步构建的模块：
+  GPU_CHIP=sbx2 python "$test_py" --suite all --expect-xcds 2 --json dual.json
+显式多 die 分发，使用多个 workgroup 检查 chunk=2：
+  GPU_CHIP=sbx2 python "$test_py" --suite route --expect-xcds 2 --die-mode linear --chunk 2 --json linear2.json
+
+默认 quick 只跑少量用例；full 只做数值，all 额外做配置拒绝检查。
+all 共6个数值用例；route 覆盖 pool16、pool4 和通用回退。
+--list 列出用例且不初始化 GPU；--case pool16 可只运行一个用例。
+每例仅调用一次算子，无预热/计时；JSON 保存逐例结果、拓扑及源码/模块哈希。
+--expect-xcds 核验实际拓扑；数值 PASS 之外还须用 completedWGs 确认跨 XCD 执行。
+--die-mode off 仅表示普通启动 API，不等同单 die；本测试不验收 Graph 或性能。
 """
-import torch
+import os
+import _index_topk_common as common
 
-from aiter import kpool_topk
-
-POOL_SIZE = 16
-GROUP_TOPK = 128
-TOPK = POOL_SIZE * GROUP_TOPK
-ROWS = 96  # 96 blocks -> one per CU on a 96-CU target
-NUM_GROUPS = 3000  # > GROUP_TOPK: every row performs a real top-k
-TAIL = 3  # token ids appended from seq_lens % POOL_SIZE
-OUT_COLS = TOPK + POOL_SIZE - 1
-
-
-def reference(score: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
-    """CPU reference: top-k groups -> their pool tokens -> tail tokens, + offset."""
-    out = torch.full((ROWS, OUT_COLS), -1, dtype=torch.int32)
-    token_offsets = torch.arange(POOL_SIZE, dtype=torch.int32)
-    for row in range(ROWS):
-        groups = score[row].topk(GROUP_TOPK).indices.to(torch.int32)
-        raw = (groups[:, None] * POOL_SIZE + token_offsets).reshape(-1)
-        raw = torch.cat(
-            [raw, NUM_GROUPS * POOL_SIZE + torch.arange(TAIL, dtype=torch.int32)]
-        )
-        out[row, : raw.numel()] = raw + offsets[row]
-    return out
+PREFIX = "SGL_KERNEL_KPOOL_TOPK"
+CASES = [
+    dict(name="pool16", op="kpool_topk", pool=16, group_k=128, rows=5, quick=True, route=True, config=True),
+    dict(name="pool4", op="kpool_topk", pool=4, group_k=512, rows=5, route=True),
+    dict(name="generic", op="kpool_topk", pool=8, group_k=64, rows=5, route=True),
+    dict(name="forced_fallback", op="kpool_topk", pool=16, group_k=128, rows=3, fallback=True),
+    dict(name="page_lookup", op="kpool_topk", pool=16, group_k=128, rows=3, page=True, mixed=True),
+    dict(name="sorted_offset", op="kpool_topk", pool=16, group_k=128, rows=3, sorted=True, mixed=True),
+]
+for _case in CASES:
+    _case["prefix"] = PREFIX
 
 
-@torch.inference_mode()
-def main() -> int:
-    torch.manual_seed(42)
+def prepare(case):
+    torch, aiter = common.torch, common.aiter
+    pool, k, rows = case["pool"], case["group_k"], case["rows"]
+    cols = k + 17
+    score = common.scores(rows, cols)
+    starts = torch.tensor([i % 4 for i in range(rows)], dtype=torch.int32)
+    lengths = torch.tensor([k + 7] * rows, dtype=torch.int32)
+    if case.get("mixed"):
+        lengths[:2] = torch.tensor([0, 7], dtype=torch.int32)
+    tails = torch.tensor([i % (pool - 1) + 1 for i in range(rows)], dtype=torch.int32)
+    seq_lens = lengths * pool + tails
+    offsets = torch.arange(rows, dtype=torch.int32) * 4096
+    out_rows = rows + (2 if case.get("mixed") else 0)
+    width = pool * k + pool - 1
+    page_rows = torch.arange(rows, dtype=torch.int32) % 2
+    table = torch.arange((cols + 1) * pool, dtype=torch.int32).repeat(2, 1) * 3
+    table[1] += 100000
+    expected = torch.full((out_rows, width), -1, dtype=torch.int32)
+    for row in range(rows):
+        start, length = int(starts[row]), int(lengths[row])
+        group_ids = score[row, start:start + length].topk(min(length, k)).indices
+        raw = (group_ids[:, None] * pool + torch.arange(pool)).flatten().int()
+        raw = torch.cat((raw, length * pool + torch.arange(int(tails[row]), dtype=torch.int32)))
+        mapped = table[page_rows[row], raw.long()] if case.get("page") else raw + offsets[row]
+        expected[row, :raw.numel()] = mapped
+    params = dict(row_starts=starts.cuda(), seq_lens=seq_lens.cuda(), out_rows=out_rows)
+    if case.get("page"):
+        params.update(page_table=table.cuda(), page_table_row_index=page_rows.cuda())
+    else:
+        params["topk_indices_offset"] = offsets.cuda()
+    x, lens = score.cuda(), lengths.cuda()
+    holder = {}
 
-    score = torch.randn(ROWS, NUM_GROUPS, dtype=torch.float32)
-    lengths = torch.full((ROWS,), NUM_GROUPS, dtype=torch.int32)
-    offsets = torch.arange(ROWS, dtype=torch.int32) * 1024
-    seq_lens = torch.full((ROWS,), NUM_GROUPS * POOL_SIZE + TAIL, dtype=torch.int32)
+    def call():
+        os.environ[PREFIX + "_FORCE_FALLBACK"] = "1" if case.get("fallback") else "0"
+        os.environ[PREFIX + "_SORT_WRITEBACK"] = "1" if case.get("sorted") else "0"
+        holder["out"] = aiter.kpool_topk(x, lens, pool, pool * k, **params)
 
-    out = kpool_topk(
-        score.cuda(),
-        lengths.cuda(),
-        POOL_SIZE,
-        TOPK,
-        topk_indices_offset=offsets.cuda(),
-        seq_lens=seq_lens.cuda(),
-    ).cpu()
+    def check():
+        got = holder["out"].cpu()
+        assert got.shape == expected.shape
+        assert torch.equal(got.sort(-1).values, expected.sort(-1).values), "pool token set differs from reference"
+        assert torch.equal(x.cpu(), score), "input changed"
+        return dict(output_sha256=common.digest(got.sort(-1).values), rows=out_rows)
 
-    props = torch.cuda.get_device_properties(0)
-    print(
-        f"device={props.name} cus={props.multi_processor_count} "
-        f"grid={ROWS} pool_size={POOL_SIZE} group_topk={GROUP_TOPK} "
-        f"topk={TOPK} groups_per_row={NUM_GROUPS} tail={TAIL}",
-        flush=True,
-    )
-
-    ref = reference(score, offsets)
-    if out.shape != ref.shape:
-        raise AssertionError(f"shape mismatch: out={tuple(out.shape)} ref={tuple(ref.shape)}")
-
-    # Token order inside a row is not part of the contract, so compare sorted rows.
-    out_sorted = out.sort(dim=-1).values
-    ref_sorted = ref.sort(dim=-1).values
-    if not torch.equal(out_sorted, ref_sorted):
-        row, col = (out_sorted != ref_sorted).nonzero()[0].tolist()
-        raise AssertionError(
-            f"mismatch at row={row} col={col}: "
-            f"out={out_sorted[row, col].item()} ref={ref_sorted[row, col].item()}"
-        )
-
-    print("PASS kpool_topk", flush=True)
-    return 0
+    return call, check, dict(input_sha256=common.digest(score))
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    common.main("module_kpool_topk", CASES, prepare, [PREFIX],
+                ["csrc/kernels/kpool_topk.cu", "csrc/kernels/kpool_topk_fallback.cu",
+                 "csrc/pybind/kpool_topk_pybind.cu", "aiter/ops/kpool_topk.py"], __file__)
