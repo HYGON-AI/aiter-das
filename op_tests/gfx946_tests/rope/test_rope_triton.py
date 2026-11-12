@@ -10,7 +10,9 @@
 原始 completedWGs；拓扑有两个 XCD 不等于 kernel 已在两个 XCD 上执行。
 """
 import argparse
+import ast
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -29,6 +31,22 @@ CASES = [dict(name=f"{'offsets' if offsets else 'positions'}_{kind}", offsets=of
           ("expanded", 0, False, False, False, 2, "float32"))]
 
 
+def buffer_ops_env_key(compiler):
+    """Read the existing switch name from the active compiler implementation."""
+    source = Path(inspect.getfile(compiler.make_ttgir)).read_text(encoding="utf-8")
+    keys = {
+        node.args[0].value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+        and node.args[0].value.endswith("_USE_BUFFER_OPS")
+    }
+    if len(keys) > 1:
+        raise RuntimeError("The active compiler exposes multiple buffer-operation switches")
+    return next(iter(keys), None)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--require-arch", default="gfx946")
@@ -43,8 +61,6 @@ def main():
         print(json.dumps(CASES, indent=2))
         return
     sys.path.insert(0, str(reference.ROOT))
-    if args.disable_buffer_ops:
-        os.environ["AMDGCN_USE_BUFFER_OPS"] = "0"
     result = dict(status="RUNNING", numerical=[])
 
     def save():
@@ -54,12 +70,19 @@ def main():
     try:
         import torch
         import triton
+        from triton.compiler.compiler import make_backend
         import aiter.ops.triton.rope as rope
         reference.torch = torch
         torch.set_num_threads(1)
         torch.cuda.init()
         arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
         assert arch == args.require_arch, arch
+        compiler = make_backend(triton.runtime.driver.active.get_current_target())
+        buffer_ops_key = buffer_ops_env_key(compiler)
+        if args.disable_buffer_ops:
+            if buffer_ops_key is None:
+                raise RuntimeError("The active compiler does not expose a buffer-operation switch")
+            os.environ[buffer_ops_key] = "0"
         agents = reference.topology() if arch == "gfx946" else []
         if args.expect_xcds is not None:
             assert len(agents) == 1 and agents[0]["xcd_status"] == 0 and agents[0]["xcds"] == args.expect_xcds, agents
@@ -68,7 +91,7 @@ def main():
         result.update(arch=arch, topology=agents, torch=torch.__version__, triton=triton.__version__,
                       triton_path=triton.__file__, source=str(source),
                       source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
-                      buffer_ops=os.environ.get("AMDGCN_USE_BUFFER_OPS", "1"),
+                      buffer_ops=os.environ.get(buffer_ops_key, "1") if buffer_ops_key else None,
                       compiler=os.environ.get("TRITON_HIP_CLANG_PATH", "default"),
                       gpu_chip=os.environ.pop("GPU_CHIP", None))
         print("ENV", json.dumps(result), flush=True)
