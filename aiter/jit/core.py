@@ -1268,6 +1268,7 @@ def compile_ops(
                     namespace = {
                         "List": List,
                         "Optional": Optional,
+                        "Tuple": typing.Tuple,
                         "torch": torch,
                         "typing": typing,
                     }
