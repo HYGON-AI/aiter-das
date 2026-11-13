@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
 set -euo pipefail
 
 # Share the target commit before environment setup, then hand off the NMZ wheel.

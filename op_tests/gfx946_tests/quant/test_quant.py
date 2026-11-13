@@ -6,7 +6,7 @@
 #
 # 在 bmz-perf_model 的 zxw_model_8585 容器中，先编译 gfx946 的
 # module_quant 和 module_cpp_api，并确认使用的是预期的 AITER 源码和缓存：
-#   cd /wksp/dcu-das/aiter
+#   cd /path/to/aiter  # 按实际源码根目录修改
 #   export GPU_ARCHS=gfx946 PMD_PATH=/opt/rocm/pmd
 #   export LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/pmd:${LD_LIBRARY_PATH:-}
 #   unset AITER_JIT_DIR PYTHONPATH AITER_REBUILD

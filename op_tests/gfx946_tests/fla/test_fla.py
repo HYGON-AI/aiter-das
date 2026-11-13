@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Small public-interface checks with CPU references (no timing loop).
 
 Usage from the repository root:

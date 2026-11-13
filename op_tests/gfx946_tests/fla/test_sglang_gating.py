@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Run with --suite full; see README.md for build, model and hardware setup.
 Example: python test_sglang_gating.py --expect-xcds 2 --json result.json
 """

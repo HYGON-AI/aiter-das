@@ -1679,7 +1679,16 @@ static inline __device__ int8_t float_to_int8_rn(float x) {
       static_cast<float>(std::numeric_limits<int8_t>::max());
   float dst = std::nearbyint(x);
   dst = fminf(fmaxf(dst, i8_min), i8_max);
+#if defined(__gfx946__)
+  // Keep conversion and masking full-width: the packed SDWA byte conversion
+  // produces incorrect odd lanes on the gfx946 performance model.
+  uint32_t bits;
+  asm volatile("v_cvt_i32_f32 %0, %1\n\tv_and_b32 %0, 255, %0"
+               : "=&v"(bits) : "v"(dst));
+  return static_cast<int8_t>(bits);
+#else
   return static_cast<int8_t>(dst);
+#endif
 #else
   uint32_t dst;
   asm volatile("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(dst) : "f"(x));
@@ -1726,9 +1735,16 @@ __device__ __forceinline__ T silu_kernel(const T& x) {
 }
 
 template <typename scalar_t, bool act_first>
-__device__ __forceinline__ scalar_t compute(const scalar_t& x,
+__device__ __forceinline__ auto compute(const scalar_t& x,
                                             const scalar_t& y) {
+#if defined(__gfx946__)
+  // Match the vector paths: round SiLU to the input dtype, then keep the
+  // product in FP32 before smoothing and the row maximum reduction.
+  return act_first ? static_cast<float>(silu_kernel(x)) * static_cast<float>(y)
+                   : static_cast<float>(x) * static_cast<float>(silu_kernel(y));
+#else
   return act_first ? silu_kernel(x) * y : x * silu_kernel(y);
+#endif
 }
 
 // The vectorized kernels stage the expert metadata in shared memory, so the

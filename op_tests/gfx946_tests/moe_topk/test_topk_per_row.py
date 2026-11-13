@@ -7,8 +7,10 @@
 避免不同进程覆盖 m5out；GPU_CHIP 必须在 Python 启动前设置。
   test_py="$PWD/op_tests/gfx946_tests/moe_topk/test_topk_per_row.py"
 
-首次运行或算子源码变更后，先重编译并加载对应模块（不发射 TopK kernel）：
-  GPU_CHIP=sb python "$test_py" --suite build --rebuild --json build.json
+已安装 wheel，或只复制本目录测试文件时，直接运行下面的数值命令；不要加 --rebuild。
+--package-mode installed 使用当前 Python 环境的 AITER，build 集合仅验证模块加载。
+在完整源码 checkout 中首次运行或源码变更后，重编译并加载对应模块：
+  GPU_CHIP=sb python "$test_py" --package-mode source --suite build --rebuild --json build.json
 单 die（1 XCD），运行全部数值用例和启动配置检查：
   GPU_CHIP=sb python "$test_py" --suite all --expect-xcds 1 --json single.json
 多 die（一张 GPU、2 XCD），复用上一步构建的模块：

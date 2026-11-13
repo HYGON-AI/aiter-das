@@ -48,7 +48,8 @@ FP16残差参考匹配当前CK实例：gfx938的偶数线程缓冲区使用packe
     只需重建一次，无需额外构建脚本。
 
 环境已配置时，在任意新建的结果目录中运行，例如：
-  TEST=/wksp/dcu-das/aiter/op_tests/gfx946_tests/rmsnorm/test_rmsnorm_dynamicquant.py
+  AITER_REPO=/path/to/aiter  # 按实际源码根目录修改
+  TEST="$AITER_REPO/op_tests/gfx946_tests/rmsnorm/test_rmsnorm_dynamicquant.py"
   GPU_CHIP=sb python "$TEST" --suite quick --expect-xcds 1 --json quick.json
   GPU_CHIP=sb python "$TEST" --suite full --expect-xcds 1 --resume quick.json --json full.json
   GPU_CHIP=sbx4 GPU_DFLAGS="['StatLog','TT0']" python "$TEST" --suite route --dtypes bf16 --expect-xcds 4 --json route.json

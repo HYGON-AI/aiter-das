@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Verify raw model dispatch accounting after numerical tests pass.
 
 python check_dispatch.py RUN_DIR --json-name result.json --require-dual

@@ -138,6 +138,8 @@ def main(module_name, cases, prepare, prefixes, sources, test_file):
     ap.add_argument("--ops", nargs="+")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--rebuild", action="store_true")
+    ap.add_argument("--package-mode", choices=("auto", "source", "installed"), default="auto",
+                    help="auto: use the script checkout when present, otherwise the installed package")
     ap.add_argument("--require-arch", default="gfx946")
     ap.add_argument("--expect-xcds", type=int)
     ap.add_argument("--die-mode", choices=("auto", "off", "linear"), default="auto")
@@ -147,6 +149,17 @@ def main(module_name, cases, prepare, prefixes, sources, test_file):
     if args.list:
         print(json.dumps(cases, indent=2))
         return
+    has_checkout = (ROOT / "aiter/__init__.py").is_file() and (ROOT / "csrc").is_dir()
+    package_mode = args.package_mode
+    if package_mode == "auto":
+        package_mode = "source" if has_checkout else "installed"
+    if package_mode == "source" and not has_checkout:
+        ap.error("source mode requires tests inside a complete AITER checkout; "
+                 "use --package-mode installed to validate a wheel")
+    if package_mode == "installed" and (args.rebuild or os.environ.get("AITER_REBUILD", "0") not in ("", "0")):
+        ap.error("installed mode validates existing modules and does not rebuild them; "
+                 "omit --rebuild and unset AITER_REBUILD, or run --package-mode source "
+                 "from tests inside a complete AITER checkout")
     selected = cases
     if args.case:
         assert set(args.case) <= {c["name"] for c in cases}, "unknown case"
@@ -164,19 +177,26 @@ def main(module_name, cases, prepare, prefixes, sources, test_file):
         os.environ[prefix + "_DIE_CHUNK"] = str(args.chunk)
         os.environ[prefix + "_DIE_MASK"] = "0"
         os.environ[prefix + "_LOG_LAUNCH"] = "1"
-    sys.path.insert(0, str(ROOT))
+    if package_mode == "source":
+        sys.path.insert(0, str(ROOT))
     global torch, aiter
     import torch
     import aiter
     from aiter.jit import core
     torch.set_num_threads(1)
-    assert Path(aiter.__file__).resolve().parent == ROOT / "aiter", aiter.__file__
+    package_root = Path(aiter.__file__).resolve().parent
+    if package_mode == "source":
+        assert package_root == ROOT / "aiter", aiter.__file__
     module = None
     if not args.rebuild:
         try:
             module = core.get_module(module_name)
         except ModuleNotFoundError:
-            pass
+            if package_mode == "installed":
+                raise RuntimeError(
+                    f"{module_name} could not be loaded from {package_root}; "
+                    "install a wheel containing this module, or rebuild from a complete "
+                    "AITER checkout with --package-mode source --rebuild") from None
     if module is None:
         build = core.get_args_of_build(module_name)
         build["md_name"] = module_name
@@ -187,13 +207,23 @@ def main(module_name, cases, prepare, prefixes, sources, test_file):
             core.rebuilded_list.append(module_name)
     so = Path(module.__file__).resolve()
     sources = sources + ["aiter/jit/core.py", "aiter/jit/optCompilerConfig.json",
-                         "csrc/include/hip_kernel_launch.h",
-                         str(Path(test_file).resolve().relative_to(ROOT)),
-                         str(Path(__file__).resolve().relative_to(ROOT))]
+                         "csrc/include/hip_kernel_launch.h"]
+    metadata_root = Path(core.AITER_META_DIR).resolve()
+    source_paths = {p: package_root / p[len("aiter/"):] if p.startswith("aiter/")
+                    else metadata_root / p for p in sources}
+    for path in (Path(test_file).resolve(), Path(__file__).resolve()):
+        source_paths[str(path.relative_to(ROOT))] = path
+    missing_sources = [p for p, path in source_paths.items() if not path.is_file()]
+    if package_mode == "source":
+        assert not missing_sources, f"missing source files: {missing_sources}"
     result = dict(module=str(so), module_sha256=hashlib.sha256(so.read_bytes()).hexdigest(),
                   aiter=aiter.__file__, torch=torch.__version__, hip=torch.version.hip,
+                  package_mode=package_mode, metadata_root=str(metadata_root),
                   args=vars(args) | {"json": str(args.json)},
-                  sources={p: hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in sources},
+                  sources={p: hashlib.sha256(path.read_bytes()).hexdigest()
+                           for p, path in source_paths.items() if path.is_file()},
+                  source_paths={p: str(path) for p, path in source_paths.items()},
+                  missing_sources=missing_sources,
                   results=[], configs=[], status="RUNNING")
 
     def save():

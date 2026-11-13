@@ -529,7 +529,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-DENABLE_FP8'"
+            "'-DENABLE_FP8'",
+            "module_vgpr_compiler_flag(module_name) if 'gfx946' in [a.strip() for a in get_gfx().split(';')] else None"
         ],
         "extra_ldflags": "None",
         "extra_include": [
