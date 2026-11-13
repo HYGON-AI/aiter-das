@@ -34,8 +34,8 @@ using fp32x16_t = __attribute__((__vector_size__(16 * sizeof(float)))) float;
 #endif
 
 // HCU QR preserves the upstream E4M3FNUZ wire format (max 240, bias 8).
-// gfx92a, gfx936 and gfx946 lack the AMD FP8 conversion instructions; use the
-// same software codec on gfx938 to keep identical rounding and scale semantics.
+// gfx92a, gfx936, gfx938 and gfx946 use the software codec below
+// to keep identical rounding and scale semantics.
 __quickreduce_device_inline__ uint8_t qr_fp8_fnuz_encode(float x)
 {
     if(isnan(x)) return 0x80;

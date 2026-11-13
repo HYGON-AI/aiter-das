@@ -31,12 +31,12 @@
 
 ## 编译与运行
 
-以下命令在 Linux 容器的 Bash 中执行。将 `AITER_REPO` 设置为已核对的容器内
-源码目录（本次适配验证使用 `/wksp/dcu-das/aiter`）。使用性能模型时，必须在启动
-Python 之前设置以下环境变量：
+以下命令在 Linux 容器的 Bash 中执行。先进入已核对的 AITER 源码根目录，
+再将当前目录保存到 `AITER_REPO`。使用性能模型时，必须在启动 Python 之前
+设置以下环境变量：
 
 ```bash
-export AITER_REPO=/wksp/dcu-das/aiter  # 按实际容器内路径修改
+export AITER_REPO="$(pwd -P)"  # 在 AITER 源码根目录执行
 export ROCM_PATH=/opt/rocm PMD_PATH=/opt/rocm/pmd GPU_ARCHS=gfx946
 export HIP_CLANG_PATH=/wksp/llvm-project/build-6.3.3/bin
 export PATH=/opt/rocm/bin:$HIP_CLANG_PATH:/opt/hyhal/bin:$PATH
