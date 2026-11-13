@@ -14,19 +14,26 @@ move is merged. From the repository root:
 python op_tests/ci_tests/test_custom_allreduce_api.py
 ```
 
-With at least four visible GPUs, this runs **TP2 followed by TP4**. It does not
+This plans **TP2 followed by TP4**, then checks the visible GPU allocation and,
+for HIP IPC, the existing topology admission rule. Automatic TP4 is explicitly
+skipped when fewer than four GPUs are visible or any selected pair fails the
+`type=2, hops=1` requirement. Supported groups still run TP4. It does not
 run TP8 automatically, even on an eight-GPU machine. Each TP runs `reuse`,
 `ar-boundaries` and `ar-precision` with both `off` and `auto`, then
 `collectives`, `fusions` and `transport` with `off`: 18 independent torchrun
-jobs in total. The launcher sets these algorithm policies itself; no
+jobs in total before admission. The launcher sets these algorithm policies itself; no
 `AITER_AR_SMALL_MESSAGE` export is needed for the default matrix. Existing
 registration-request and safe HCU copy-in checks remain enabled.
 
 `AITER_AR_TP_SIZE=2` limits the default matrix to TP2 for a two-GPU CI allocation;
-the usual CI allocation of four GPUs runs both sizes. An explicit
-`--tp-size 2`, `--tp-size 4` or `--tp-size 8` runs only that size.
-Use `--dry-run` to inspect the matrix without importing Torch or using GPUs.
-Insufficient visible GPUs fail the test rather than silently skipping cases.
+the usual CI allocation of four GPUs plans both sizes. An explicit
+`--tp-size 2`, `--tp-size 4` or `--tp-size 8` strictly requires that size:
+it does not automatically skip a missing GPU or unsupported topology. Direct
+torchrun and explicit Fabric tests also retain their existing checks.
+Use `--dry-run` to inspect the requested matrix without importing Torch or
+using GPUs; runtime admission is not evaluated in a dry run. Fewer than two
+GPUs, missing topology dependencies, and failed identity/SMI queries still fail
+automatic CI rather than producing a successful skip.
 
 The default repeat counts are 100 (`--repeats`) and 20 (`--close-repeats`);
 specialized boundary/precision loops retain their own case counts. Each job
@@ -35,6 +42,13 @@ provenance and `summary.json` go to a unique subdirectory of
 `test_custom_allreduce_api_results/` in the working directory (`--output`
 overrides the parent). Any failed job, timeout or missing rank completion
 fails the launcher and preserves partial results.
+
+Skipped jobs print `CAR_CI_JOB_SKIP` with the reason. `summary.json` preserves
+the requested `tp_sizes` and `planned_jobs`, lists `active_tp_sizes`, and records
+`executed_jobs`, `skipped_jobs` and individual `status="skipped"` entries with
+reasons. For example, an unsupported HIP IPC TP4 group yields 9 executed TP2
+jobs and 9 skipped TP4 jobs, not 18 correctness passes. No CI arguments are
+needed for this selection.
 
 CI registers this script separately from `test_custom_allreduce.py` in the
 `multi_gpu_tests` table of the optest package, which only adds its four-GPU
@@ -46,7 +60,7 @@ framework/model validation.
 |---|---|---|
 | `test_custom_allreduce_api.py --suite collectives` | Dimension-aware AG/RS, integer bit preservation, input validation, changing Graph inputs, close/recreate | 2, 4, 8 |
 | `test_custom_allreduce_api.py --suite fusions` | RMSNorm/Gemma, padding/strides, FP8 mirrors/scales, MXFP4 packing, QK norm, Graph registration | 2, 4, 8 |
-| `test_custom_allreduce_api.py --suite transport` | IPC selection, collective initialization failures, topology rejection, optional disabled-Fabric check | 2, 4, 8; 6 with `--tp6` |
+| `test_custom_allreduce_api.py --suite transport` | IPC selection, default capacity/environment precedence, rank configuration agreement, collective initialization failures, topology rejection, optional disabled-Fabric check | 2, 4, 8; 6 with `--tp6` |
 | `test_custom_allreduce_api.py --suite reuse` | Immediate input reuse, changing eager/Graph inputs, exact FP16/BF16/FP32 sums and HCU copy-in protection | 2, 4, 8 |
 | `test_custom_allreduce_api.py --suite ar-boundaries` | Mixed packet/LL/tile boundaries, two alternating Graphs, allocation cycles, rank submission skew and staging/admission capacity limits | 2, 4, 8 |
 | `test_custom_allreduce_api.py --suite ar-precision` | Ordered FP32 sums, FP16/BF16 RNE ties, cancellation, Inf/NaN, subnormals, guarded tails and changing Graph inputs | 2, 4, 8 |

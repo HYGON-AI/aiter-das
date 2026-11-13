@@ -2,6 +2,9 @@
 
 #include "dispatch_utils.h"
 #include "hip_compat.h"
+#include "hip_kernel_launch.h"
+
+#include <cmath>
 
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
@@ -175,8 +178,8 @@ __global__ void per_token_group_quant_fp8_small_kernel(const scalar_t* __restric
 {
     constexpr int VEC = 16;
 
-    int global_tid      = blockIdx.x * blockDim.x + threadIdx.x;
-    int global_group_id = global_tid / THREADS_PER_GROUP;
+    int64_t global_tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t global_group_id = global_tid / THREADS_PER_GROUP;
     int lane_in_group   = global_tid % THREADS_PER_GROUP;
 
     if(global_group_id >= total_groups)
@@ -354,33 +357,39 @@ void launch_per_token_group_quant_fp8_small(
     switch(threads_per_group)
     {
     case 1:
-        per_token_group_quant_fp8_small_kernel<scalar_t, 1, is_e4m3>
-            <<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+        launch_kernel(launch_policy::quant,
+            per_token_group_quant_fp8_small_kernel<scalar_t, 1, is_e4m3>,
+            dim3(num_blocks), dim3(BLOCK_SIZE), stream,
                 input, out_ptr, scales_ptr, group_size, eps, use_ue8m0, num_groups);
         break;
     case 2:
-        per_token_group_quant_fp8_small_kernel<scalar_t, 2, is_e4m3>
-            <<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+        launch_kernel(launch_policy::quant,
+            per_token_group_quant_fp8_small_kernel<scalar_t, 2, is_e4m3>,
+            dim3(num_blocks), dim3(BLOCK_SIZE), stream,
                 input, out_ptr, scales_ptr, group_size, eps, use_ue8m0, num_groups);
         break;
     case 4:
-        per_token_group_quant_fp8_small_kernel<scalar_t, 4, is_e4m3>
-            <<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+        launch_kernel(launch_policy::quant,
+            per_token_group_quant_fp8_small_kernel<scalar_t, 4, is_e4m3>,
+            dim3(num_blocks), dim3(BLOCK_SIZE), stream,
                 input, out_ptr, scales_ptr, group_size, eps, use_ue8m0, num_groups);
         break;
     case 8:
-        per_token_group_quant_fp8_small_kernel<scalar_t, 8, is_e4m3>
-            <<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+        launch_kernel(launch_policy::quant,
+            per_token_group_quant_fp8_small_kernel<scalar_t, 8, is_e4m3>,
+            dim3(num_blocks), dim3(BLOCK_SIZE), stream,
                 input, out_ptr, scales_ptr, group_size, eps, use_ue8m0, num_groups);
         break;
     case 16:
-        per_token_group_quant_fp8_small_kernel<scalar_t, 16, is_e4m3>
-            <<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+        launch_kernel(launch_policy::quant,
+            per_token_group_quant_fp8_small_kernel<scalar_t, 16, is_e4m3>,
+            dim3(num_blocks), dim3(BLOCK_SIZE), stream,
                 input, out_ptr, scales_ptr, group_size, eps, use_ue8m0, num_groups);
         break;
     case 32:
-        per_token_group_quant_fp8_small_kernel<scalar_t, 32, is_e4m3>
-            <<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+        launch_kernel(launch_policy::quant,
+            per_token_group_quant_fp8_small_kernel<scalar_t, 32, is_e4m3>,
+            dim3(num_blocks), dim3(BLOCK_SIZE), stream,
                 input, out_ptr, scales_ptr, group_size, eps, use_ue8m0, num_groups);
         break;
     default:
@@ -402,28 +411,33 @@ void launch_per_token_group_quant_fp8_large(const scalar_t* input,
     switch(block_size)
     {
     case 64:
-        per_token_group_quant_fp8_kernel<scalar_t, 64, is_e4m3>
-            <<<num_groups, 64, 0, stream>>>(
+        launch_kernel(launch_policy::quant,
+            per_token_group_quant_fp8_kernel<scalar_t, 64, is_e4m3>,
+            dim3(num_groups), dim3(64), stream,
                 input, out_ptr, scales_ptr, group_size, eps, use_ue8m0);
         break;
     case 128:
-        per_token_group_quant_fp8_kernel<scalar_t, 128, is_e4m3>
-            <<<num_groups, 128, 0, stream>>>(
+        launch_kernel(launch_policy::quant,
+            per_token_group_quant_fp8_kernel<scalar_t, 128, is_e4m3>,
+            dim3(num_groups), dim3(128), stream,
                 input, out_ptr, scales_ptr, group_size, eps, use_ue8m0);
         break;
     case 256:
-        per_token_group_quant_fp8_kernel<scalar_t, 256, is_e4m3>
-            <<<num_groups, 256, 0, stream>>>(
+        launch_kernel(launch_policy::quant,
+            per_token_group_quant_fp8_kernel<scalar_t, 256, is_e4m3>,
+            dim3(num_groups), dim3(256), stream,
                 input, out_ptr, scales_ptr, group_size, eps, use_ue8m0);
         break;
     case 512:
-        per_token_group_quant_fp8_kernel<scalar_t, 512, is_e4m3>
-            <<<num_groups, 512, 0, stream>>>(
+        launch_kernel(launch_policy::quant,
+            per_token_group_quant_fp8_kernel<scalar_t, 512, is_e4m3>,
+            dim3(num_groups), dim3(512), stream,
                 input, out_ptr, scales_ptr, group_size, eps, use_ue8m0);
         break;
     case 1024:
-        per_token_group_quant_fp8_kernel<scalar_t, 1024, is_e4m3>
-            <<<num_groups, 1024, 0, stream>>>(
+        launch_kernel(launch_policy::quant,
+            per_token_group_quant_fp8_kernel<scalar_t, 1024, is_e4m3>,
+            dim3(num_groups), dim3(1024), stream,
                 input, out_ptr, scales_ptr, group_size, eps, use_ue8m0);
         break;
     default:
@@ -438,27 +452,40 @@ void per_token_group_quant_fp8(torch::Tensor& out,
                                float eps,
                                bool use_ue8m0)
 {
-    input = input.is_contiguous() ? input : input.contiguous();
+    TORCH_CHECK(input.is_cuda() && out.is_cuda() && scales.is_cuda(),
+                "input, out and scales must be GPU tensors");
+    TORCH_CHECK(input.device() == out.device() && input.device() == scales.device(),
+                "input, out and scales must be on the same device");
+    TORCH_CHECK(input.dim() >= 1, "input must have at least one dimension");
+    TORCH_CHECK(input.scalar_type() == torch::kFloat16 ||
+                    input.scalar_type() == torch::kBFloat16 ||
+                    input.scalar_type() == torch::kFloat32,
+                "input must be float16, bfloat16 or float32");
+    // Validate before modulo/narrowing: group_size=0 previously divided by zero.
+    TORCH_CHECK(group_size >= 16 && group_size <= 16384 &&
+                    (group_size & (group_size - 1)) == 0,
+                "group_size must be a power of 2 between 16 and 16384");
+    TORCH_CHECK(input.size(-1) % group_size == 0,
+                "hidden_size must be a multiple of group_size");
+    TORCH_CHECK(std::isfinite(eps) && eps > 0, "eps must be finite and positive");
     TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
     TORCH_CHECK(scales.is_contiguous(), "scales must be contiguous");
+    TORCH_CHECK(out.numel() == input.numel(), "out must have the same numel as input");
+    TORCH_CHECK(scales.scalar_type() == torch::kFloat32, "scales must be float32");
+    TORCH_CHECK(scales.numel() == input.numel() / group_size,
+                "scales must have one element per group");
     TORCH_CHECK(out.scalar_type() == torch::kFloat8_e4m3fn ||
                     out.scalar_type() == torch::kFloat8_e5m2,
                 "Output tensor must be float8_e4m3fn or float8_e5m2");
 
     const bool is_e4m3        = (out.scalar_type() == torch::kFloat8_e4m3fn);
-    const int hidden_size     = static_cast<int>(input.size(-1));
     const int group_size_int  = static_cast<int>(group_size);
 
-    TORCH_CHECK(hidden_size % group_size_int == 0,
-                "hidden_size must be a multiple of group_size");
-    TORCH_CHECK(group_size_int <= 16384, "group_size exceeds maximum supported size of 16384");
-    TORCH_CHECK(group_size_int >= 16 && group_size_int % 16 == 0,
-                "group_size must be >=16 and a multiple of 16");
-    TORCH_CHECK((group_size_int & (group_size_int - 1)) == 0,
-                "group_size must be a power of 2");
-
     const int64_t num_groups = input.numel() / group_size_int;
+    if(num_groups == 0)
+        return;
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    input = input.is_contiguous() ? input : input.contiguous();
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     auto out_ptr             = reinterpret_cast<uint8_t*>(out.data_ptr());
 

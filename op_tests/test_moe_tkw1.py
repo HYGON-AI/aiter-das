@@ -1,5 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# DISABLED: this test uses asm_moe_tkw1/torch_moe_tkw1 from
+# aiter/fused_moe_bf16_asm.py, which no longer exists, so importing this file
+# raises ModuleNotFoundError (also during pytest collection of op_tests/).
+# Kept for reference. To re-enable, restore the tkw1 backend or rewrite the
+# test on a supported path.
+import pytest
+
+pytest.skip("tkw1 backend (fused_moe_bf16_asm) retired in the fused_moe "
+            "re-enablement; file kept for history", allow_module_level=True)
+
 import torch
 from aiter.test_common import checkAllclose, perftest
 from aiter import dtypes

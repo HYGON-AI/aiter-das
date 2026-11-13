@@ -1,81 +1,12 @@
 from typing import Optional
 
-import functools
-import json
-import os
-
 import torch
 import triton
 import triton.language as tl
-import aiter.ops.triton.utils.arch_info as arch_info
-from aiter import logger
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-
-# HAS_DUMPED_SIGMOID_GATING_REC_KERNEL_METADATA = False
-TRITON_CONFIG_CHECK = os.environ.get("TRITON_CONFIG_CHECK", "0") == "1"
-_DEFAULT_FUSED_SIGMOID_GATING_REC_CONFIG = {
-    "BV": 32,
-    "num_warps": 1,
-}
-
-
-@functools.lru_cache(maxsize=1)
-def _load_fused_sigmoid_gating_recurrent_configs() -> dict:
-    device_name = arch_info.get_arch()
-    path = os.path.join(
-        AITER_TRITON_CONFIGS_PATH,
-        "fused_sigmoid_gating_delta_rule_update_recurrent",
-        f"fused_sigmoid_gating_delta_rule_update_recurrent-{device_name}.json",
-    )
-    if not os.path.exists(path):
-        logger.warning(
-            f"fused_sigmoid_gating_delta_rule_update_recurrent config not found at {path}, "
-            f"using default {_DEFAULT_FUSED_SIGMOID_GATING_REC_CONFIG}."
-        )
-        return {}
-    with open(path) as f:
-        payload = json.load(f)
-    return payload.get("config", {}) if isinstance(payload, dict) else {}
-
-@functools.lru_cache
-def _get_fused_sigmoid_gating_recurrent_config(T: int, H: int, HV: int) -> dict:
-    cfgs = _load_fused_sigmoid_gating_recurrent_configs()
-    key = f"T={T},H={H},HV={HV}"
-    cfg = cfgs.get(key)
-    if cfg is None:
-        candidates = []
-        for k, v in cfgs.items():
-            if k == "default":
-                continue
-            try:
-                parts = {x.split("=")[0]: int(x.split("=")[1]) for x in k.split(",")}
-            except Exception:
-                continue
-            if parts.get("H") == H and parts.get("HV") == HV and "T" in parts:
-                candidates.append((abs(parts["T"] - T), parts["T"], v))
-        if candidates:
-            candidates.sort(key=lambda x: x[0])
-            _, nearest_t, cfg = candidates[0]
-            if TRITON_CONFIG_CHECK:
-                logger.warning(
-                    f"fused_sigmoid_gating_recurrent config key '{key}' not found, "
-                    f"using nearest-T config with T={nearest_t}: {cfg}."
-                )
-    if cfg is None:
-        default_cfg = cfgs.get("default", _DEFAULT_FUSED_SIGMOID_GATING_REC_CONFIG)
-        if TRITON_CONFIG_CHECK:
-            logger.warning(
-                f"fused_sigmoid_gating_recurrent config key '{key}' not found, "
-                f"using default config: {default_cfg}."
-            )
-        cfg = default_cfg
-    merged = dict(_DEFAULT_FUSED_SIGMOID_GATING_REC_CONFIG)
-    merged.update(cfg)
-    return merged
 
 
 @triton.jit(do_not_specialize=["T"])
-def fused_sigmoid_gating_delta_rule_update_kernel(
+def fused_sigmoid_gating_delta_rule_update_kernel_opt(
     A_log,
     a,
     dt_bias,
@@ -98,7 +29,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stride_retrieve_parent_token_token: tl.constexpr,
     # ================================================
     scale,
+    lower_bound,
+    beta_scale,
     T,
+    stride_a,
     stride_q,
     stride_k,
     stride_v,
@@ -115,10 +49,21 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     IS_KDA: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
     # Optional flags for target_verify support (default False for decode)
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    replayssm_rawv=None,
+    replayssm_rawk=None,
+    replayssm_g=None,
+    replayssm_beta=None,
+    stride_rawv_slot: tl.constexpr = 0,
+    stride_rawk_slot: tl.constexpr = 0,
+    stride_g_slot: tl.constexpr = 0,
+    stride_beta_slot: tl.constexpr = 0,
+    REPLAYSSM_WINDOW_LEN: tl.constexpr = 0,
+    CACHE_REPLAYSSM_INPUTS: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -140,6 +85,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_k[:, None] & mask_v[None, :]
 
     p_q = q + bos * stride_q + i_h * K + o_k
     p_k = k + bos * stride_k + i_h * K + o_k
@@ -147,18 +95,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     p_b = b + bos * stride_b + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
-    # Gating computation pointers
-    p_A_log = A_log + i_hv
     if IS_KDA:
-        p_a = a + (bos * HV + i_hv) * K + o_k
+        p_a = a + bos * stride_a + i_hv * K + o_k
         p_dt_bias = dt_bias + i_hv * K + o_k
     else:
-        p_a = a + bos * HV + i_hv
+        p_a = a + bos * stride_a + i_hv
         p_dt_bias = dt_bias + i_hv
-
-    mask_k = o_k < K
-    mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
@@ -173,27 +115,16 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             )
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
-    # Preload tree attention data if needed
-    if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
-        token_indices = tl.arange(0, NP2_T)
-        mask_retrieve = token_indices < T
-        retrieve_parent_token_base = (
-            retrieve_parent_token_ptr
-            + (i_n * stride_retrieve_parent_token_seq)
-            + token_indices * stride_retrieve_parent_token_token
-        )
-        parent_idx_tokens = tl.load(
-            retrieve_parent_token_base, mask=mask_retrieve, other=0
-        )
+    b_A = tl.exp(tl.load(A_log + i_hv).to(tl.float32))
+    if IS_KDA:
+        b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0.0).to(tl.float32)
+    else:
+        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
 
     # Prepare intermediate state cache index if enabled
     cache_idx = -1
     if CACHE_INTERMEDIATE_STATES:
         cache_idx = tl.load(intermediate_state_indices + i_n)
-    # Invariant across timesteps.
-    b_A = tl.exp(tl.load(p_A_log).to(tl.float32))
-    if not IS_KDA:
-        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
 
     step_idx = 0
     for _ in range(0, T):
@@ -201,42 +132,95 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
             # step_idx == 0 uses b_h from USE_INITIAL_STATE
             if step_idx != 0 and cache_idx >= 0:
-                parent_step_idx = tl.sum(
-                    tl.where(token_indices == step_idx, parent_idx_tokens, 0)
+                parent_step_idx = tl.load(
+                    retrieve_parent_token_ptr
+                    + i_n * stride_retrieve_parent_token_seq
+                    + step_idx * stride_retrieve_parent_token_token
                 )
-                step_offset = parent_step_idx * HV * K * V
-                cache_ptr = (
-                    intermediate_states_buffer
-                    + cache_idx * cache_steps * HV * K * V
-                    + step_offset
-                    + i_hv * K * V
-                    + o_v[None, :] * K
-                    + o_k[:, None]
-                )
-                b_h = tl.load(cache_ptr, mask=mask_h, other=0).to(tl.float32)
+                if parent_step_idx != step_idx - 1:
+                    step_offset = parent_step_idx * HV * K * V
+                    cache_ptr = (
+                        intermediate_states_buffer
+                        + cache_idx * cache_steps * HV * K * V
+                        + step_offset
+                        + i_hv * K * V
+                        + o_v[None, :] * K
+                        + o_k[:, None]
+                    )
+                    b_h = tl.load(cache_ptr, mask=mask_h, other=0).to(tl.float32)
 
-        # Load k first; q is loaded later right before output to reduce register live range.
+        # Load inputs
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+        b_b = tl.load(p_b).to(tl.float32)
 
         # Compute sigmoid gating
         # Load gating parameters
         if IS_KDA:
             b_a = tl.load(p_a, mask=mask_k, other=0).to(tl.float32)
-            b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
         else:
             b_a = tl.load(p_a).to(tl.float32)
 
-        # Compute g with tighter live ranges for intermediates.
+        # Compute g = -exp(A_log) * softplus(a + dt_bias), or the KDA safe gate.
         x = b_a + b_dt_bias
-        x_scaled = softplus_beta * x
-        x = tl.where(
-            x_scaled <= softplus_threshold,
-            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(x_scaled)),
-            x,
-        )
-        b_g = -b_A * x
+        if IS_KDA and USE_LOWER_BOUND:
+            b_g = lower_bound * tl.sigmoid(b_A * x)
+        else:
+            beta_x = softplus_beta * x
+            # Apply softplus with numerical stability
+            softplus_x = tl.where(
+                beta_x <= softplus_threshold,
+                (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+                x,
+            )
+            b_g = -b_A * softplus_x
 
-        # Apply L2 normalization to k early; q normalization is deferred until q is loaded.
+        # Compute beta = sigmoid(b)
+        b_beta = beta_scale * (1.0 / (1.0 + tl.exp(-b_b)))
+
+        # Stage the raw inputs consumed by this recurrent update. After
+        # sampling, ReplaySSM folds only the accepted prefix into the fp32
+        # checkpoint; the next verify step overwrites rejected suffix rows.
+        if CACHE_REPLAYSSM_INPUTS:
+            state_slot = tl.load(h0_indices + i_n).to(tl.int64)
+            if state_slot >= 0 and step_idx < REPLAYSSM_WINDOW_LEN:
+                tl.store(
+                    replayssm_rawv
+                    + state_slot * stride_rawv_slot
+                    + (i_hv * REPLAYSSM_WINDOW_LEN + step_idx) * V
+                    + o_v,
+                    b_v.to(replayssm_rawv.dtype.element_ty),
+                    mask=mask_v,
+                )
+                if i_v == 0:
+                    # Grouped value heads share K; stage it once per key head.
+                    if i_hv % (HV // H) == 0:
+                        tl.store(
+                            replayssm_rawk
+                            + state_slot * stride_rawk_slot
+                            + (i_h * REPLAYSSM_WINDOW_LEN + step_idx) * K
+                            + o_k,
+                            b_k.to(replayssm_rawk.dtype.element_ty),
+                            mask=mask_k,
+                        )
+                    tl.store(
+                        replayssm_g
+                        + state_slot * stride_g_slot
+                        + (i_hv * REPLAYSSM_WINDOW_LEN + step_idx) * K
+                        + o_k,
+                        b_g,
+                        mask=mask_k,
+                    )
+                    if i_k == 0:
+                        tl.store(
+                            replayssm_beta
+                            + state_slot * stride_beta_slot
+                            + i_hv * REPLAYSSM_WINDOW_LEN
+                            + step_idx,
+                            b_beta,
+                        )
+
+        # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
             b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
 
@@ -246,24 +230,20 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         else:
             b_h *= tl.exp(b_g)
 
-        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-
         # Delta rule: v -= sum(h * k, dim=0)
         b_v -= tl.sum(b_h * b_k[:, None], 0)
 
         # Apply beta gating: v *= beta
-        b_v *= tl.sigmoid(tl.load(p_b).to(tl.float32))
+        b_v *= b_beta
 
         # Update hidden state: h += k[:, None] * v[None, :]
         b_h += b_k[:, None] * b_v[None, :]
 
-        # Load q late to shorten q live range and lower peak register pressure.
+        # Compute output: o = sum(h * q, dim=0)
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         if USE_QK_L2NORM_IN_KERNEL:
             b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
         b_q = b_q * scale
-
-        # Compute output: o = sum(h * q, dim=0)
         b_o = tl.sum(b_h * b_q[:, None], 0)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
@@ -289,10 +269,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_v += stride_v
         p_b += stride_b
         p_o += HV * V
-        if IS_KDA:
-            p_a += HV * K
-        else:
-            p_a += HV
+        p_a += stride_a
 
     # Store final state back to h0_source with bounds checking
     if not DISABLE_STATE_UPDATE:
@@ -325,15 +302,20 @@ def fused_sigmoid_gating_delta_rule_update(
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
     is_kda: bool = False,
+    lower_bound: Optional[float] = None,
+    beta_scale: float = 1.0,
     # Optional parameters for target_verify support
     disable_state_update: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
-    kernel_cfg: dict | None = None,
+    cache_replayssm_inputs: bool = False,
+    replayssm_rawv: Optional[torch.Tensor] = None,
+    replayssm_rawk: Optional[torch.Tensor] = None,
+    replayssm_g: Optional[torch.Tensor] = None,
+    replayssm_beta: Optional[torch.Tensor] = None,
 ):
-    global HAS_DUMPED_SIGMOID_GATING_REC_KERNEL_METADATA
     """
     Fused triton implementation of sigmoid gating delta rule update.
     This function uses a single fused kernel that combines both sigmoid gating computation
@@ -350,32 +332,21 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_v = v.stride()[1]
     stride_b = b.stride()[-2]
     HV = v.shape[2]
+    # Normalize flattened and explicit-head layouts to one row per token.
+    # In particular, [B, T, HV, K] advances by HV*K, not stride(-2) == K.
+    a = a.reshape(B * T, HV * K if is_kda else HV).contiguous()
+    stride_a = a.stride(0)
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK = triton.next_power_of_2(K)
-    cfg = kernel_cfg if kernel_cfg is not None else _get_fused_sigmoid_gating_recurrent_config(T, H, HV)
-    BV = min(triton.next_power_of_2(V), int(cfg["BV"]))
+    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
-    num_warps = int(cfg["num_warps"])
+    num_stages = 3
+    num_warps = 1
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
     else:
         assert scale > 0, "scale must be positive"
-
-    if use_qk_l2norm_in_kernel and arch_info.get_arch() == "gfx946":
-        # Keep gfx946 off the Triton 3.2 vector-reduction path used by the
-        # in-kernel Q/K normalization; the recurrent update itself is correct.
-        def _normalize_for_gfx946(x: torch.Tensor) -> torch.Tensor:
-            x_fp32 = x.float()
-            inv_norm = torch.rsqrt(
-                torch.sum(x_fp32 * x_fp32, dim=-1, keepdim=True) + 1e-6
-            )
-            return (x_fp32 * inv_norm).to(x.dtype)
-
-        q = _normalize_for_gfx946(q)
-        k = _normalize_for_gfx946(k)
-        use_qk_l2norm_in_kernel = False
 
     o = q.new_empty(NK, *v.shape)
 
@@ -391,7 +362,45 @@ def fused_sigmoid_gating_delta_rule_update(
 
     grid = (NK, NV, N * HV)
 
-    compiled_kernel = fused_sigmoid_gating_delta_rule_update_kernel[grid](
+    if cache_replayssm_inputs:
+        assert is_kda, "ReplaySSM input staging is KDA-only"
+        assert (
+            replayssm_rawv is not None
+            and replayssm_rawk is not None
+            and replayssm_g is not None
+            and replayssm_beta is not None
+        )
+        assert (
+            replayssm_rawv.ndim == 4
+            and replayssm_rawk.ndim == 4
+            and replayssm_g.ndim == 4
+            and replayssm_beta.ndim == 3
+        ), "ReplaySSM expects per-layer input-window views"
+        replayssm_window_len = replayssm_rawv.shape[-2]
+        assert replayssm_rawv.shape[1:] == (HV, replayssm_window_len, V)
+        assert replayssm_rawk.shape[1:] == (H, replayssm_window_len, K)
+        assert replayssm_g.shape[1:] == (HV, replayssm_window_len, K)
+        assert replayssm_beta.shape[1:] == (HV, replayssm_window_len)
+        assert (
+            replayssm_rawv.shape[0]
+            == replayssm_rawk.shape[0]
+            == replayssm_g.shape[0]
+            == replayssm_beta.shape[0]
+        )
+        assert replayssm_g.dtype == torch.float32
+        assert replayssm_beta.dtype == torch.float32
+        stride_rawv_slot = replayssm_rawv.stride(0)
+        stride_rawk_slot = replayssm_rawk.stride(0)
+        stride_g_slot = replayssm_g.stride(0)
+        stride_beta_slot = replayssm_beta.stride(0)
+    else:
+        replayssm_window_len = 0
+        stride_rawv_slot = 0
+        stride_rawk_slot = 0
+        stride_g_slot = 0
+        stride_beta_slot = 0
+
+    fused_sigmoid_gating_delta_rule_update_kernel_opt[grid](
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
@@ -412,7 +421,10 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
         scale=scale,
+        lower_bound=0.0 if lower_bound is None else lower_bound,
+        beta_scale=beta_scale,
         T=T,
+        stride_a=stride_a,
         stride_q=stride_q,
         stride_k=stride_k,
         stride_v=stride_v,
@@ -429,20 +441,22 @@ def fused_sigmoid_gating_delta_rule_update(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_VARLEN=cu_seqlens is not None,
         IS_KDA=is_kda,
+        USE_LOWER_BOUND=lower_bound is not None,
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        replayssm_rawv=replayssm_rawv,
+        replayssm_rawk=replayssm_rawk,
+        replayssm_g=replayssm_g,
+        replayssm_beta=replayssm_beta,
+        stride_rawv_slot=stride_rawv_slot,
+        stride_rawk_slot=stride_rawk_slot,
+        stride_g_slot=stride_g_slot,
+        stride_beta_slot=stride_beta_slot,
+        REPLAYSSM_WINDOW_LEN=replayssm_window_len,
+        CACHE_REPLAYSSM_INPUTS=cache_replayssm_inputs,
         num_warps=num_warps,
-        num_stages=1,
+        num_stages=num_stages,
     )
-    '''
-    if not HAS_DUMPED_SIGMOID_GATING_REC_KERNEL_METADATA and compiled_kernel is not None:
-        print("sigmoid gating recurrent kernel metadata")
-        print(f"  grid: {grid}")
-        print(f"  registers: {compiled_kernel.n_regs}")
-        print(f"  spills: {compiled_kernel.n_spills}")
-        print(f"  shared memory: {compiled_kernel.metadata.shared} bytes")
-        HAS_DUMPED_SIGMOID_GATING_REC_KERNEL_METADATA = True
-    '''
     o = o.squeeze(0)
     return o

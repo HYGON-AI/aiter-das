@@ -181,3 +181,53 @@ def top_k_top_p_sampling_from_probs(
         deterministic, seed, offset,
     )
     return samples
+
+
+def _torch_top_p_sampling(
+    probs, indices, top_p_arr, top_p_val, deterministic=True,
+):
+    return top_p_sampling_from_probs(
+        probs, top_p_arr if top_p_arr is not None else top_p_val,
+        indices=indices, deterministic=deterministic,
+    )
+
+
+def _torch_top_k_top_p_sampling(
+    probs, indices, top_k_arr, top_k_val, top_p_arr, top_p_val, deterministic=True,
+):
+    return top_k_top_p_sampling_from_probs(
+        probs, top_k_arr if top_k_arr is not None else top_k_val,
+        top_p_arr if top_p_arr is not None else top_p_val,
+        indices=indices, deterministic=deterministic,
+    )
+
+
+def _sampling_meta(probs, indices):
+    batch = probs.size(0) if indices is None else indices.size(0)
+    return probs.new_empty((batch,), dtype=torch.int32)
+
+
+# Framework calls split each parameter into an optional tensor and a scalar.
+# Keep these allocating schemas separate from the existing output-buffer APIs.
+_sampling_library = torch.library.Library("aiter", "FRAGMENT")
+_sampling_library.define(
+    "top_p_sampling_from_probs(Tensor probs, Tensor? indices, Tensor? top_p_arr, "
+    "float top_p_val, bool deterministic=True) -> Tensor"
+)
+_sampling_library.define(
+    "top_k_top_p_sampling_from_probs(Tensor probs, Tensor? indices, Tensor? top_k_arr, "
+    "int top_k_val, Tensor? top_p_arr, float top_p_val, bool deterministic=True) -> Tensor"
+)
+_sampling_library.impl("top_p_sampling_from_probs", _torch_top_p_sampling, "CUDA")
+_sampling_library.impl("top_k_top_p_sampling_from_probs", _torch_top_k_top_p_sampling, "CUDA")
+_sampling_library.impl(
+    "top_p_sampling_from_probs",
+    lambda probs, indices, top_p_arr, top_p_val, deterministic=True: _sampling_meta(probs, indices),
+    "Meta",
+)
+_sampling_library.impl(
+    "top_k_top_p_sampling_from_probs",
+    lambda probs, indices, top_k_arr, top_k_val, top_p_arr, top_p_val, deterministic=True:
+        _sampling_meta(probs, indices),
+    "Meta",
+)

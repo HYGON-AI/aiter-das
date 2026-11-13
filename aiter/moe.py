@@ -56,16 +56,32 @@ class AiterMoeConfig:
         config: Backend-specific config dict (opaque to the caller).
         need_shuffle: Whether the backend requires weight shuffling via
             :func:`aiter_moe_shfl_weight` before calling :func:`aiter_moe`.
+        dtype: Compute dtype the config was selected for; moe_c channelwise
+            lookup keys CSV rows by it, so it must equal the runtime
+            ``hidden_states.dtype`` for float activations. Never reuse a
+            cached config across dtypes.
     """
     quant_type: Optional[str] = None
     solution_type: Optional[str] = None
     config: Optional[Dict[str, Any]] = None
     need_shuffle: bool = False
     need_shuffle_scale: bool = False
+    dtype: Optional[torch.dtype] = None
 
 
 def _pick_closest_config(configs: Dict[int, Any], m: int) -> Dict[str, Any]:
     return configs[min(configs.keys(), key=lambda x: abs(x - m))]
+
+
+def _resolve_moe_c_config_dtype(dtype: torch.dtype) -> torch.dtype:
+    if dtype in (torch.float16, torch.bfloat16, torch.float32):
+        return dtype
+    logger.warning(
+        "dtype=%s is not a float compute dtype; normalizing to "
+        "torch.bfloat16 for the moe_c selection key",
+        dtype,
+    )
+    return torch.bfloat16
 
 
 def _pad_tensor_dim(x: torch.Tensor, dim: int, target: Optional[int]) -> torch.Tensor:
@@ -140,7 +156,14 @@ def _try_get_moe_c_config(
     block_size: int,
     k: Optional[int] = None,
     top_k: Optional[int] = None,
+    indtype: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    """Look up a tuned moe_c config.
+
+    ``indtype`` is the channelwise CSV key (fp8_w8a8/int8_w8a8/int8_w4a8
+    only; other families ignore it) and must match the execute-time
+    ``str(compute_dtype)`` lookup.
+    """
     try:
         from .fused_moe_c import get_moe_configs_marlin
 
@@ -169,6 +192,7 @@ def _try_get_moe_c_config(
                 use_moe_wna16_cuda=True,
                 K=k,
                 top_k=top_k,
+                indtype=indtype,
             )
         elif quant_type == MoeQuantType.FP8_W8A8:
             if k is not None and (block_size is None or block_size == 0):
@@ -181,6 +205,7 @@ def _try_get_moe_c_config(
                     use_moe_wna16_cuda=True,
                     K=padded_k,
                     top_k=top_k,
+                    indtype=indtype,
                 )
                 if configs is None:
                     return None
@@ -196,6 +221,7 @@ def _try_get_moe_c_config(
                 is_bottom=False,
                 use_moe_wna16_cuda=True,
                 top_k=top_k,
+                indtype=indtype,
             )
         elif quant_type == MoeQuantType.W4A8:
             configs = get_moe_configs_marlin(
@@ -208,6 +234,7 @@ def _try_get_moe_c_config(
                 use_moe_wna16_cuda=True,
                 K=k,
                 top_k=top_k,
+                indtype=indtype,
             )
         elif quant_type == MoeQuantType.WFP4A8:
             configs = get_moe_configs_marlin(
@@ -323,8 +350,9 @@ def _try_get_asm_config(
             if block_size == 32:
                 if top_k > 8 or n != 256 or k != 7168:
                     return None
-                else:
-                    return decode_sol_w4a16_gw32()
+                if arch == "gfx92a":
+                    return None
+                return decode_sol_w4a16_gw32()
 
             solution = get_moe_asm_solution(
                 arch=arch,
@@ -415,6 +443,10 @@ def _try_get_triton_config(
     k: int,
     top_k: int,
 ) -> Optional[Dict[str, Any]]:
+
+    if quant_type == MoeQuantType.W4A16 and block_size <= 0:
+        return None
+
     try:
         from boltops.fused_moe.triton.moe_config_utils import get_moe_configs as triton_get_moe_configs
 
@@ -449,6 +481,57 @@ def _try_get_triton_config(
         return _pick_closest_config(configs, m)
     except Exception as exc:
         logger.debug("Triton config lookup failed for %s: %s", quant_type, exc)
+        return None
+
+
+def _try_get_triton_default_config(
+    quant_type: str,
+    m: int,
+    e: int,
+    n: int,
+    block_size: int,
+    k: int,
+    top_k: int,
+) -> Optional[Dict[str, Any]]:
+    # Only enable quant types represented by aiter_moe's Triton execution flags.
+    dtype_names = {
+        MoeQuantType.W16A16: None,
+        MoeQuantType.W4A16: "int4_w4a16",
+        MoeQuantType.W4A8: "int4_w4a8",
+        MoeQuantType.W8A8: "int8_w8a8",
+        MoeQuantType.FP8_W8A8: "fp8_w8a8",
+        MoeQuantType.INT8_W8A16: "int8_w8a16",
+    }
+    if quant_type not in dtype_names:
+        return None
+    if quant_type == MoeQuantType.W4A16 and block_size <= 0:
+        return None
+
+    try:
+        if quant_type == MoeQuantType.FP8_W8A8:
+            from .utility import dtypes
+
+            # The uint8 FP8 fallback is not an executable Triton FP8 dtype.
+            if dtypes.fp8 == torch.uint8:
+                return None
+        from boltops.fused_moe.triton.moe_config_utils import get_default_config
+
+        block_n = block_size if quant_type in (MoeQuantType.W8A8, MoeQuantType.FP8_W8A8) else 0
+        config = get_default_config(
+            m, e, n, k, top_k, dtype_names[quant_type],
+            is_marlin=False,
+            block_shape=[block_n, block_size] if block_size else None,
+        )
+        if not config:
+            return None
+        logger.info(
+            "No tuned MoE config found; using default untuned Triton config for MoE execution: "
+            "quant_type=%s, M=%s, E=%s, N=%s, K=%s, top_k=%s, block_size=%s, config=%s",
+            quant_type, m, e, n, k, top_k, block_size, config,
+        )
+        return config
+    except Exception as exc:
+        logger.debug("Triton default config lookup failed for %s: %s", quant_type, exc)
         return None
 
 
@@ -526,6 +609,10 @@ def get_aiter_moe_config(
     - ``int8_w8a16``: moe_c > triton (ASM kernel not available)
     - ``fp8_w8a16``: not yet implemented (raises NotImplementedError)
 
+    If all candidates lack a tuned config, try an untuned Triton default.
+    An explicit backend request stays restricted to that backend; explicit
+    Triton requests can also use its default config.
+
     For non-gated MOE (e.g. Nemotron with ReLU² activation), pass
     ``gated=False`` (or let it auto-detect from ``activation="relu2"``)
     and set ``N1 = intermediate_size`` (not ``2 * intermediate_size``).
@@ -538,16 +625,22 @@ def get_aiter_moe_config(
     # For non-gated:   N1 = intermediate_size,     n = N1
     n = N1 // 2 if gated else N1
     block_shape = [0, block_size] if block_size else None
+    config_dtype = _resolve_moe_c_config_dtype(dtype)
 
     # If a specific solution type is requested, only try that one
     if spec_sol_type is not None:
         # Only try the specified backend
         if spec_sol_type == MoeSolutionType.MOE_C:
-            config = _try_get_moe_c_config(quant_type, M, E, n, block_size, K, top_k)
+            config = _try_get_moe_c_config(
+                quant_type, M, E, n, block_size, K, top_k,
+                indtype=str(config_dtype),
+            )
         elif spec_sol_type == MoeSolutionType.ASM:
             config = _try_get_asm_config(quant_type, M, E, n, K, top_k, block_size, use_shuffle)
         elif spec_sol_type == MoeSolutionType.TRITON:
             config = _try_get_triton_config(quant_type, M, E, n, block_size, K, top_k)
+            if config is None:
+                config = _try_get_triton_default_config(quant_type, M, E, n, block_size, K, top_k)
         elif spec_sol_type == MoeSolutionType.CK:
             config = _try_get_ck_config(quant_type, M, E, n, K, top_k, block_shape)
         else:
@@ -560,6 +653,7 @@ def get_aiter_moe_config(
                 need_shuffle=((spec_sol_type == MoeSolutionType.MOE_C and (quant_type not in (MoeQuantType.W4A16, MoeQuantType.WFP4A16))) or (spec_sol_type == MoeSolutionType.ASM and bool(config.get("USE_SHUFFLE", use_shuffle)))),
                 need_shuffle_scale=((spec_sol_type == MoeSolutionType.MOE_C) and (quant_type in (MoeQuantType.W4A16, MoeQuantType.WFP4A16))),
                 config=config,
+                dtype=config_dtype,
             )
         else:
             return False, AiterMoeConfig(quant_type=quant_type)
@@ -574,9 +668,8 @@ def get_aiter_moe_config(
         elif dtype == torch.bfloat16:
             candidates = [
                 (MoeSolutionType.ASM, lambda: _try_get_asm_config(quant_type, M, E, n, K, top_k, block_size, use_shuffle)),
-                (MoeSolutionType.TRITON, lambda: _try_get_triton_config(quant_type, M, E, n, block_size, K, top_k)),
                 (MoeSolutionType.MOE_C, lambda: _try_get_moe_c_config(quant_type, M, E, n, block_size)),
-                
+                (MoeSolutionType.TRITON, lambda: _try_get_triton_config(quant_type, M, E, n, block_size, K, top_k)),
             ]
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
@@ -588,7 +681,7 @@ def get_aiter_moe_config(
         if block_size is None or block_size == 0: # Channel wise
             candidates = [
                 (MoeSolutionType.ASM, lambda: _try_get_asm_config(quant_type, M, E, n, K, top_k, block_size, use_shuffle)),
-                (MoeSolutionType.MOE_C, lambda: _try_get_moe_c_config(quant_type, M, E, n, block_size, K, top_k)),
+                (MoeSolutionType.MOE_C, lambda: _try_get_moe_c_config(quant_type, M, E, n, block_size, K, top_k, indtype=str(config_dtype))),
                 (MoeSolutionType.TRITON, lambda: _try_get_triton_config(quant_type, M, E, n, block_size, K, top_k)),
                 # (MoeSolutionType.CK, lambda: _try_get_ck_config(quant_type, M, E, n, K, top_k, block_shape)),
             ]
@@ -600,7 +693,7 @@ def get_aiter_moe_config(
 
     elif quant_type == MoeQuantType.W4A8:
         candidates = [
-            (MoeSolutionType.MOE_C, lambda: _try_get_moe_c_config(quant_type, M, E, n, block_size, K, top_k)),
+            (MoeSolutionType.MOE_C, lambda: _try_get_moe_c_config(quant_type, M, E, n, block_size, K, top_k, indtype=str(config_dtype))),
             (MoeSolutionType.TRITON, lambda: _try_get_triton_config(quant_type, M, E, n, block_size, K, top_k)),
             # (MoeSolutionType.ASM, lambda: _try_get_asm_config(quant_type, M, E, n, K, top_k)),
         ]
@@ -638,8 +731,17 @@ def get_aiter_moe_config(
                 need_shuffle=(((solution_type == MoeSolutionType.MOE_C) and (quant_type not in (MoeQuantType.W4A16, MoeQuantType.WFP4A16))) or (solution_type == MoeSolutionType.ASM and bool(config.get("USE_SHUFFLE", use_shuffle)))),
                 need_shuffle_scale=((solution_type == MoeSolutionType.MOE_C) and (quant_type in (MoeQuantType.W4A16, MoeQuantType.WFP4A16))),
                 config=config,
+                dtype=config_dtype,
             )
 
+    config = _try_get_triton_default_config(quant_type, M, E, n, block_size, K, top_k)
+    if config is not None:
+        return True, AiterMoeConfig(
+            quant_type=quant_type,
+            solution_type=MoeSolutionType.TRITON,
+            config=config,
+            dtype=config_dtype,
+        )
     return False, AiterMoeConfig(quant_type=quant_type)
 
 
@@ -674,7 +776,7 @@ def aiter_moe(
             "Call get_aiter_moe_config first and check the status."
         )
     
-    if output_dtype is None:
+    if output_dtype is None and moe_config.solution_type != MoeSolutionType.MOE_C:
         output_dtype = hidden_states.dtype
     
     if routed_scaling_factor is None:
@@ -720,6 +822,36 @@ def aiter_moe(
 
     if moe_config.solution_type == MoeSolutionType.MOE_C:
         from .fused_moe_c import moe_c_fused_experts
+
+        float_dtypes = (torch.float16, torch.bfloat16, torch.float32)
+        if hidden_states.dtype in float_dtypes:
+            compute_dtype = hidden_states.dtype
+            if moe_config.dtype is not None and moe_config.dtype != compute_dtype:
+                raise ValueError(
+                    "aiter_moe(moe_c): moe_config was selected for "
+                    f"{moe_config.dtype}, but hidden_states has {compute_dtype}; "
+                    "call get_aiter_moe_config again with the runtime dtype"
+                )
+            if moe_config.dtype is None:
+                logger.warning(
+                    "aiter_moe(moe_c): moe_config.dtype is None; dtype check "
+                    "skipped, execute-time config lookup may miss"
+                )
+        else:
+            compute_dtype = moe_config.dtype or torch.bfloat16
+
+        if output_dtype is None:
+            output_dtype = compute_dtype
+        if output_dtype not in float_dtypes:
+            raise ValueError(
+                "aiter_moe(moe_c): output_dtype must be fp16, bf16, or fp32, "
+                f"got {output_dtype}"
+            )
+        if output_dtype != compute_dtype:
+            raise ValueError(
+                "aiter_moe(moe_c): output_dtype must equal moe_c compute dtype; "
+                f"got output_dtype={output_dtype}, compute_dtype={compute_dtype}"
+            )
 
         moe_c_kwargs = {}
         if use_fp8_w8a8 and moe_config.config:
@@ -780,12 +912,17 @@ def aiter_moe(
             routed_scaling_factor=routed_scaling_factor,
             gemm1_alpha=gemm1_alpha,
             gemm1_limit=gemm1_limit,
-            compute_dtype=output_dtype,
+            compute_dtype=compute_dtype,
             **moe_c_kwargs,
         )
 
     if moe_config.solution_type == MoeSolutionType.ASM:
         from .fused_moe_asm_wna16 import fused_experts_asm_impl
+        if output_dtype == torch.float32:
+            raise ValueError(
+                "aiter_moe(asm): fp32 output is unsupported; asm supports "
+                "only fp16 and bf16 output"
+            )
         per_channel_quant = True if block_shape is None else False
         cfg = moe_config.config
         solution_id = f"{cfg['SOL_ID1']}+{cfg['SOL_ID2']}"

@@ -120,6 +120,66 @@ vllm_fused_sigmoid_gating_delta_rule_update(
 }
 
 AITER_CPP_TORCH_API std::vector<torch::Tensor>
+sglang_fused_sigmoid_gating_delta_rule_update(
+    const torch::Tensor& A_log,
+    const torch::Tensor& a,
+    const torch::Tensor& dt_bias,
+    float softplus_beta,
+    float softplus_threshold,
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& b,
+    const std::optional<torch::Tensor>& initial_state_source,
+    const std::optional<torch::Tensor>& initial_state_indices,
+    const std::optional<float>& scale,
+    bool use_qk_l2norm_in_kernel,
+    const std::optional<torch::Tensor>& cu_seqlens,
+    bool is_kda,
+    const std::optional<float>& lower_bound,
+    float beta_scale,
+    bool disable_state_update,
+    const std::optional<torch::Tensor>& intermediate_states_buffer,
+    const std::optional<torch::Tensor>& intermediate_state_indices,
+    int64_t cache_steps,
+    const std::optional<torch::Tensor>& retrieve_parent_token,
+    bool cache_replayssm_inputs,
+    const std::optional<torch::Tensor>& replayssm_rawv,
+    const std::optional<torch::Tensor>& replayssm_rawk,
+    const std::optional<torch::Tensor>& replayssm_g,
+    const std::optional<torch::Tensor>& replayssm_beta)
+{
+    return ::sglang_fused_sigmoid_gating_delta_rule_update(
+        A_log,
+        a,
+        dt_bias,
+        softplus_beta,
+        softplus_threshold,
+        q,
+        k,
+        v,
+        b,
+        initial_state_source,
+        initial_state_indices,
+        scale,
+        use_qk_l2norm_in_kernel,
+        cu_seqlens,
+        is_kda,
+        lower_bound,
+        beta_scale,
+        disable_state_update,
+        intermediate_states_buffer,
+        intermediate_state_indices,
+        cache_steps,
+        retrieve_parent_token,
+        cache_replayssm_inputs,
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta);
+}
+
+AITER_CPP_TORCH_API std::vector<torch::Tensor>
 aiter_fused_recurrent_gated_delta_rule_packed_decode(
     const torch::Tensor& mixed_qkv,
     const torch::Tensor& a,

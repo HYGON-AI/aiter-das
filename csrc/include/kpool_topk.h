@@ -1,7 +1,6 @@
 #pragma once
 
 #include <torch/extension.h>
-
 #include <optional>
 
 void kpool_topk_launcher(

@@ -23,6 +23,7 @@
 
 #include "dispatch_utils.h"
 #include "hip_compat.h"
+#include "hip_kernel_launch.h"
 #include "hip_reduce.h"
 #include "py_itfs_common.h"
 #include "vec_convert.h"
@@ -833,25 +834,27 @@ namespace vllm
 // KV_T is the stored data type of kv-cache.
 // CACHE_T is the data type of key and value tensors.
 // KV_DTYPE is the real data type of kv-cache.
-#define CALL_RESHAPE_AND_CACHE(KV_T, CACHE_T, KV_DTYPE)               \
-  vllm::reshape_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE>             \
-      <<<grid, block, 0, stream>>>(                                   \
-          reinterpret_cast<KV_T *>(key.data_ptr()),                   \
-          reinterpret_cast<KV_T *>(value.data_ptr()),                 \
-          reinterpret_cast<CACHE_T *>(key_cache.data_ptr()),          \
-          reinterpret_cast<CACHE_T *>(value_cache.data_ptr()),        \
-          slot_mapping.data_ptr<int64_t>(), key_stride, value_stride, \
-          num_heads, head_size, block_size, x, k_scale, v_scale);
+#define CALL_RESHAPE_AND_CACHE(KV_T, CACHE_T, KV_DTYPE)                     \
+  aiter::launch_kernel(                                                     \
+      aiter::launch_policy::kv_cache,                                       \
+      vllm::reshape_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE>, grid, block,  \
+      stream, reinterpret_cast<KV_T *>(key.data_ptr()),                     \
+      reinterpret_cast<KV_T *>(value.data_ptr()),                           \
+      reinterpret_cast<CACHE_T *>(key_cache.data_ptr()),                    \
+      reinterpret_cast<CACHE_T *>(value_cache.data_ptr()),                  \
+      slot_mapping.data_ptr<int64_t>(), key_stride, value_stride,           \
+      num_heads, head_size, block_size, x, k_scale, v_scale);
 
-#define CALL_RESHAPE_AND_CACHE_ASM(KV_T, CACHE_T, KV_DTYPE)           \
-  vllm::reshape_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE, true>       \
-      <<<grid, block, 0, stream>>>(                                   \
-          reinterpret_cast<KV_T *>(key.data_ptr()),                   \
-          reinterpret_cast<KV_T *>(value.data_ptr()),                 \
-          reinterpret_cast<CACHE_T *>(key_cache.data_ptr()),          \
-          reinterpret_cast<CACHE_T *>(value_cache.data_ptr()),        \
-          slot_mapping.data_ptr<int64_t>(), key_stride, value_stride, \
-          num_heads, head_size, block_size, x, k_scale, v_scale);
+#define CALL_RESHAPE_AND_CACHE_ASM(KV_T, CACHE_T, KV_DTYPE)                  \
+  aiter::launch_kernel(                                                     \
+      aiter::launch_policy::kv_cache,                                       \
+      vllm::reshape_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE, true>, grid,   \
+      block, stream, reinterpret_cast<KV_T *>(key.data_ptr()),              \
+      reinterpret_cast<KV_T *>(value.data_ptr()),                           \
+      reinterpret_cast<CACHE_T *>(key_cache.data_ptr()),                    \
+      reinterpret_cast<CACHE_T *>(value_cache.data_ptr()),                  \
+      slot_mapping.data_ptr<int64_t>(), key_stride, value_stride,           \
+      num_heads, head_size, block_size, x, k_scale, v_scale);
 
 void reshape_and_cache(
     torch::Tensor &key,   // [num_tokens, num_heads, head_size]

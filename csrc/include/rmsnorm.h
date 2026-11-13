@@ -32,6 +32,17 @@ rmsnorm2d(torch::Tensor& input,
           torch::Tensor& weight,
           double epsilon); // 0: Use default RMSNorm; 1: Use T5-like implementation
 
+// Out-parameter form of the CK rmsnorm2d above. Deliberately a distinct name
+// rather than an overload: the pybind macro binds &rmsnorm2d by address, so
+// adding an overload here would make that binding ambiguous.
+// Honours input.stride(0) / out.stride(0), so a non-contiguous row view (e.g.
+// a torch.split of a fused QKV projection) is handled correctly -- unlike
+// rms_norm, whose kernel indexes its input as if it were contiguous.
+void rmsnorm2d_out(torch::Tensor& out,    // [m, n]
+                   torch::Tensor& input,  // [m, n]
+                   torch::Tensor& weight, // [1, n]
+                   double epsilon);
+
 void rmsnorm2d_with_add(
     torch::Tensor& out,          // [m ,n]
     torch::Tensor& input,        // [m ,n]

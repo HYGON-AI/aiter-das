@@ -67,6 +67,21 @@ def rmsnorm2d_fwd(
 
 
 @compile_ops("module_rmsnorm")
+def rmsnorm2d_fwd_out(
+    out: Tensor,
+    input: Tensor,
+    weight: Tensor,
+    epsilon: float,
+) -> None:
+    """
+    Out-parameter form of rmsnorm2d_fwd. Honours input/out row strides, so a
+    non-contiguous row view works; rms_norm_cu does not (its kernel indexes
+    input as contiguous).
+    """
+    ...
+
+
+@compile_ops("module_rmsnorm")
 def rmsnorm2d_fwd_with_add(
     out: Tensor,
     input: Tensor,
@@ -259,3 +274,81 @@ def head_rms_norm(
         Tensor with same shape as input
     """
     ...
+
+
+# ============================================================================
+# Fast HIP RMSNorm family (module_rmsnorm_quant), ported from aiter-github.
+#
+# These are *additional* entry points, not a replacement for the CK / opus
+# rmsnorm2d_* path above: nothing in this file routes to them automatically.
+# Upstream wires them in as a fast path inside rmsnorm2d_fwd_with_dynamicquant
+# and friends; that is deliberately not done here, because the shape and
+# architecture thresholds upstream uses to pick the fast path are calibrated on
+# upstream CDNA and have to be re-measured on HCU before they can gate production
+# traffic (see doc/transplant_github_aiter_ops/, risk R12).
+#
+# Capabilities beyond rmsnorm2d_fwd_with_dynamicquant:
+#   * group_size: 1xG grouped (block) quant instead of per-token only.
+#   * shuffle_scale: transposed / swizzled scale layouts for ASM GEMM consumers.
+#   * e8m0 1-byte block scale (pass a 1-byte scale tensor). gfx938 / gfx946
+#     only -- it pairs with an mxfp8 output, which gfx936 has no hardware for.
+#
+# Constraints:
+#   * hidden size n <= 8192, and input must be 2-D (m, n).
+#   * quant output dtype: i8 everywhere, fp8 on gfx938 / gfx946.
+#   * scale_layout_m32k4 is accepted for signature parity with upstream and
+#     rejected at runtime: it targets a gfx1250 MXFP8 ASM GEMM A-scale layout
+#     that has no consumer on HCU.
+# ============================================================================
+
+
+@compile_ops("module_rmsnorm_quant", develop=True)
+def add_rmsnorm_quant(
+    out: Tensor,
+    input: Tensor,
+    residual_in: Tensor,
+    residual_out: Tensor,
+    scale: Tensor,
+    weight: Tensor,
+    epsilon: float,
+    group_size: int = 0,
+    shuffle_scale: bool = False,
+    gemma_norm: bool = False,
+    scale_layout_m32k4: bool = False,
+) -> None: ...
+
+
+@compile_ops("module_rmsnorm_quant", develop=True)
+def add_rmsnorm(
+    out: Tensor,
+    input: Tensor,
+    residual_in: Tensor,
+    residual_out: Tensor,
+    weight: Tensor,
+    epsilon: float,
+    gemma_norm: bool = False,
+) -> None: ...
+
+
+@compile_ops("module_rmsnorm_quant", develop=True)
+def rmsnorm_quant(
+    out: Tensor,
+    input: Tensor,
+    scale: Tensor,
+    weight: Tensor,
+    epsilon: float,
+    group_size: int = 0,
+    shuffle_scale: bool = False,
+    gemma_norm: bool = False,
+    scale_layout_m32k4: bool = False,
+) -> None: ...
+
+
+@compile_ops("module_rmsnorm_quant", develop=True)
+def rmsnorm(
+    out: Tensor,
+    input: Tensor,
+    weight: Tensor,
+    epsilon: float,
+    gemma_norm: bool = False,
+) -> None: ...

@@ -96,8 +96,10 @@ fi
 if [[ $mode == wheel ]]; then
     echo "### [1/3] 清理历史编译产物"
     # 与原全量构建保持相同清理范围；保留源码和 dist/ 下已有的 wheel。
+    # install_mode 是 setup.py 生成的标记；与 aiter_meta 一起清理，避免重试时
+    # jit.core 在 setup.py 重建元数据前仍按 install 模式读取已删除的目录。
     rm -rf -- aiter/jit/aiter_.so aiter/jit/build aiter/jit/*.so \
-        aiter/jit/jit/build build aiter.egg-info aiter_meta
+        aiter/jit/jit/build build aiter.egg-info aiter_meta aiter/install_mode
     export PREBUILD_KERNELS=1
 else
     echo "### [1/3] 保留历史编译产物，准备开发安装"

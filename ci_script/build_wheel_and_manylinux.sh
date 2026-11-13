@@ -7,6 +7,76 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 echo "Building AITER wheel in ${repo_root}"
 cd "${repo_root}"
 
+export PYTHON="${PYTHON:-python}"
+PYTHON_VERSION="$("${PYTHON}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+
+declare -A NUMPY_VERSIONS=(
+  ["3.8"]="1.21.6"
+  ["3.9"]="1.22.4"
+  ["3.10"]="1.24.3"
+  ["3.11"]="1.26.2"
+  ["3.12"]="1.26.2"
+  ["3.13"]="2.1.2"
+  ["3.14"]="2.3.4"
+)
+declare -A PANDAS_VERSIONS=(
+  ["3.8"]="2.0.3"
+  ["3.9"]="2.2.3"
+  ["3.10"]="2.2.3"
+  ["3.11"]="2.2.3"
+  ["3.12"]="2.2.3"
+)
+
+NUMPY_VERSION="${NUMPY_VERSIONS[$PYTHON_VERSION]:-}"
+PANDAS_VERSION="${PANDAS_VERSIONS[$PYTHON_VERSION]:-}"
+echo "Python ${PYTHON_VERSION}: numpy ${NUMPY_VERSION:-auto}, pandas ${PANDAS_VERSION:-auto}"
+
+PIP_CONSTRAINT="${PIP_CONSTRAINT:-$(mktemp)}"
+export PIP_CONSTRAINT
+# Keep these constraints visible to later pip commands in the parent CI shell.
+printf '%s\n' "numpy${NUMPY_VERSION:+==${NUMPY_VERSION}}" "pandas${PANDAS_VERSION:+==${PANDAS_VERSION}}" > "${PIP_CONSTRAINT}"
+if [[ -n "${TORCH_VERSION:-}" ]]; then
+  printf 'torch==%s\n' "${TORCH_VERSION}" >> "${PIP_CONSTRAINT}"
+fi
+echo "Dependency constraints: $(tr '\n' ' ' < "${PIP_CONSTRAINT}")"
+
+"${PYTHON}" -m pip install "numpy${NUMPY_VERSION:+==${NUMPY_VERSION}}" \
+  --no-cache-dir \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple/
+
+"${PYTHON}" -m pip install packaging -i https://pypi.tuna.tsinghua.edu.cn/simple/
+"${PYTHON}" -m pip install zmq -i https://pypi.tuna.tsinghua.edu.cn/simple/
+"${PYTHON}" -m pip install tabulate -i https://pypi.tuna.tsinghua.edu.cn/simple/
+"${PYTHON}" -m pip install wheel -i https://pypi.tuna.tsinghua.edu.cn/simple/
+"${PYTHON}" -m pip install pyyaml -i https://pypi.tuna.tsinghua.edu.cn/simple/
+"${PYTHON}" -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple/
+"${PYTHON}" -m pip install auditwheel patchelf -i https://pypi.tuna.tsinghua.edu.cn/simple/
+"${PYTHON}" -m pip install setuptools==79.0.1 -i https://pypi.tuna.tsinghua.edu.cn/simple --force-reinstall
+
+"${PYTHON}" -c "import numpy, pandas; pandas.DataFrame([{'ok': 1}]); print(f'numpy {numpy.__version__} / pandas {pandas.__version__} installed successfully')"
+
+hipcc --version
+
+"${PYTHON}" - <<'PY'
+import torch
+
+if torch.version.hip is None:
+    raise RuntimeError("Expected a HIP-enabled Torch build")
+print("torch:", torch.__version__)
+print("hip:", torch.version.hip)
+PY
+
+# Prepare the test runner before NMZ compiles or BW waits for its wheel.
+if [[ "${CI_PIPELINE_SOURCE:-}" == "merge_request_event" ]]; then
+  "${PYTHON}" -m pip install optest -i "${DTK_PIP_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}"
+fi
+
+# BW uses the NMZ wheel after preparing the same environment.
+if [[ "${SKIP_WHEEL_BUILD:-0}" == "1" ]]; then
+  echo "Environment ready; skipping wheel build on BW"
+  exit 0
+fi
+
 echo "Initializing AITER submodules from the current commit..."
 git submodule sync --recursive
 git submodule update --init --recursive
@@ -31,7 +101,7 @@ if [[ "${#wheels[@]}" -ne 1 ]]; then
   exit 1
 fi
 
-torch_path="$(python -c "import torch, os; print(os.path.dirname(torch.__file__))")"
+torch_path="$("${PYTHON}" -c "import torch, os; print(os.path.dirname(torch.__file__))")"
 if [[ -z "${torch_path}" || ! -d "${torch_path}/lib" ]]; then
   echo "Unable to locate the PyTorch library directory" >&2
   exit 1

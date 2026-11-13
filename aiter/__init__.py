@@ -51,11 +51,13 @@ from .jit import core
 # from .ops.enum import *
 from .ops.norm import *
 from .ops.quant import *
-# from .ops.gemm_op_a8w8 import *
+from .ops.gemm_op_a8w8 import gemm_a8w8, gemm_a8w8_CK, gemm_a8w8_blockscale, gemm_a8w8_blockscale_CK
 # from .ops.batched_gemm_op_a8w8 import *
 # from .ops.batched_gemm_op_bf16 import *
 from .ops.aiter_operator import *
 from .ops.activation import *
+from .ops.reduce_sum import *
+from .ops.softmax import softmax, softmax_out
 # from .ops.attention import *
 from .ops.custom import *
 from .ops.custom_all_reduce import *
@@ -86,3 +88,17 @@ from .ops.kvcache_metadata import fused_metadata_kernel_general
 from .ops.blockwise_scaling import *
 from .utility import dtypes,fp4_utils
 from .ops.fused_rmsnorm_rope import *
+from .ops.fused_qk_norm_rope_cache_quant import (
+    fused_qk_norm_rope_2way,
+    fused_qk_norm_rope_cache_block_quant_shuffle,
+    fused_qk_norm_rope_cache_pts_quant_shuffle,
+    fused_qk_norm_rope_cache_quant_shuffle,
+    fused_qk_rmsnorm,
+)
+from .ops.sample import *
+from .ops.moe_routing import (
+    RoutingBuffers, allocate_moe_routing, moe_routing_workspace_size,
+    moe_routing_prepare_out, moe_routing_scatter_out, moe_routing_gather_out,
+    moe_routing_cumsum_out, check_moe_routing_status, moe_init_routing_out,
+    moe_finalize_routing_out,
+)

@@ -15,6 +15,7 @@
 * limitations under the License.
 """
 
+import operator
 import os
 import pickle
 from contextlib import contextmanager
@@ -47,6 +48,8 @@ except Exception as e:
 _AR_TRANSPORT_IDS = {"ipc": 0, "fabric": 1}
 # Match AMD's default ordinary custom-AR cutoff (64 MiB).
 _DEFAULT_AR_MAX_SIZE_MB = 64
+# Preserve the ordinary AR/RS/RMS 64 MiB range with the existing /2 guards.
+_DEFAULT_AR_BUFFER_SIZE_MB = 128
 _LEGACY_AR_MAX_SIZE = 64 * 1024 * 1024
 
 
@@ -59,6 +62,29 @@ def _requested_ar_max_size() -> int:
         raise ValueError("AITER_AR_MAX_SIZE_MB must be a positive integer") from None
     if size_mb <= 0:
         raise ValueError("AITER_AR_MAX_SIZE_MB must be a positive integer")
+    return size_mb * 1024 * 1024
+
+
+def _requested_ar_buffer_size(max_size: Optional[int]) -> int:
+    """Shared staging bytes: explicit argument > capacity env > 128 MiB."""
+    if max_size is not None:
+        try:
+            if isinstance(max_size, bool):
+                raise TypeError
+            size = operator.index(max_size)
+        except TypeError:
+            raise ValueError("max_size must be a positive integer number of bytes") from None
+        if size <= 0:
+            raise ValueError("max_size must be a positive integer number of bytes")
+        return size
+
+    value = os.environ.get("AITER_AR_BUFFER_SIZE_MB", str(_DEFAULT_AR_BUFFER_SIZE_MB))
+    try:
+        size_mb = int(value)
+    except ValueError:
+        raise ValueError("AITER_AR_BUFFER_SIZE_MB must be a positive integer") from None
+    if size_mb <= 0:
+        raise ValueError("AITER_AR_BUFFER_SIZE_MB must be a positive integer")
     return size_mb * 1024 * 1024
 
 
@@ -422,12 +448,11 @@ class CustomAllreduce:
 
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8, 16, 32, 40]
 
-    # max_size: max supported allreduce size
     def __init__(
         self,
         group: ProcessGroup,
         device: Union[int, str, torch.device],
-        max_size=1024 * 1024 * 1024,  # Input staging capacity in bytes (1 GiB).
+        max_size: Optional[int] = None,
         enable_register_for_capturing: bool = True,
     ) -> None:
         """
@@ -436,6 +461,11 @@ class CustomAllreduce:
                 default process group.
             device: the device to bind the CustomAllreduce to. If None,
                 it will be bind to f"cuda:{local_rank}".
+            max_size: positive shared input staging capacity in bytes. None
+                reads AITER_AR_BUFFER_SIZE_MB (MiB), defaulting to 128 MiB.
+                An explicit value overrides that environment variable. The
+                ordinary AR admission limit is configured independently by
+                AITER_AR_MAX_SIZE_MB and remains bounded by max_size // 2.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device, and all communicators in this group
         are in the same node.
@@ -445,6 +475,7 @@ class CustomAllreduce:
         self._ptr = 0
         self.requested_transport = _requested_ar_transport()
         self._all_reduce_max_size = _requested_ar_max_size()
+        max_size = _requested_ar_buffer_size(max_size)
         self.transport = "ipc"
         self.transport_id = _AR_TRANSPORT_IDS["ipc"]
 
@@ -571,16 +602,6 @@ class CustomAllreduce:
             if debug_init:
                 print(f"CUSTOM_AR_STAGE rank={rank} stage={stage}", flush=True)
 
-        # This stores tuples of pointers to buffers from all ranks. RankData
-        # has kMaxRanks=40 pointer slots, so each tuple is always 320 bytes,
-        # including when the active world size is smaller. The fixed 8 MiB pool
-        # therefore holds 26214 tuples; the largest model observed needs fewer
-        # than 10000, so the allocation size itself does not increase.
-        debug_stage("rank_data_begin")
-        self.rank_data = torch.empty(
-            8 * 1024 * 1024, dtype=torch.uint8, device=self.device
-        )
-        debug_stage("rank_data_done")
         self.max_size = max_size
         self.rank = rank
         self.world_size = world_size
@@ -591,17 +612,32 @@ class CustomAllreduce:
         arch = torch.cuda.get_device_properties(self.device).gcnArchName.split(":")[0] if torch.version.hip else ""
         small_capable = self.transport == "ipc" and world_size in (2, 4, 8) and arch in ("gfx936", "gfx938")
         small_configs = [None] * world_size
-        dist.all_gather_object(small_configs, (requested_small_ar, max_size, small_capable), group=self.group)
-        if any(c[:2] != small_configs[0][:2] for c in small_configs):
-            raise ValueError("AITER_AR_SMALL_MESSAGE and max_size must agree across ranks")
+        dist.all_gather_object(
+            small_configs,
+            (requested_small_ar, max_size, self._all_reduce_max_size, small_capable),
+            group=self.group,
+        )
+        if any(c[:3] != small_configs[0][:3] for c in small_configs):
+            raise ValueError(
+                "AITER_AR_SMALL_MESSAGE, resolved max_size (AITER_AR_BUFFER_SIZE_MB), "
+                "and AITER_AR_MAX_SIZE_MB must agree across ranks"
+            )
         small_modes = {"off": 0, "ll": 1, "ll128": 2, "auto": 3}
         if requested_small_ar not in small_modes:
             raise ValueError("AITER_AR_SMALL_MESSAGE must be off, ll, ll128, or auto")
+        # RankData has kMaxRanks=40 pointer slots per tuple (320 bytes),
+        # including smaller groups. The fixed 8 MiB pool holds 26214 tuples;
+        # the largest model observed needs fewer than 10000.
+        debug_stage("rank_data_begin")
+        self.rank_data = torch.empty(
+            8 * 1024 * 1024, dtype=torch.uint8, device=self.device
+        )
+        debug_stage("rank_data_done")
         self.small_ar_mode = "off"
         small_bytes = 0
         meta_bytes = ops.meta_size() + 2 * max_size
         # All ranks must choose the same protocol, including heterogeneous groups.
-        if requested_small_ar != "off" and all(c[2] for c in small_configs):
+        if requested_small_ar != "off" and all(c[3] for c in small_configs):
             small_bytes = ops.small_ar_scratch_size(world_size)
             if max_size >= small_bytes:
                 self.small_ar_mode = requested_small_ar

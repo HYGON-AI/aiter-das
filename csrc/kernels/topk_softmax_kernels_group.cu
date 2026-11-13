@@ -12,6 +12,7 @@
  */
 
 #include "dispatch_utils.h"
+#include "hip_kernel_launch.h"
 #include "hip_reduce.h"
 #include "py_itfs_common.h"
 #include "warp_sort.h"
@@ -462,6 +463,20 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
                 }
             }
 
+            // The DPP sequence below covers groups of at most 8 lanes. For
+            // NUM_GRP=1/2/4, merge both maxima across the full 64/32/16 lanes.
+            if constexpr(THREAD_PER_GRP > 8)
+            {
+#pragma unroll
+                for(int offset = 1; offset < THREAD_PER_GRP; offset *= 2)
+                {
+                    const float remote_max1 = __shfl_xor(max1, offset, THREAD_PER_GRP);
+                    const float remote_max2 = __shfl_xor(max2, offset, THREAD_PER_GRP);
+                    max2 = fmaxf(fminf(max1, remote_max1), fmaxf(max2, remote_max2));
+                    max1 = fmaxf(max1, remote_max1);
+                }
+            }
+            else
             {
                 constexpr int row_mask    = 0xf;
                 constexpr int bank_mask   = 0xf;
@@ -1056,8 +1071,11 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             if(need_renorm)
             {
                 sum    = multithread_reduce(topk_v, [&](auto x_, auto y_) { return x_ + y_; }, 8);
-                // Note: routed_scaling_factor for fused_shared_experts. Now, only unfunsed version supported.
                 topk_v = topk_v *  routed_scaling_factor * __builtin_amdgcn_rcpf(sum);
+            }
+            else if(routed_scaling_factor != 1.0f)
+            {
+                topk_v *= routed_scaling_factor;
             }
             topk_weights[token_idx * stride_tk + threadIdx.x] = topk_v;
             topk_ids[token_idx * stride_tk + threadIdx.x]     = topk_i;
@@ -1088,6 +1106,10 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                 sum    = multithread_reduce(topk_v, [&](auto x_, auto y_) { return x_ + y_; }, 8);
                 topk_v = topk_v *  routed_scaling_factor * __builtin_amdgcn_rcpf(sum);
             }
+            else if(routed_scaling_factor != 1.0f)
+            {
+                topk_v *= routed_scaling_factor;
+            }
             topk_weights[token_idx * stride_tk + threadIdx.x] = topk_v;
             topk_ids[token_idx * stride_tk + threadIdx.x]     = topk_i;
         }
@@ -1097,7 +1119,8 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
 } // namespace aiter
 
 #define LAUNCH_KERNEL()                                    \
-    switch(num_experts % 4)                                \
+    /* Vectors must not straddle expert-group boundaries. */ \
+    switch((num_experts / num_expert_group) % 4)            \
     {                                                      \
     case 0:                                                \
         using vec4_type = ck_tile::ext_vector_t<float, 4>; \
@@ -1154,7 +1177,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
 
 #define LAUNCHER_biased_grouped_topk_kernel(VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)      \
     VLLM_DISPATCH_FLOATING_TYPES(gating_output.scalar_type(), "biased_grouped_topk_kernel", [&] {  \
-        hipLaunchKernelGGL(                                                                        \
+        aiter::launch_kernel(aiter::launch_policy::moe_topk,                                                                         \
             (aiter::                                                                               \
                  grouped_topk_kernel<scalar_t, VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax>), \
             dim3(grid),                                                                            \
@@ -1175,7 +1198,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
 
 #define LAUNCHER_grouped_topk_kernel(VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)             \
     VLLM_DISPATCH_FLOATING_TYPES(gating_output.scalar_type(), "grouped_topk_kernel", [&] {         \
-        hipLaunchKernelGGL(                                                                        \
+        aiter::launch_kernel(aiter::launch_policy::moe_topk,                                                                         \
             (aiter::                                                                               \
                  grouped_topk_kernel<scalar_t, VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax>), \
             dim3(grid),                                                                            \
@@ -1198,7 +1221,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
     VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)                             \
     VLLM_DISPATCH_FLOATING_TYPES(                                                 \
         gating_output.scalar_type(), "biased_grouped_topk_opt_sort_kernel", [&] { \
-            hipLaunchKernelGGL((aiter::grouped_topk_opt_sort_kernel<scalar_t,     \
+            aiter::launch_kernel(aiter::launch_policy::moe_topk, (aiter::grouped_topk_opt_sort_kernel<scalar_t,     \
                                                                     VEC_F,        \
                                                                     NUM_GRP,      \
                                                                     need_renorm,  \

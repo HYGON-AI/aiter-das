@@ -70,6 +70,36 @@ vllm_fused_sigmoid_gating_delta_rule_update(
     bool is_kda = false);
 
 AITER_CPP_TORCH_API std::vector<torch::Tensor>
+sglang_fused_sigmoid_gating_delta_rule_update(
+    const torch::Tensor& A_log,
+    const torch::Tensor& a,
+    const torch::Tensor& dt_bias,
+    float softplus_beta,
+    float softplus_threshold,
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& b,
+    const std::optional<torch::Tensor>& initial_state_source = std::nullopt,
+    const std::optional<torch::Tensor>& initial_state_indices = std::nullopt,
+    const std::optional<float>& scale = std::nullopt,
+    bool use_qk_l2norm_in_kernel = false,
+    const std::optional<torch::Tensor>& cu_seqlens = std::nullopt,
+    bool is_kda = false,
+    const std::optional<float>& lower_bound = std::nullopt,
+    float beta_scale = 1.0f,
+    bool disable_state_update = false,
+    const std::optional<torch::Tensor>& intermediate_states_buffer = std::nullopt,
+    const std::optional<torch::Tensor>& intermediate_state_indices = std::nullopt,
+    int64_t cache_steps = 0,
+    const std::optional<torch::Tensor>& retrieve_parent_token = std::nullopt,
+    bool cache_replayssm_inputs = false,
+    const std::optional<torch::Tensor>& replayssm_rawv = std::nullopt,
+    const std::optional<torch::Tensor>& replayssm_rawk = std::nullopt,
+    const std::optional<torch::Tensor>& replayssm_g = std::nullopt,
+    const std::optional<torch::Tensor>& replayssm_beta = std::nullopt);
+
+AITER_CPP_TORCH_API std::vector<torch::Tensor>
 aiter_fused_recurrent_gated_delta_rule_packed_decode(
     const torch::Tensor& mixed_qkv,
     const torch::Tensor& a,

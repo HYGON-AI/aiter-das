@@ -112,9 +112,14 @@ torch::Tensor
         )
 
         INSTANCE_template = """// SPDX-License-Identifier: MIT
+
+// FP8 has no native CK implementation on gfx936. Keep the host symbols
+// and only instantiate device kernels for supported targets in fat binaries.
+#if !defined(__HIP_DEVICE_COMPILE__) || !defined(AITER_W8A8_HCU) || \\
+    defined(__gfx92a__) || defined(__gfx938__) || defined(__gfx946__)
  
 
-#include "{name}.cuh"
+#include "../impl/{name}.cuh"
 
 template torch::Tensor
 {name}<{dtypes}>(
@@ -125,9 +130,11 @@ template torch::Tensor
     torch::Tensor &Y
     );
 
+#endif
 """
-        INSTANCE_dFP32_eBF16 = INSTANCE_template.format(name=k.name, dtypes="F32, B16")
-        INSTANCE_dFP32_eFP16 = INSTANCE_template.format(name=k.name, dtypes="F32, F16")
+        scale_type = "F32"
+        INSTANCE_dFP32_eBF16 = INSTANCE_template.format(name=k.name, dtypes=f"{scale_type}, B16")
+        INSTANCE_dFP32_eFP16 = INSTANCE_template.format(name=k.name, dtypes=f"{scale_type}, F16")
         # TODO: dFP8_eFP8
 
         if self.istune:
@@ -292,10 +299,33 @@ if __name__ == "__main__":
     #         same: [same as out]"
     # )
 
+    parser.add_argument("--hcu", action="store_true", help="generate native HCU 16x16 MMAC instances")
     args = parser.parse_args()
     codegen = gemm_a8w8_blockscale_codegen(args.working_path, args.tune)
 
-    if args.tune:
+    if args.hcu:
+        hcu_kernels = {}
+        hcu_kernels[-2] = kernelInstance(
+            64, 1, 32, 32, 16, 16, 128, 8, 8, 16, 16, 1, 1,
+            [16, 4, 1], [16, 4, 1], 1, 1, [1, 16, 1, 4], [4], "Intrawave", 1)
+        # Selected on gfx938, then validated independently on gfx946.
+        # The MX32 instances keep NWaves * NPerXDL <= ScaleBlockN.
+        hcu_kernels.update({
+            -10: kernelInstance(64, 1, 128, 128, 16, 16, 128, 16, 16, 16, 16, 1, 1,
+                [8, 8, 1], [8, 8, 1], 1, 1, [1, 16, 1, 4], [4], "Intrawave", 1),
+            -11: kernelInstance(64, 1, 128, 128, 16, 32, 128, 16, 16, 16, 16, 1, 2,
+                [8, 8, 1], [8, 8, 1], 1, 1, [1, 16, 1, 4], [4], "Intrawave", 1),
+            -13: kernelInstance(256, 1, 128, 128, 64, 64, 128, 16, 16, 16, 16, 1, 4,
+                [8, 32, 1], [8, 32, 1], 1, 1, [1, 64, 1, 4], [4], "Intrawave", 1),
+            -20: kernelInstance(64, 1, 32, 32, 16, 32, 128, 8, 8, 16, 16, 1, 2,
+                [16, 4, 1], [16, 4, 1], 1, 1, [1, 16, 1, 4], [4], "Intrawave", 1),
+            -22: kernelInstance(256, 1, 32, 32, 64, 32, 128, 8, 8, 16, 16, 1, 2,
+                [16, 16, 1], [16, 16, 1], 1, 1, [1, 64, 1, 4], [4], "Intrawave", 1),
+            -23: kernelInstance(64, 1, 32, 32, 16, 16, 256, 8, 8, 16, 16, 1, 1,
+                [32, 2, 1], [32, 2, 1], 1, 1, [1, 16, 1, 4], [4], "Intrawave", 1),
+        })
+        codegen.gen_instances(hcu_kernels)
+    elif args.tune:
         codegen.gen_instances(kernels_list)
     else:
         codegen.gen_instances(get_tune_dict(args.tune_file))

@@ -82,8 +82,8 @@ Meta derive_meta(const torch::Tensor& q,
     TORCH_CHECK(meta.h_qk > 0 && meta.h_v > 0, "head counts must be positive");
     TORCH_CHECK(meta.h_v % meta.h_qk == 0, "h_v must be a multiple of h_qk");
     const int64_t ratio = meta.h_v / meta.h_qk;
-    TORCH_CHECK(ratio == 1 || ratio == 2 || ratio == 4,
-                "CK GDN supports h_v / h_qk in {1,2,4}");
+    TORCH_CHECK(ratio == 1 || ratio == 2 || ratio == 3 || ratio == 4,
+                "CK GDN supports h_v / h_qk in {1,2,3,4}");
 
     if(cu_seqlens.has_value())
     {

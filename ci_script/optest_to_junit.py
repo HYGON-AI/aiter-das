@@ -159,7 +159,7 @@ def build_junit(data: dict, log_dir: Path) -> str:
                 message=f"{name}: {row_failed}/{row.get('total', 0)} failed",
             )
             failure.text = _read_error_context(log_dir, f"acc/{name}.log")
-        if row_skipped > 0:
+        if row_skipped > 0 and row_passed == 0 and row_failed == 0:
             skipped += 1
             SubElement(tc, "skipped",
                        message=f"{name}: {row_skipped}/{row.get('total', 0)} skipped")

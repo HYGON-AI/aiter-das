@@ -225,22 +225,28 @@ def per_group_quant_hip(
     transpose_scale=False,
     num_rows: Optional[torch.tensor] = None,
     num_rows_factor=1,
+    scale_type=dtypes.fp32,
 ):
     shape = x.shape
+    if group_size not in (32, 64, 128):
+        raise ValueError("group_size must be 32, 64 or 128")
+    if x.ndim < 2 or shape[-1] == 0 or shape[-1] % group_size:
+        raise ValueError("input must have at least two dimensions and complete groups")
+    if quant_dtype not in (torch.int8, torch.float8_e4m3fn):
+        raise ValueError("group quant output must be INT8 or E4M3FN")
+    if scale_type not in (dtypes.fp32, dtypes.fp8_e8m0):
+        raise ValueError("group scale must be FP32 or E8M0")
+    if scale_type != dtypes.fp32 and quant_dtype != torch.float8_e4m3fn:
+        raise ValueError("E8M0 scales require E4M3FN output")
     device = x.device
     if scale is None:
         scale = torch.empty(
-            (*shape[:-1], shape[-1] // group_size), dtype=dtypes.fp32, device=device
+            (*shape[:-1], shape[-1] // group_size), dtype=scale_type, device=device
         )
     else:
         raise ValueError("unsupported: static per token quant")
-    assert group_size in [
-        32,
-        64,
-        128,
-    ], f"unsupported group size {group_size=}, only support [32, 64, 128]"
     y = torch.empty(shape, dtype=quant_dtype, device=device)
-    dynamic_per_token_scaled_quant(
+    _dynamic_per_group_quant(
         y,
         x.view(-1, group_size),
         scale,
@@ -259,8 +265,11 @@ def per_1x32_f4_quant_hip(
     num_rows: Optional[torch.tensor] = None,
     num_rows_factor=1,
 ):
+    if x.ndim != 2 or x.shape[-1] == 0 or x.shape[-1] % 32:
+        raise ValueError("MXFP4 input must be a matrix with complete 32-element groups")
     m, n = x.shape
-    assert quant_dtype == dtypes.fp4x2
+    if quant_dtype != dtypes.fp4x2:
+        raise ValueError("MXFP4 output must use packed FP4 storage")
     assert n % 2 == 0
     device = x.device
     if scale is None:
@@ -383,6 +392,18 @@ def dynamic_per_token_scaled_quant(
 ) -> None: ...
 
 
+@compile_ops("module_quant", fc_name="dynamic_per_group_scaled_quant")
+def _dynamic_per_group_quant(
+    out: Tensor,
+    input: Tensor,
+    scales: Tensor,
+    scale_ub: Optional[Tensor] = None,
+    shuffle_scale: bool = False,
+    num_rows: Optional[Tensor] = None,
+    num_rows_factor: int = 1,
+) -> None: ...
+
+
 @compile_ops("module_quant")
 def dynamic_per_group_scaled_quant_fp4(
     out: Tensor,
@@ -470,3 +491,116 @@ def moe_swiglu_dynamic_quant_wrapper(
         beta,
     )
     return output, scales
+
+
+# ============================================================================
+# DSV4 rotate / rope+rotate activation (module_dsv4_rotate_quant), ported from
+# aiter-github.
+#
+# HCU cuts (doc/transplant_github_aiter_ops/): upstream's three fp4 entry
+# points (rotate_activation_fp4quant, rope_rotate_activation_fp4quant,
+# rmsnorm_rope_rotate_activation_fp4quant_kvcache) are not ported -- no HCU
+# target has e2m1 hardware -- so `rope_rotate_activation` dispatches on bf16/
+# fp16 and fp8 only. The fp8 entry needs gfx938 / gfx946 / gfx92a; on gfx936 it
+# is not compiled into the module at all.
+#
+# Constraints: input is [..., head_num, dim] with dim in {128, 256, 512, 1024}
+# and head_num a power of two; `positions` is int64 with one entry per token;
+# rope_dim must be even and divisible by the kernel's vec_size (16, or 32 at
+# dim == 1024).
+# ============================================================================
+
+
+@compile_ops("module_dsv4_rotate_quant", fc_name="rotate_activation", develop=True)
+def _rotate_activation_bf16(out: Tensor, input: Tensor) -> None:
+    """Hadamard-rotate ``input`` into ``out`` (same dtype/shape)."""
+
+
+@compile_ops("module_dsv4_rotate_quant", fc_name="rope_rotate_activation", develop=True)
+def _rope_rotate_activation_bf16(
+    out: Tensor,
+    input: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    rope_dim: int,
+    do_rotate_act: bool = True,
+) -> None:
+    """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then
+    Hadamard-rotate."""
+
+
+@compile_ops(
+    "module_dsv4_rotate_quant", fc_name="rope_rotate_activation_fp8quant", develop=True
+)
+def _rope_rotate_activation_fp8quant(
+    out: Tensor,
+    scale: Tensor,
+    input: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    rope_dim: int,
+    group_size: int = 128,
+    do_rotate_act: bool = True,
+) -> None:
+    """Apply interleaved RoPE to trailing ``rope_dim``, Hadamard-rotate, then
+    fp8-quantize: ``out`` is fp8 and ``scale`` (``[m, dim // group_size]`` fp32)
+    receives the per-(row, ``1 x group_size``) block scales
+    ``scale = absMax / fp8_max``. Needs gfx938 / gfx946.
+    """
+
+
+def rotate_activation(out: Tensor, input: Tensor) -> None:
+    """Hadamard-rotate ``input`` into ``out``. bf16/fp16 only on this fork."""
+    _rotate_activation_bf16(out, input)
+
+
+def rope_rotate_activation(
+    out: Tensor,
+    input: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    rope_dim: int,
+    out_scale: Optional[Tensor] = None,
+    group_size: Optional[int] = None,
+    do_rotate_act: bool = True,
+) -> None:
+    """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then
+    Hadamard-rotate, dispatching on ``out.dtype``:
+
+    - bf16/fp16 ``out``: plain rope+hadamard in place (``out_scale`` ignored).
+    - ``fp8`` ``out``: per-(row, 1xGROUP) fp8-quantize into ``out`` + fp32
+      ``out_scale`` (required; ``group_size`` defaults to 128). gfx938 / gfx946
+      only.
+
+    When ``do_rotate_act`` is False the Hadamard rotate is skipped and only RoPE
+    (plus any quantization) is applied.
+
+    Upstream also accepts an ``fp4x2`` ``out`` with an e8m0 scale, plus a
+    ``shuffle_scale`` / ``round_rope`` pair that only that path uses. Neither is
+    available here: no HCU target has fp4 hardware.
+    """
+    if out.dtype == dtypes.fp8:
+        assert out_scale is not None, "fp8 rope_rotate_activation needs out_scale"
+        _rope_rotate_activation_fp8quant(
+            out,
+            out_scale,
+            input,
+            cos,
+            sin,
+            positions,
+            rope_dim,
+            group_size=128 if group_size is None else group_size,
+            do_rotate_act=do_rotate_act,
+        )
+    elif out.dtype == dtypes.fp4x2:
+        raise NotImplementedError(
+            "fp4x2 rope_rotate_activation is not available on gfx936/gfx938/gfx946: "
+            "no e2m1 hardware support (see doc/transplant_github_aiter_ops/)"
+        )
+    else:
+        _rope_rotate_activation_bf16(
+            out, input, cos, sin, positions, rope_dim, do_rotate_act
+        )

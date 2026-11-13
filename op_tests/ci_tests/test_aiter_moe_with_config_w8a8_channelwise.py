@@ -17,6 +17,7 @@ from aiter.moe import (
     MoeQuantType,
 )
 from aiter.ops.quant import pertoken_quant
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.moe_c_golden import compare_tensors, run_fp8_channelwise_golden
 import aiter
 
@@ -317,6 +318,12 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", choices=("fp8", "bf16", "fp16"), default="fp8")
     parser.add_argument("--output", default="w8a8_channelwise.csv")
     args = parser.parse_args()
+    arch = get_gfx().lower()
+    if arch == "gfx936" and args.quant == "fp8":
+        aiter.logger.info(
+            f"SKIP fp8_w8a8 channel-wise: architecture {arch} does not support fp8"
+        )
+        raise SystemExit(0)
     backend = MoeSolutionType.MOE_C if args.backend == "moe-c" else None
 
     quant_type = MoeQuantType.FP8_W8A8 if args.quant == "fp8" else MoeQuantType.W8A8

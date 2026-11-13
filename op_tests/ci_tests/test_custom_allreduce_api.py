@@ -1,6 +1,8 @@
 """CAR collectives, fused operators, transport and input reuse contracts at TP2/4/8.
 
-Run with python and no arguments for the TP2 + TP4 CI matrix.
+Run with python and no arguments for the topology-admitted TP2 + TP4 CI matrix.
+Automatic TP4 is reported as skipped when GPUs or HIP IPC connectivity are
+insufficient. Topology query errors fail; an explicit --tp-size stays strict.
 AITER_AR_TP_SIZE limits the default matrix to the CI GPU allocation (2 or 4).
 TP8 requires explicit --tp-size 8 or torchrun. Explicit torchrun accepts one --suite.
 """
@@ -494,7 +496,12 @@ def run_transport(args):
     ca=None
     try:
         os.environ['AITER_AR_TRANSPORT']='auto'
-        ca=car.CustomAllreduce(dist.group.WORLD,device,max_size=16*1024*1024,enable_register_for_capturing=False)
+        with patch.dict(os.environ):
+            os.environ.pop('AITER_AR_BUFFER_SIZE_MB', None)
+            os.environ.pop('AITER_AR_MAX_SIZE_MB', None)
+            ca=car.CustomAllreduce(dist.group.WORLD,device,enable_register_for_capturing=False)
+        assert ca.max_size == ca._pool['input'].max_size == 128 * 1024**2
+        assert ca._all_reduce_max_size == 64 * 1024**2
         assert not ca.disabled and ca.transport=='ipc'
         for dtype in (torch.float16,torch.bfloat16,torch.float32):
             x=torch.empty((4,512),device=device,dtype=dtype)
@@ -512,9 +519,28 @@ def run_transport(args):
         if args.tp6:
             print('CAR_TP6_PASS',rank,world,flush=True)
             return
+        os.environ['AITER_AR_TRANSPORT']='ipc'
+        # Configuration contracts belong to initialization; large-message and
+        # Graph boundaries are already covered by the existing AR suites.
+        for env_value, explicit, expected in [('32', None, 32), ('invalid', 16 * 1024**2, 16)]:
+            with patch.dict(os.environ, {'AITER_AR_BUFFER_SIZE_MB': env_value, 'AITER_AR_MAX_SIZE_MB': '16'}):
+                ca=car.CustomAllreduce(dist.group.WORLD,device,max_size=explicit,enable_register_for_capturing=False)
+                assert not ca.disabled
+                assert ca.max_size == ca._pool['input'].max_size == expected * 1024**2
+                assert ca._all_reduce_max_size == 16 * 1024**2
+                torch.cuda.synchronize();dist.barrier();ca.close();ca=None
+        with patch.dict(os.environ, {'AITER_AR_BUFFER_SIZE_MB': '0'}):
+            expect_value_error(lambda: car.CustomAllreduce(dist.group.WORLD,device))
+        for key in ('AITER_AR_BUFFER_SIZE_MB', 'AITER_AR_MAX_SIZE_MB'):
+            with patch.dict(os.environ, {'AITER_AR_BUFFER_SIZE_MB': '32', 'AITER_AR_MAX_SIZE_MB': '16'}):
+                os.environ[key] = '32' if rank == 0 else '64'
+                with patch.object(car.IPCBufferPool, 'create') as allocate:
+                    expect_value_error(lambda: car.CustomAllreduce(dist.group.WORLD,device))
+                    allocate.assert_not_called()
+            dist.barrier()
+        print('CAR_CONFIG_CONTRACTS_PASS', rank, world, flush=True)
         # Inject one failed rank at three native resource phases; all ranks
         # must leave initialization disabled and release their allocations.
-        os.environ['AITER_AR_TRANSPORT']='ipc'
         for owner,method in ((car.IPCBufferPool,'create'),(car.IPCBufferPool,'get_local_meta'),(car.ops,'init_custom_ar')):
             original=getattr(owner,method)
             def injected(*a,**kw):
@@ -650,8 +676,16 @@ def run_ar_boundaries(args):
                              enable_register_for_capturing=True)
         assert not ca.disabled and ca.transport == 'ipc'
         requested = os.environ.get('AITER_AR_SMALL_MESSAGE', 'off')
-        if requested != 'off':
-            assert ca.small_ar_mode == requested, (ca.small_ar_mode, requested)
+        # Unsupported ranks must keep the traditional path even for auto/LL.
+        # On supported homogeneous groups, still require the requested mode.
+        arch = torch.cuda.get_device_properties(local).gcnArchName.split(':')[0]
+        capabilities = [None] * world
+        dist.all_gather_object(capabilities, arch in ('gfx936', 'gfx938'))
+        expected_mode = requested if all(capabilities) else 'off'
+        assert ca.small_ar_mode == expected_mode, (arch, ca.small_ar_mode, expected_mode)
+        print('AR_SMALL_MODE_RESULT', json.dumps(dict(rank=rank, arch=arch,
+              requested=requested, effective=ca.small_ar_mode,
+              expected=expected_mode, capabilities=capabilities)), flush=True)
         empty = torch.empty(0, device='cuda', dtype=torch.float16)
         assert not ca.should_custom_ar(empty)
         expect_value_error(lambda: ca.all_reduce(empty))
@@ -792,20 +826,32 @@ def run_ar_boundaries(args):
             else:
                 raise AssertionError('staging capacity overflow was accepted')
             print('AR_INPUT_CAPACITY_BOUNDARY_PASS',rank,flush=True)
-            expect_value_error(lambda: ops.configure_small_ar(ca._ptr, 64 << 20,
-                               ca._pool['meta'].max_size, 3))
-            print('AR_SMALL_CAPACITY_FALLBACK_PASS',rank,flush=True)
+            if arch in ('gfx936', 'gfx938'):
+                expect_value_error(lambda: ops.configure_small_ar(ca._ptr, 64 << 20,
+                                   ca._pool['meta'].max_size, 3))
+                print('AR_SMALL_CAPACITY_FALLBACK_PASS',rank,flush=True)
+            else:
+                # Native configuration is a no-op on unsupported local targets.
+                ops.configure_small_ar(ca._ptr, 64 << 20, ca._pool['meta'].max_size, 3)
+                print('AR_UNSUPPORTED_SMALL_CONFIG_NOOP_PASS',rank,arch,flush=True)
+            torch.testing.assert_close(ca.custom_all_reduce(tiny),
+                                       torch.full_like(tiny,world*(world+1)/2),rtol=0,atol=0)
             ca.close()
             ca = None
             # Simulate one unsupported participant in the capability exchange;
             # all ranks must fall back before allocating or launching LL.
             gather = dist.all_gather_object
+            capability_injected = False
             def one_unsupported(outputs, value, *args, **kwargs):
-                if isinstance(value, tuple) and len(value) == 3 and value[0] == requested:
-                    value = (value[0], value[1], value[2] and rank != 0)
+                nonlocal capability_injected
+                if isinstance(value, tuple) and len(value) == 4 and value[0] == requested:
+                    # Keep mode, capacity and admission limit identical across ranks.
+                    value = (*value[:3], value[3] and rank != 0)
+                    capability_injected = True
                 return gather(outputs, value, *args, **kwargs)
             with patch.object(dist, 'all_gather_object', side_effect=one_unsupported):
                 ca = CustomAllreduce(dist.group.WORLD, local, max_size=64 << 20)
+            assert capability_injected, 'capability exchange was not intercepted'
             assert not ca.disabled and ca.small_ar_mode == 'off'
             torch.testing.assert_close(ca.custom_all_reduce(tiny),
                                        torch.full_like(tiny,world*(world+1)/2),rtol=0,atol=0)
@@ -971,6 +1017,27 @@ def run_job(command, env, log_path, timeout):
             return 124, True
 
 
+def automatic_tp_skips(args, tp_sizes, available):
+    """Skip only known unsupported automatic groups, never a probe failure."""
+    if args.tp_size is not None or args.tp6:
+        return {}
+    import torch
+    skipped = {}
+    for tp in tp_sizes:
+        if available < tp:
+            skipped[tp] = dict(reason=f'TP{tp} requires {tp} visible GPUs, found {available}')
+        elif tp > 2 and args.transport == 'ipc' and torch.version.hip:
+            # Reuse the runtime predicate, including HIP/ROCR visibility mapping.
+            # Do not turn an import/SMI/identity error into a successful CI skip.
+            from aiter.dist.device_communicators.topology import (
+                _device_pci_bus_id, _query_hsl_connectivity)
+            bus_ids = [_device_pci_bus_id(torch.device('cuda', i)) for i in range(tp)]
+            if not _query_hsl_connectivity(bus_ids):
+                skipped[tp] = dict(reason='HIP IPC requires type=2, hops=1 for every GPU pair',
+                                   devices=bus_ids)
+    return skipped
+
+
 def launch_ci(args, parser):
     try:
         allocation = int(os.environ.get('AITER_AR_TP_SIZE', '4'))
@@ -989,21 +1056,43 @@ def launch_ci(args, parser):
         return
     import torch
     available = torch.cuda.device_count()
-    if available < max(tp_sizes):
-        parser.error(f'TP{max(tp_sizes)} requires {max(tp_sizes)} visible GPUs, found {available}; '
+    required = max(tp_sizes) if args.tp_size is not None or args.tp6 else min(tp_sizes)
+    if available < required:
+        parser.error(f'TP{required} requires {required} visible GPUs, found {available}; '
                      'select GPUs with HIP_VISIBLE_DEVICES or request --tp-size 2')
     root = Path(args.output).resolve()
     root.mkdir(parents=True, exist_ok=True)
     run_dir = Path(tempfile.mkdtemp(prefix='run-', dir=root))
-    report = dict(tp_sizes=tp_sizes, status='running', planned_jobs=len(jobs), jobs=[])
+    report = dict(tp_sizes=tp_sizes, status='running', planned_jobs=len(jobs),
+                  executed_jobs=0, skipped_jobs=0, jobs=[])
     report_path = run_dir / 'summary.json'
 
     def save_report():
         report_path.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
 
     save_report()
-    print(f'CAR_CI_START TP={tp_sizes} jobs={len(jobs)} report={report_path}', flush=True)
+    try:
+        skipped = automatic_tp_skips(args, tp_sizes, available)
+    except Exception as exc:
+        report.update(status='failed', preflight_error=f'{type(exc).__name__}: {exc}')
+        save_report()
+        print(f'CAR_CI_PREFLIGHT_FAIL {report["preflight_error"]} report={report_path}', flush=True)
+        raise
+    report['active_tp_sizes'] = [tp for tp in tp_sizes if tp not in skipped]
+    report['skipped_tp_sizes'] = skipped
+    skip_count = sum(tp in skipped for tp, _, _, _ in jobs)
+    save_report()
+    print(f'CAR_CI_START TP={report["active_tp_sizes"]} jobs={len(jobs)-skip_count} '
+          f'skipped={skip_count} planned={len(jobs)} report={report_path}', flush=True)
     for tp, suite, mode, command in jobs:
+        if tp in skipped:
+            report['jobs'].append(dict(tp=tp, suite=suite, small_message=mode, status='skipped',
+                command=command, workers=[], **skipped[tp]))
+            report['skipped_jobs'] += 1
+            save_report()
+            print(f'CAR_CI_JOB_SKIP tp={tp} suite={suite} mode={mode} '
+                  f'reason={skipped[tp]["reason"]}', flush=True)
+            continue
         log_path = run_dir / f'tp{tp}_{suite}_{mode}.log'
         rank_dir = run_dir / f'tp{tp}_{suite}_{mode}'
         rank_dir.mkdir()
@@ -1023,6 +1112,7 @@ def launch_ci(args, parser):
         report['jobs'].append(dict(tp=tp, suite=suite, small_message=mode, status='passed' if passed else 'failed',
             returncode=rc, timed_out=timed_out, elapsed_s=time.monotonic()-started,
             command=command, log=str(log_path), workers=records))
+        report['executed_jobs'] += 1
         report['status'] = 'running' if passed else 'failed'
         save_report()
         print(f'CAR_CI_JOB_{"PASS" if passed else "FAIL"} tp={tp} suite={suite} mode={mode} log={log_path}', flush=True)
@@ -1031,7 +1121,8 @@ def launch_ci(args, parser):
             raise SystemExit(rc if rc > 0 else 1)
     report['status'] = 'passed'
     save_report()
-    print(f'CAR_CI_PASS jobs={len(jobs)} report={report_path}', flush=True)
+    print(f'CAR_CI_PASS jobs={report["executed_jobs"]} skipped={report["skipped_jobs"]} '
+          f'report={report_path}', flush=True)
 
 
 def worker_provenance(args):
@@ -1058,7 +1149,8 @@ def main():
     parser.add_argument('--register', choices=['off', 'on', 'both'], default='both')
     parser.add_argument('--tp6', action='store_true')
     parser.add_argument('--tp-size', type=int, choices=[2, 4, 8],
-                        help='run one TP size; default runs TP2 + TP4, limited by AITER_AR_TP_SIZE')
+                        help='strictly require one TP size; default selects TP2 + TP4, limited by '
+                             'AITER_AR_TP_SIZE, visible GPUs and HIP IPC topology')
     parser.add_argument('--fabric-disabled', action='store_true')
     parser.add_argument('--small-message', choices=['off', 'auto', 'll', 'll128', 'both'],
                         help='all defaults to off/auto for AR suites and off for other suites; '

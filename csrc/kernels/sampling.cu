@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 #include "sampling.h"
+#include "hip_kernel_launch.h"
+#include <cmath>
+#include <limits>
 
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
@@ -10,12 +13,11 @@
 
 #include <hip/hip_runtime.h>
 #include <hipcub/hipcub.hpp>
-#include <hiprand.h>
-#include <hiprand_kernel.h>
+#include <hiprand/hiprand.h>
+#include <hiprand/hiprand_kernel.h>
 
-// DTK's warp-sync intrinsics require HIP_ENABLE_WARP_SYNC_BUILTINS; fall back
-// to the non-sync variants (behaviorally equivalent on AMD, warps execute
-// lock-step within a wavefront).
+// Use the non-sync intrinsics when synchronized variants are unavailable.
+// All lanes follow the same wavefront control flow at these call sites.
 #ifndef __shfl_up_sync
 #define __shfl_up_sync(mask, var, delta, ...) __shfl_up(var, delta)
 #endif
@@ -170,6 +172,22 @@ struct vec_t<float, vec_size> {
     cast_store_impl(ptr, *this);
   }
 };
+
+template <size_t VEC_SIZE, typename T>
+__INLINE__ void load_probability_vector(vec_t<float, VEC_SIZE>& values,
+                                        const T* row, uint32_t column, uint32_t d) {
+  values.fill(0);
+  if (column >= d) return;
+  const T* ptr = row + column;
+  if (d - column >= VEC_SIZE && reinterpret_cast<uintptr_t>(ptr) % 16 == 0) {
+    values.cast_load(ptr);
+  } else {
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      if (j < d - column) values[j] = static_cast<float>(ptr[j]);
+    }
+  }
+}
 
 template <typename T>
 struct ValueCount {
@@ -329,9 +347,18 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
     for (uint32_t offset = HCU_WARP_SIZE / 2; offset > 0; offset /= 2) {
       lane_max = fmaxf(lane_max, __shfl_xor_sync(0xffffffffffffffff, lane_max, offset));
     }
+#if defined(__gfx946__)
+    // Avoid signed shared-memory atomics in the gfx946 execution path.
+    float block_max = BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(
+                          temp_storage->block_prim.reduce).Reduce(lane_max, MaxReduceOp{});
+    __syncthreads();
+    if (tx == 0) temp_storage->max_val = fmaxf(temp_storage->max_val, block_max);
+    __syncthreads();
+#else
     if (tx % HCU_WARP_SIZE == 0) {
       atomicMax((int*)&temp_storage->max_val, __float_as_int(lane_max));
     }
+#endif
   }
   float aggregate_local =
       BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce)
@@ -362,6 +389,17 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
       greater_than_u[j] = (inclusive_cdf[j] + aggregate > u) && valid[j];
     }
 
+#if defined(__gfx946__)
+    int first = d;
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      if (greater_than_u[j]) first = min(first, int((i * BLOCK_THREADS + tx) * VEC_SIZE + j));
+    }
+    int block_first = BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(
+                          temp_storage->block_prim.reduce_int).Reduce(first, MinReduceOp{});
+    __syncthreads();
+    if (tx == 0) temp_storage->sampled_id = block_first;
+#else
     bool greater_than_u_diff[VEC_SIZE];
     // FlagHeads was removed from BlockAdjacentDifference in newer hipCUB.
     // Boolean inequality with a false predecessor preserves the head flags.
@@ -375,6 +413,7 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
         atomicMin(&(temp_storage->sampled_id), (i * BLOCK_THREADS + tx) * VEC_SIZE + j);
       }
     }
+#endif
     __syncthreads();
   }
 
@@ -560,10 +599,8 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
     aggregate = 0;
 #pragma unroll 4
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
-      probs_vec.fill(0);
-      if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-        probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
-      }
+      load_probability_vector(probs_vec, probs + row_idx * d,
+                              (i * BLOCK_THREADS + tx) * VEC_SIZE, d);
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                              DETERMINISTIC>(
@@ -587,10 +624,8 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
     float threadlocal_aggregate_gt_pivot_1 = 0;
 #pragma unroll 4
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
-      probs_vec.fill(0);
-      if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-        probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
-      }
+      load_probability_vector(probs_vec, probs + row_idx * d,
+                              (i * BLOCK_THREADS + tx) * VEC_SIZE, d);
 
       float probs_gt_pivot_0[VEC_SIZE], probs_gt_pivot_1[VEC_SIZE];
 #pragma unroll
@@ -675,10 +710,8 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
     row_scan_done = true;
 #pragma unroll 4
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
-      probs_vec.fill(0);
-      if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-        probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
-      }
+      load_probability_vector(probs_vec, probs + row_idx * d,
+                              (i * BLOCK_THREADS + tx) * VEC_SIZE, d);
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                              DETERMINISTIC>(
@@ -711,10 +744,8 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
     ValueCount<float> threadlocal_aggregate_gt_pivot_1{0, 0};
 #pragma unroll 4
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
-      probs_vec.fill(0);
-      if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-        probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
-      }
+      load_probability_vector(probs_vec, probs + row_idx * d,
+                              (i * BLOCK_THREADS + tx) * VEC_SIZE, d);
 
       ValueCount<float> probs_gt_pivot_0[VEC_SIZE], probs_gt_pivot_1[VEC_SIZE];
 #pragma unroll
@@ -797,8 +828,10 @@ static void TopPSamplingFromProb(T* probs, IdType* output, IdType* indices, T* t
     DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
       auto kernel = TopPSamplingFromProbKernel<THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE,
                                                DETERMINISTIC, T, IdType>;
-      kernel<<<nblks, nthrs, smem_size, stream>>>(probs, output, indices, top_p_arr, top_p_val, d,
-                                                  philox_seed, philox_offset);
+      aiter::launch_kernel(aiter::launch_policy::sampling, kernel,
+                           nblks, nthrs, smem_size, stream,
+                           probs, output, indices, top_p_arr, top_p_val, d,
+                           philox_seed, philox_offset);
     });
   });
 }
@@ -817,14 +850,49 @@ static void TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, 
     DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
       auto kernel = TopKTopPSamplingFromProbKernel<THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE,
                                                    DETERMINISTIC, T, IdType>;
-      kernel<<<nblks, nthrs, smem_size, stream>>>(probs, top_k_arr, top_p_arr, output, indices,
-                                                  top_k_val, top_p_val, d,
-                                                  philox_seed, philox_offset);
+      aiter::launch_kernel(aiter::launch_policy::sampling, kernel,
+                           nblks, nthrs, smem_size, stream,
+                           probs, top_k_arr, top_p_arr, output, indices,
+                           top_k_val, top_p_val, d, philox_seed, philox_offset);
     });
   });
 }
 
 // -------------------------------- Public entry points --------------------------------
+
+static void check_sampling_inputs(const torch::Tensor& probs, const torch::Tensor& output,
+                                  const std::optional<torch::Tensor>& indices) {
+  TORCH_CHECK(probs.is_cuda() && probs.scalar_type() == torch::kFloat32 &&
+                  probs.dim() == 2 && probs.is_contiguous(),
+              "probs must be a contiguous 2-D float32 GPU tensor");
+  TORCH_CHECK(probs.size(1) > 0 && probs.size(1) <= std::numeric_limits<int32_t>::max() &&
+                  probs.numel() <= std::numeric_limits<uint32_t>::max(),
+              "probs must have a nonempty vocabulary and fit uint32 indexing");
+  TORCH_CHECK(output.device() == probs.device() && output.scalar_type() == torch::kInt32 &&
+                  output.dim() == 1 && output.is_contiguous(),
+              "output must be a contiguous 1-D int32 tensor on the probs device");
+  TORCH_CHECK(output.numel() <= std::numeric_limits<int32_t>::max(), "batch is too large");
+  if (indices) {
+    TORCH_CHECK(indices->device() == probs.device() && indices->scalar_type() == torch::kInt32 &&
+                    indices->dim() == 1 && indices->is_contiguous() &&
+                    indices->numel() == output.numel(),
+                "indices must be contiguous 1-D int32 with output length on the probs device");
+    TORCH_CHECK(output.numel() == 0 || probs.size(0) > 0, "cannot index empty probs rows");
+  } else {
+    TORCH_CHECK(output.numel() == probs.size(0), "output length must equal probs rows");
+  }
+}
+
+static void check_sampling_parameter(const std::optional<torch::Tensor>& parameter,
+                                     const torch::Tensor& probs, torch::ScalarType dtype,
+                                     const char* name) {
+  if (parameter) {
+    TORCH_CHECK(parameter->device() == probs.device() && parameter->scalar_type() == dtype &&
+                    parameter->dim() == 1 && parameter->is_contiguous() &&
+                    parameter->numel() == probs.size(0),
+                name, " must have one contiguous value per probs row on the probs device");
+  }
+}
 
 void c_top_k_sampling_from_probs(const torch::Tensor& probs, torch::Tensor& output,
                                std::optional<torch::Tensor> maybe_indices,
@@ -849,6 +917,12 @@ void c_top_p_sampling_from_probs(const torch::Tensor& probs, torch::Tensor& outp
                                std::optional<torch::Tensor> maybe_indices,
                                std::optional<torch::Tensor> maybe_top_p_arr, double top_p_val,
                                bool deterministic, int64_t philox_seed, int64_t philox_offset) {
+  check_sampling_inputs(probs, output, maybe_indices);
+  check_sampling_parameter(maybe_top_p_arr, probs, torch::kFloat32, "top_p");
+  TORCH_CHECK(maybe_top_p_arr || (std::isfinite(static_cast<float>(top_p_val)) &&
+                                static_cast<float>(top_p_val) > 0),
+              "top_p must be finite and positive");
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(probs));
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
   bool has_top_p_arr = maybe_top_p_arr.has_value();
@@ -871,6 +945,15 @@ void c_top_k_top_p_sampling_from_probs(const torch::Tensor& probs, torch::Tensor
                                      std::optional<torch::Tensor> maybe_top_p_arr,
                                      double top_p_val, bool deterministic, int64_t philox_seed,
                                      int64_t philox_offset) {
+  check_sampling_inputs(probs, output, maybe_indices);
+  check_sampling_parameter(maybe_top_k_arr, probs, torch::kInt32, "top_k");
+  check_sampling_parameter(maybe_top_p_arr, probs, torch::kFloat32, "top_p");
+  TORCH_CHECK(maybe_top_k_arr || (top_k_val > 0 && top_k_val <= std::numeric_limits<int32_t>::max()),
+              "top_k must be positive and fit int32");
+  TORCH_CHECK(maybe_top_p_arr || (std::isfinite(static_cast<float>(top_p_val)) &&
+                                static_cast<float>(top_p_val) > 0),
+              "top_p must be finite and positive");
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(probs));
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
   bool has_top_k_arr = maybe_top_k_arr.has_value();

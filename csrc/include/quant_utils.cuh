@@ -24,6 +24,8 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 
+#include <string>
+
 #include "attention_dtypes.h"
 #ifndef AITER_QUANT_UTILS_NO_OPUS
 #include "opus/opus.hpp"
@@ -787,6 +789,50 @@ __inline__ __device__ Tout scaled_convert(const Tin& x, const float scale)
     }
 
 #ifndef AITER_QUANT_UTILS_NO_OPUS
+
+// gcnArch of the current device, without the ":xnack+"-style feature suffix.
+// Cached per device and thread: the fp8 guard below runs on every dispatch, and
+// hipGetDeviceProperties is far too expensive to repeat at decode rates.
+inline const std::string& opus_current_gpu_arch()
+{
+    static thread_local int cached_device = -1;
+    static thread_local std::string cached_arch;
+
+    int device = 0;
+    if(hipGetDevice(&device) != hipSuccess)
+    {
+        device = -1;
+    }
+    if(device != cached_device)
+    {
+        hipDeviceProp_t prop{};
+        if(device >= 0 && hipGetDeviceProperties(&prop, device) == hipSuccess)
+        {
+            std::string full(prop.gcnArchName);
+            cached_arch = full.substr(0, full.find(':'));
+        }
+        else
+        {
+            cached_arch = "unknown";
+        }
+        cached_device = device;
+    }
+    return cached_arch;
+}
+
+// opus implements the fp8 <-> fp32 scalar conversions only for gfx938 / gfx946
+// (opus.hpp:1107-1126, __builtin_hcu_cvt_pk_fp8_f32 / __builtin_hcu_cvt_f32_fp8); on
+// every other architecture both directions `return 0.0f`. HCU fp8 conversion hardware
+// starts at gfx938, so on gfx936 an fp8 KV cache is silently written as all zeros --
+// measured as 100% wrong k_cache / v_cache with no error raised. Fail the call instead.
+// This covers only the opus dispatch; the ck_tile DISPATCH_BY_KV_CACHE_DTYPE above uses
+// a different conversion path and is not in scope here.
+inline bool opus_fp8_supported()
+{
+    const std::string& arch = opus_current_gpu_arch();
+    return arch.rfind("gfx938", 0) == 0 || arch.rfind("gfx946", 0) == 0;
+}
+
 #define DISPATCH_BY_KV_CACHE_DTYPE_OPUS(SRC_DTYPE, KV_DTYPE, FN)                       \
     if(KV_DTYPE == "auto")                                                             \
     {                                                                                  \
@@ -811,6 +857,11 @@ __inline__ __device__ Tout scaled_convert(const Tin& x, const float scale)
     {                                                                                  \
         if(KV_DTYPE == "fp8" || KV_DTYPE == "fp8_e4m3")                                \
         {                                                                              \
+            TORCH_CHECK(vllm::fp8::opus_fp8_supported(),                               \
+                        "fp8 kv cache is not supported on this GPU (",                 \
+                        vllm::fp8::opus_current_gpu_arch(),                            \
+                        "): opus provides fp8 conversion only on gfx938/gfx946 and "   \
+                        "would silently write zeros here. Use kv_cache_dtype=\"auto\"."); \
             if(SRC_DTYPE == at::ScalarType::Float)                                     \
             {                                                                          \
                 FN(float, opus::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);            \

@@ -26,6 +26,7 @@ __device__ inline void operator delete[](void*, void*) noexcept {}
 #include <torch/all.h>
 
 #include "aiter_hip_common.h"
+#include "hip_kernel_launch.h"
 #include "topk_per_row.h"
 #include <algorithm>
 #include <hipcub/util_type.hpp>
@@ -601,10 +602,17 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
       for (int i = threadIdx.x; i < smemFinalDstIdx[0];
            i += kNumThreadsPerBlock) {
         int outIndex = 0;
-        auto logit = smemFinal.items.logits[i];
+        // Match the histogram's descending float order. The candidate slot
+        // makes keys unique even when values tie, so output slots cannot collide.
+        auto makeKey = [](float value, uint32_t slot) {
+          uint32_t bits = __float_as_uint(value);
+          bits = (bits & 0x80000000u) ? bits : (~bits & 0x7fffffffu);
+          return (static_cast<uint64_t>(bits) << 32) | slot;
+        };
+        auto key = makeKey(smemFinal.items.logits[i], i);
         for (int j = 0; j < smemFinalDstIdx[0]; j++) {
-          auto otherLogit = smemFinal.items.logits[j];
-          if (logit < otherLogit) {
+          auto otherKey = makeKey(smemFinal.items.logits[j], j);
+          if (otherKey < key) {
             outIndex++;
           }
         }
@@ -759,6 +767,58 @@ static int chooseBlocksPerRow(int64_t numRows, int64_t rowLen, int64_t topK) {
   return blocks;
 }
 
+// All launches go through aiter::launch_kernel so gfx946 multi-die builds can
+// dispatch in linear mode (aiter::launch_policy::topk_per_row); other targets
+// fall back to hipLaunchKernel. launch_kernel takes the full kernel signature,
+// so defaulted tail parameters of the kernels are passed explicitly.
+template <int kNumThreadsPerBlock, bool useRadixSort,
+          bool multipleBlocksPerRow = false, bool mergeBlocks = false,
+          int kNextN = 0, int kNumBins = 2048>
+static void launchDecodeKernel(dim3 grid, size_t sharedBytes, hipStream_t stream,
+                               const float* logits, const int* seqLens,
+                               int* outIndices, int64_t stride0, int64_t stride1,
+                               int64_t topK, int64_t next_n,
+                               float* outLogits = nullptr,
+                               int numBlocksToMerge = 0,
+                               const int* indices = nullptr) {
+  aiter::launch_kernel(
+      aiter::launch_policy::topk_per_row,
+      topKPerRowDecode<kNumThreadsPerBlock, useRadixSort, multipleBlocksPerRow,
+                       mergeBlocks, kNextN, kNumBins>,
+      grid, dim3(kNumThreadsPerBlock), sharedBytes, stream, logits, seqLens,
+      outIndices, static_cast<int>(stride0), static_cast<int>(stride1),
+      static_cast<int>(topK), static_cast<int>(next_n), outLogits,
+      numBlocksToMerge, indices);
+}
+
+template <int kNumThreadsPerBlock, bool useRadixSort, int kNumBins = 2048>
+static void launchPrefillKernel(dim3 grid, size_t sharedBytes, hipStream_t stream,
+                                const float* logits, const int* rowStarts,
+                                const int* rowEnds, int* outIndices,
+                                int64_t stride0, int64_t stride1, int64_t topK) {
+  aiter::launch_kernel(
+      aiter::launch_policy::topk_per_row,
+      topKPerRowPrefill<kNumThreadsPerBlock, useRadixSort, kNumBins>, grid,
+      dim3(kNumThreadsPerBlock), sharedBytes, stream, logits, rowStarts,
+      rowEnds, outIndices, static_cast<int>(stride0), static_cast<int>(stride1),
+      static_cast<int>(topK));
+}
+
+template <int kNumThreadsPerBlock, bool useRadixSort, int kNumBins = 2048>
+static void launchPrefillSplitKernel(dim3 grid, size_t sharedBytes,
+                                     hipStream_t stream, const float* logits,
+                                     const int* rowStarts, const int* rowEnds,
+                                     int* outIndices, float* outLogits,
+                                     int64_t stride0, int64_t stride1,
+                                     int64_t topK) {
+  aiter::launch_kernel(
+      aiter::launch_policy::topk_per_row,
+      topKPerRowPrefillSplit<kNumThreadsPerBlock, useRadixSort, kNumBins>, grid,
+      dim3(kNumThreadsPerBlock), sharedBytes, stream, logits, rowStarts,
+      rowEnds, outIndices, outLogits, static_cast<int>(stride0),
+      static_cast<int>(stride1), static_cast<int>(topK));
+}
+
 template <int kNumBins>
 static void launchDecodeInsertion(const torch::Tensor& logits, int64_t next_n,
                                   const torch::Tensor& seqLens,
@@ -766,32 +826,24 @@ static void launchDecodeInsertion(const torch::Tensor& logits, int64_t next_n,
                                   int64_t stride0, int64_t stride1,
                                   int64_t topK, hipStream_t stream) {
   constexpr int kNumThreadsPerBlock = 1024;
+  const dim3 grid(static_cast<unsigned>(numRows));
+  const size_t smem = topK * sizeof(int32_t);
+#define LAUNCH_DECODE_INSERTION(NEXT_N)                                        \
+  launchDecodeKernel<kNumThreadsPerBlock, false, false, false, NEXT_N,         \
+                     kNumBins>(grid, smem, stream, logits.data_ptr<float>(),   \
+                               seqLens.data_ptr<int>(),                        \
+                               indices.data_ptr<int>(), stride0, stride1,      \
+                               topK, next_n)
   if (next_n == 1) {
-    topKPerRowDecode<kNumThreadsPerBlock, false, false, false, 1, kNumBins>
-        <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
-            logits.data_ptr<float>(), seqLens.data_ptr<int>(),
-            indices.data_ptr<int>(), static_cast<int>(stride0),
-            static_cast<int>(stride1), static_cast<int>(topK), 1);
+    LAUNCH_DECODE_INSERTION(1);
   } else if (next_n == 2) {
-    topKPerRowDecode<kNumThreadsPerBlock, false, false, false, 2, kNumBins>
-        <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
-            logits.data_ptr<float>(), seqLens.data_ptr<int>(),
-            indices.data_ptr<int>(), static_cast<int>(stride0),
-            static_cast<int>(stride1), static_cast<int>(topK), 2);
+    LAUNCH_DECODE_INSERTION(2);
   } else if (next_n == 4) {
-    topKPerRowDecode<kNumThreadsPerBlock, false, false, false, 4, kNumBins>
-        <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
-            logits.data_ptr<float>(), seqLens.data_ptr<int>(),
-            indices.data_ptr<int>(), static_cast<int>(stride0),
-            static_cast<int>(stride1), static_cast<int>(topK), 4);
+    LAUNCH_DECODE_INSERTION(4);
   } else {
-    topKPerRowDecode<kNumThreadsPerBlock, false, false, false, 0, kNumBins>
-        <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
-            logits.data_ptr<float>(), seqLens.data_ptr<int>(),
-            indices.data_ptr<int>(), static_cast<int>(stride0),
-            static_cast<int>(stride1), static_cast<int>(topK),
-            static_cast<int>(next_n));
+    LAUNCH_DECODE_INSERTION(0);
   }
+#undef LAUNCH_DECODE_INSERTION
 }
 
 void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
@@ -827,39 +879,34 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
     const bool useRadix = numColumns >= kSortingAlgorithmThreshold;
     const int mergeLen = blocksPerRow * static_cast<int>(topK);
 
+    const dim3 splitGrid(static_cast<unsigned>(numRows), blocksPerRow);
     if (useRadix) {
-      topKPerRowDecode<kNumThreadsPerBlockRadix, true, true>
-          <<<dim3(numRows, blocksPerRow), kNumThreadsPerBlockRadix,
-             2 * topK * sizeof(int32_t), stream>>>(
-              logits.data_ptr<float>(), seqLens.data_ptr<int>(),
-              outIndicesAux.data_ptr<int>(), static_cast<int>(stride0),
-              static_cast<int>(stride1), static_cast<int>(topK),
-              static_cast<int>(next_n), outLogitsAux.data_ptr<float>());
+      launchDecodeKernel<kNumThreadsPerBlockRadix, true, true>(
+          splitGrid, 2 * topK * sizeof(int32_t), stream,
+          logits.data_ptr<float>(), seqLens.data_ptr<int>(),
+          outIndicesAux.data_ptr<int>(), stride0, stride1, topK, next_n,
+          outLogitsAux.data_ptr<float>());
     } else {
-      topKPerRowDecode<kNumThreadsPerBlock, false, true>
-          <<<dim3(numRows, blocksPerRow), kNumThreadsPerBlock,
-             2 * topK * sizeof(int32_t), stream>>>(
-              logits.data_ptr<float>(), seqLens.data_ptr<int>(),
-              outIndicesAux.data_ptr<int>(), static_cast<int>(stride0),
-              static_cast<int>(stride1), static_cast<int>(topK),
-              static_cast<int>(next_n), outLogitsAux.data_ptr<float>());
+      launchDecodeKernel<kNumThreadsPerBlock, false, true>(
+          splitGrid, 2 * topK * sizeof(int32_t), stream,
+          logits.data_ptr<float>(), seqLens.data_ptr<int>(),
+          outIndicesAux.data_ptr<int>(), stride0, stride1, topK, next_n,
+          outLogitsAux.data_ptr<float>());
     }
 
+    const dim3 mergeGrid(static_cast<unsigned>(numRows));
     if (mergeLen >= kSortingAlgorithmThreshold) {
-      topKPerRowDecode<kNumThreadsPerBlockRadix, true, false, true>
-          <<<numRows, kNumThreadsPerBlockRadix, topK * sizeof(int32_t),
-             stream>>>(
-              outLogitsAux.data_ptr<float>(), seqLens.data_ptr<int>(),
-              indices.data_ptr<int>(), blocksPerRow * topK, 1,
-              static_cast<int>(topK), static_cast<int>(next_n), nullptr,
-              blocksPerRow, outIndicesAux.data_ptr<int>());
+      launchDecodeKernel<kNumThreadsPerBlockRadix, true, false, true>(
+          mergeGrid, topK * sizeof(int32_t), stream,
+          outLogitsAux.data_ptr<float>(), seqLens.data_ptr<int>(),
+          indices.data_ptr<int>(), blocksPerRow * topK, 1, topK, next_n,
+          nullptr, blocksPerRow, outIndicesAux.data_ptr<int>());
     } else {
-      topKPerRowDecode<kNumThreadsPerBlock, false, false, true>
-          <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
-              outLogitsAux.data_ptr<float>(), seqLens.data_ptr<int>(),
-              indices.data_ptr<int>(), blocksPerRow * topK, 1,
-              static_cast<int>(topK), static_cast<int>(next_n), nullptr,
-              blocksPerRow, outIndicesAux.data_ptr<int>());
+      launchDecodeKernel<kNumThreadsPerBlock, false, false, true>(
+          mergeGrid, topK * sizeof(int32_t), stream,
+          outLogitsAux.data_ptr<float>(), seqLens.data_ptr<int>(),
+          indices.data_ptr<int>(), blocksPerRow * topK, 1, topK, next_n,
+          nullptr, blocksPerRow, outIndicesAux.data_ptr<int>());
     }
   } else if (numColumns < kSortingAlgorithmThreshold) {
     if (numColumns >= 8192) {
@@ -870,12 +917,10 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
                                   stride0, stride1, topK, stream);
     }
   } else {
-    topKPerRowDecode<kNumThreadsPerBlockRadix, true>
-        <<<numRows, kNumThreadsPerBlockRadix, topK * sizeof(int32_t), stream>>>(
-            logits.data_ptr<float>(), seqLens.data_ptr<int>(),
-            indices.data_ptr<int>(), static_cast<int>(stride0),
-            static_cast<int>(stride1), static_cast<int>(topK),
-            static_cast<int>(next_n));
+    launchDecodeKernel<kNumThreadsPerBlockRadix, true>(
+        dim3(static_cast<unsigned>(numRows)), topK * sizeof(int32_t), stream,
+        logits.data_ptr<float>(), seqLens.data_ptr<int>(),
+        indices.data_ptr<int>(), stride0, stride1, topK, next_n);
   }
 }
 
@@ -913,63 +958,55 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
     const bool useRadix = maxLen >= kSortingAlgorithmThreshold;
     const int mergeLen = blocksPerRow * static_cast<int>(topK);
 
+    const dim3 splitGrid(static_cast<unsigned>(numRows), blocksPerRow);
     if (useRadix) {
-      topKPerRowPrefillSplit<kNumThreadsPerBlockRadix, true>
-          <<<dim3(numRows, blocksPerRow), kNumThreadsPerBlockRadix,
-             2 * topK * sizeof(int32_t), stream>>>(
-              logits.data_ptr<float>(), rowStarts.data_ptr<int>(),
-              rowEnds.data_ptr<int>(), outIndicesAux.data_ptr<int>(),
-              outLogitsAux.data_ptr<float>(), static_cast<int>(stride0),
-              static_cast<int>(stride1), static_cast<int>(topK));
+      launchPrefillSplitKernel<kNumThreadsPerBlockRadix, true>(
+          splitGrid, 2 * topK * sizeof(int32_t), stream,
+          logits.data_ptr<float>(), rowStarts.data_ptr<int>(),
+          rowEnds.data_ptr<int>(), outIndicesAux.data_ptr<int>(),
+          outLogitsAux.data_ptr<float>(), stride0, stride1, topK);
     } else {
-      topKPerRowPrefillSplit<kNumThreadsPerBlock, false>
-          <<<dim3(numRows, blocksPerRow), kNumThreadsPerBlock,
-             2 * topK * sizeof(int32_t), stream>>>(
-              logits.data_ptr<float>(), rowStarts.data_ptr<int>(),
-              rowEnds.data_ptr<int>(), outIndicesAux.data_ptr<int>(),
-              outLogitsAux.data_ptr<float>(), static_cast<int>(stride0),
-              static_cast<int>(stride1), static_cast<int>(topK));
+      launchPrefillSplitKernel<kNumThreadsPerBlock, false>(
+          splitGrid, 2 * topK * sizeof(int32_t), stream,
+          logits.data_ptr<float>(), rowStarts.data_ptr<int>(),
+          rowEnds.data_ptr<int>(), outIndicesAux.data_ptr<int>(),
+          outLogitsAux.data_ptr<float>(), stride0, stride1, topK);
     }
 
+    const dim3 mergeGrid(static_cast<unsigned>(numRows));
     if (mergeLen >= kSortingAlgorithmThreshold) {
-      topKPerRowDecode<kNumThreadsPerBlockRadix, true, false, true>
-          <<<numRows, kNumThreadsPerBlockRadix, topK * sizeof(int32_t),
-             stream>>>(
-              outLogitsAux.data_ptr<float>(), rowEnds.data_ptr<int>(),
-              indices.data_ptr<int>(), blocksPerRow * topK, 1,
-              static_cast<int>(topK), /*next_n=*/1, nullptr, blocksPerRow,
-              outIndicesAux.data_ptr<int>());
+      launchDecodeKernel<kNumThreadsPerBlockRadix, true, false, true>(
+          mergeGrid, topK * sizeof(int32_t), stream,
+          outLogitsAux.data_ptr<float>(), rowEnds.data_ptr<int>(),
+          indices.data_ptr<int>(), blocksPerRow * topK, 1, topK,
+          /*next_n=*/1, nullptr, blocksPerRow, outIndicesAux.data_ptr<int>());
     } else {
-      topKPerRowDecode<kNumThreadsPerBlock, false, false, true>
-          <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
-              outLogitsAux.data_ptr<float>(), rowEnds.data_ptr<int>(),
-              indices.data_ptr<int>(), blocksPerRow * topK, 1,
-              static_cast<int>(topK), /*next_n=*/1, nullptr, blocksPerRow,
-              outIndicesAux.data_ptr<int>());
+      launchDecodeKernel<kNumThreadsPerBlock, false, false, true>(
+          mergeGrid, topK * sizeof(int32_t), stream,
+          outLogitsAux.data_ptr<float>(), rowEnds.data_ptr<int>(),
+          indices.data_ptr<int>(), blocksPerRow * topK, 1, topK,
+          /*next_n=*/1, nullptr, blocksPerRow, outIndicesAux.data_ptr<int>());
     }
   } else if (maxLen < kSortingAlgorithmThreshold) {
     if (maxLen >= 8192) {
-      topKPerRowPrefill<kNumThreadsPerBlock, false, 4096>
-          <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
-              logits.data_ptr<float>(), rowStarts.data_ptr<int>(),
-              rowEnds.data_ptr<int>(), indices.data_ptr<int>(),
-              static_cast<int>(stride0), static_cast<int>(stride1),
-              static_cast<int>(topK));
+      launchPrefillKernel<kNumThreadsPerBlock, false, 4096>(
+          dim3(static_cast<unsigned>(numRows)), topK * sizeof(int32_t), stream,
+          logits.data_ptr<float>(), rowStarts.data_ptr<int>(),
+          rowEnds.data_ptr<int>(), indices.data_ptr<int>(), stride0, stride1,
+          topK);
     } else {
-      topKPerRowPrefill<kNumThreadsPerBlock, false, 2048>
-          <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
-              logits.data_ptr<float>(), rowStarts.data_ptr<int>(),
-              rowEnds.data_ptr<int>(), indices.data_ptr<int>(),
-              static_cast<int>(stride0), static_cast<int>(stride1),
-              static_cast<int>(topK));
+      launchPrefillKernel<kNumThreadsPerBlock, false, 2048>(
+          dim3(static_cast<unsigned>(numRows)), topK * sizeof(int32_t), stream,
+          logits.data_ptr<float>(), rowStarts.data_ptr<int>(),
+          rowEnds.data_ptr<int>(), indices.data_ptr<int>(), stride0, stride1,
+          topK);
     }
   } else {
-    topKPerRowPrefill<kNumThreadsPerBlockRadix, true>
-        <<<numRows, kNumThreadsPerBlockRadix, topK * sizeof(int32_t), stream>>>(
-            logits.data_ptr<float>(), rowStarts.data_ptr<int>(),
-            rowEnds.data_ptr<int>(), indices.data_ptr<int>(),
-            static_cast<int>(stride0), static_cast<int>(stride1),
-            static_cast<int>(topK));
+    launchPrefillKernel<kNumThreadsPerBlockRadix, true>(
+        dim3(static_cast<unsigned>(numRows)), topK * sizeof(int32_t), stream,
+        logits.data_ptr<float>(), rowStarts.data_ptr<int>(),
+        rowEnds.data_ptr<int>(), indices.data_ptr<int>(), stride0, stride1,
+        topK);
   }
 }
 } // namespace topk
@@ -1865,9 +1902,24 @@ void standalone_stable_radix_topk_one_block_(void* buf,
         bufs                                = static_cast<decltype(bufs)>(aligned_pointers[0]);
     }
 
-    radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES, false, phase>
-        <<<batch_size, BlockSize, 0, stream>>>(
-            in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min, bufs, next_n);
+    aiter::launch_kernel(
+      aiter::launch_policy::topk_per_row,
+      radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES, false, phase>,
+      dim3(batch_size),
+      dim3(BlockSize),
+      static_cast<size_t>(0),
+      stream,
+      in,
+      in_idx,
+      len,
+      rowStarts,
+      rowEnds,
+      k,
+      out,
+      out_idx,
+      select_min,
+      bufs,
+      next_n);
 }
 
 template <typename T,

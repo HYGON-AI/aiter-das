@@ -22,6 +22,7 @@
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/extension.h>
+#include <ATen/MemoryOverlap.h>
 
 #include <cmath>
 
@@ -32,6 +33,7 @@
 #include "hip_compat.h"
 #include "py_itfs_common.h"
 #include "vec_convert.h"
+#include "hip_kernel_launch.h"
 
 using fp8_type = ck_tile::fp8_t;
 
@@ -236,6 +238,35 @@ __device__ __forceinline__ float silu_kernel(const T& x)
     return y;
 }
 
+// SiLU-only path: aligned vectors divide d exactly, including odd/small d via
+// vec1. No rounded buffer extent or unmasked vector store crosses a row.
+template <typename T, int Vec, bool HasLimit>
+__global__ void silu_and_mul_kernel(T* __restrict__ out,
+                                    const T* __restrict__ input,
+                                    int d, float limit)
+{
+    const int64_t row = blockIdx.x;
+    using Vector = ck_tile::vec_t<T, Vec>;
+    for(int64_t col = int64_t(threadIdx.x) * Vec; col < d; col += blockDim.x * Vec)
+    {
+        auto x = *reinterpret_cast<const Vector*>(input + row * 2 * d + col);
+        auto y = *reinterpret_cast<const Vector*>(input + row * 2 * d + d + col);
+        Vector result;
+        #pragma unroll
+        for(int j = 0; j < Vec; ++j)
+        {
+            float gate = ck_tile::type_convert<float>(y[j]);
+            if constexpr(HasLimit)
+            {
+                x[j] = ck_tile::type_convert<T>(fminf(ck_tile::type_convert<float>(x[j]), limit));
+                gate = fminf(fmaxf(gate, -limit), limit);
+            }
+            result[j] = ck_tile::type_convert<T>(silu_kernel(x[j]) * gate);
+        }
+        *reinterpret_cast<Vector*>(out + row * d + col) = result;
+    }
+}
+
 template <typename T>
 __device__ __forceinline__ float gelu_kernel(const T& x)
 {
@@ -319,9 +350,51 @@ static constexpr int nextPow2(unsigned int num)
 namespace aiter {
 
 void silu_and_mul(torch::Tensor& out,   // [..., d]
-                  torch::Tensor& input) // [..., 2 * d]
+                  torch::Tensor& input, // [..., 2 * d]
+                  float limit)
 {
-    LAUNCH_ACTIVATION_GATE_KERNEL(aiter::silu_kernel);
+    TORCH_CHECK(std::isfinite(limit) && limit >= 0, "silu_and_mul: limit must be finite and >= 0");
+    TORCH_CHECK(input.is_cuda() && out.is_cuda() && input.device() == out.device(),
+                "silu_and_mul: input/out must be on the same GPU");
+    TORCH_CHECK(input.scalar_type() == at::kHalf || input.scalar_type() == at::kBFloat16,
+                "silu_and_mul: input must be FP16 or BF16");
+    TORCH_CHECK(out.scalar_type() == input.scalar_type(), "silu_and_mul: dtype mismatch");
+    TORCH_CHECK(input.dim() >= 1 && input.size(-1) % 2 == 0,
+                "silu_and_mul: input needs an even last dimension");
+    auto shape = input.sizes().vec();
+    shape.back() /= 2;
+    TORCH_CHECK(out.sizes() == at::IntArrayRef(shape), "silu_and_mul: output shape mismatch");
+    TORCH_CHECK(input.is_contiguous() && out.is_contiguous(),
+                "silu_and_mul: contiguous input/out required");
+    at::assert_no_overlap(out, input);
+    if(out.numel() == 0)
+        return;
+    TORCH_CHECK(shape.back() <= std::numeric_limits<int>::max(), "silu_and_mul: K too large");
+    const int d = static_cast<int>(shape.back());
+    const int64_t rows = out.numel() / d;
+    TORCH_CHECK(rows <= std::numeric_limits<int>::max(), "silu_and_mul: too many rows");
+    int vec = std::min(nextPow2(d / 64), max_vec_size);
+    const auto input_address = reinterpret_cast<std::uintptr_t>(input.data_ptr());
+    const auto output_address = reinterpret_cast<std::uintptr_t>(out.data_ptr());
+    while(vec > 1 && (d % vec || input_address % (vec * input.element_size()) ||
+                     output_address % (vec * out.element_size())))
+        vec /= 2;
+    const int waves = std::min(nextPow2(d / 64 / vec), max_wave_num);
+    const dim3 grid(static_cast<unsigned int>(rows)), block(waves * 64);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "silu_and_mul", [&] {
+        using T = typename t2ck<scalar_t>::type;
+        auto* output = reinterpret_cast<T*>(out.data_ptr());
+        auto* source = reinterpret_cast<const T*>(input.data_ptr());
+        AITER_DISPATCH_CASE_VEC_SIZE(vec,
+            if(limit > 0)
+                launch_kernel(aiter::launch_policy::silu, silu_and_mul_kernel<T, VEC_SIZE, true>,
+                                    grid, block, stream, output, source, d, limit);
+            else
+                launch_kernel(aiter::launch_policy::silu, silu_and_mul_kernel<T, VEC_SIZE, false>,
+                                    grid, block, stream, output, source, d, limit);)
+    });
 }
 
 void scaled_silu_and_mul(torch::Tensor& out,   // [..., d]

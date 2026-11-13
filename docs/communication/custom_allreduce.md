@@ -18,7 +18,7 @@ CAR对组内各rank的张量逐元素求SUM，返回同形状、同dtype的新�
 
 ## 默认分派与配置
 
-普通CAR的构造、`custom_all_reduce()`、`all_reduce()`等调用签名不变，无需指定
+普通CAR保留现有构造参数位置及`custom_all_reduce()`、`all_reduce()`接口，无需指定
 kernelID或线程数。升级时需使用匹配的Python与native模块，并确保框架实际选择AITER CAR后端。
 
 | 使用方式 | 自动生效的路径 |
@@ -48,8 +48,7 @@ export AITER_AR_SMALL_MESSAGE=auto
 ```python
 from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 
-ca = CustomAllreduce(group, device, max_size=128 << 20,
-                     enable_register_for_capturing=True)
+ca = CustomAllreduce(group, device, enable_register_for_capturing=True)
 supported = ca.should_custom_ar(x)
 y = ca.custom_all_reduce(x, use_new=True, open_fp8_quant=False)
 ```
@@ -58,7 +57,7 @@ y = ca.custom_all_reduce(x, use_new=True, open_fp8_quant=False)
 |---|---|
 | `group` | 用于交换元数据的非 NCCL ProcessGroup，例如 Gloo；每个 rank 绑定不同 GPU |
 | `device` | 当前进程的 GPU，可传 `torch.device("cuda", local_rank)` |
-| `max_size` | staging 容量，单位 byte，默认 1 GiB；普通 AR 的单 rank 输入上限还受 `max_size // 2` 限制 |
+| `max_size` | 正整数 staging 容量，单位 byte；默认 `None`，读取 `AITER_AR_BUFFER_SIZE_MB`，未设置时为 128 MiB。显式参数优先；普通 AR 的单 rank 输入上限仍受 `max_size // 2` 限制 |
 | `enable_register_for_capturing` | 请求 Graph 输入注册，默认 `True`；gfx936/gfx938 传统路径使用 copy-in，已准入的 LL/LL128 读取本卡输入 |
 | `should_custom_ar(x)` | 检查 CAR 是否启用以及大小、布局、拓扑等准入条件；调用方仍需保证设备和 dtype 合法 |
 | `custom_all_reduce(x)` | 自动分配输出；不满足准入时返回 `None`，调用方负责回退 |
@@ -68,7 +67,29 @@ y = ca.custom_all_reduce(x, use_new=True, open_fp8_quant=False)
 
 普通 AR 使用非空 FP16、BF16 或 FP32 张量。推荐 contiguous 布局，总字节数必须为 16 的倍数。所有 rank 必须按相同顺序调用，输入形状、dtype 和准入/回退决策一致；输出是 SUM，不会除以 world size。
 
-`AITER_AR_MAX_SIZE_MB` 控制普通 AR 的大小阈值，默认 64 MiB（67,108,864 字节），须为正整数。实际可接受大小为 `min(max_size // 2, 阈值)`；超过门限时 `should_custom_ar()` 返回 `False`、`custom_all_reduce()` 返回 `None`，由调用方选择 RCCL 等回退后端。增大阈值不会自动扩容 staging。`max_size` 也不是对象的总显存占用：初始化另有约 `2 * max_size` 的 meta 区域及其他管理资源，应预留额外显存。
+容量与普通 AR 准入分别配置，两个环境变量的单位均为 MiB（1024×1024字节），须为正整数：
+
+| 环境变量 | 默认值 | 含义 |
+|---|---:|---|
+| `AITER_AR_BUFFER_SIZE_MB` | 128 | 共享 input staging 容量 B；仅在未显式传入 `max_size` 或传入 `None` 时读取 |
+| `AITER_AR_MAX_SIZE_MB` | 64 | 普通 AR 输入大小门限 L，不控制分配，不作为 RS/fusion 通用门限 |
+
+优先级为：**显式 `max_size`（字节） > 容量环境变量（MiB） > 128 MiB**。显式参数不会乘二，也不会被环境变量覆盖。普通 AR 实际上限仍是 `min(B // 2, L)`；超过时 `should_custom_ar()` 返回 `False`、`custom_all_reduce()` 返回 `None`，由调用方选择 RCCL 等回退后端。只增大 L 不会扩容，只增大 B 也不会提高默认64MiB门限。
+
+默认 B=128MiB 保持普通 AR、RS、AR+RMS 的64MiB范围。input=B、meta=2B+Signal，另有8MiB rank_data；默认请求约392MiB，而非此前1GiB容量的约3080MiB。native池不完整计入PyTorch的`memory_allocated()`；启用LL/LL128还可能分配额外scratch。
+
+共享接口仍有各自容量约束：AllGather完整输出最多B/2（默认64MiB，单rank输入最多64MiB/TP）；QK/RoPE的copy-in QKV及MHC调用方使用的staging也受B限制。它们不保证自动回退。需要原有大容量时可显式传`max_size=1 << 30`，或在构造前设置`AITER_AR_BUFFER_SIZE_MB=1024`。显式`prefill_support=True`的AR检查也从原默认512MiB降为64MiB。
+
+例如需要保留1GiB共享容量、普通AR仍限制64MiB：
+
+```bash
+export AITER_AR_BUFFER_SIZE_MB=1024
+export AITER_AR_MAX_SIZE_MB=64
+```
+
+配置在构造时读取；组内所有rank的解析后容量、普通AR门限和small-message模式必须一致。初始化后修改环境变量不会改变已有对象；调整容量需等待工作完成、销毁旧通信器并重新创建和捕获Graph。
+
+**SGLang接入建议：** 部分版本把`AITER_AR_MAX_SIZE_MB`转传为显式`max_size`，会覆盖上述容量默认值及新变量。例如转传64会得到B=64MiB、普通AR实际上限32MiB。应删除该转传，让AITER分别解析两个变量；本次不修改SGLang。RS应使用`should_custom_rs`，融合接口应使用自身准入，不能借普通AR判断。详见[容量与框架评审](custom_allreduce_ref/custom_allreduce_capacity_review_20261109.md)。
 
 上述大小准入适用于 `custom_all_reduce` / `should_custom_ar`。显式调用
 `all_reduce` 不执行该框架回退判断，copy-in 输入可以使用完整 `max_size` staging
@@ -212,10 +233,16 @@ gfx938 TP8也有明显批间漂移，不能按单行数字宣称稳定收益。T
 ## 精度与覆盖范围
 
 日常算子回归入口是 `python op_tests/ci_tests/test_custom_allreduce_api.py`。
-无参数默认依次执行 TP2、TP4，共18个独立任务：输入立即复用、Graph变化输入、边界与RNE精度专项各测off/auto，再测AG/RS、融合与IPC初始化；不自动运行TP8。
-`--tp-size 2/4/8` 可显式选择单个TP，CI仅分配2卡时（`AITER_AR_TP_SIZE=2`）默认只测TP2。
+无参数默认规划TP2、TP4，共18个独立任务：输入复用、边界与RNE精度专项各测off/auto，再测AG/RS、融合与IPC初始化；容量配置检查并入IPC初始化测试，不增加独立任务。不自动运行TP8。启动前自动检查可见卡数和HIP IPC拓扑：不足4卡或所选四卡不满足每对`type=2,hops=1`时，保留TP2并将TP4明确记录为SKIP；满足条件的机器继续测试TP4。
+`--tp-size 2/4/8` 显式要求单个TP，仍执行严格检查，不因拓扑不支持自动跳过。CI仅分配2卡时（`AITER_AR_TP_SIZE=2`）默认只规划TP2。自动模式下不足2卡、拓扑依赖缺失或查询异常仍报错；`--dry-run` 仅展示规划，不访问GPU判断拓扑。
+日志和`summary.json`分别记录实际执行数、跳过数及原因；例如TP2通过9项、TP4跳过9项，不等价于18项正确性通过。
 原 `test_custom_allreduce.py` 保留独立精度/性能测试。参数、日志和覆盖边界见[测试说明](../../op_tests/multigpu_tests/README.md#interface-and-correctness-tests)。
-2026-10-12 在 gfx936/gfx938 上验证该无参数入口，TP2/TP4 各架构均通过18/18个任务；未运行TP8或新增模型回归。
+2026-10-12在gfx936/gfx938验证的是当时18任务的无参数矩阵，各架构通过18/18；该历史结果不包含后来加入的容量配置检查。初始化与配置可通过已有入口验证：
+
+```bash
+python op_tests/ci_tests/test_custom_allreduce_api.py --suite transport --tp-size 2
+python op_tests/ci_tests/test_custom_allreduce_api.py --suite transport --tp-size 4
+```
 
 - gfx936/gfx938均完成普通CAR 96项、fused/split AR RMS 288路径项及共享API回归；原CI阈值未放宽。独立FP32 FTZ/RNE专项、变化输入、Graph复用与边界检查通过，不能把容差CI通过解释为所有元素逐位一致。
 - 保留FP32累加、BF16 RNE、同步和消费完成确认；LL无需不安全的跨卡输入直接注册。协议与共享ABI约束见[实现说明](custom_allreduce_ref/custom_allreduce_implementation.md)。

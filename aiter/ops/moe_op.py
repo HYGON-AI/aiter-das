@@ -20,7 +20,17 @@ def topk_softmax(
 
 
 @compile_ops("module_moe_utils")
-def moe_sum(input: Tensor, output: Tensor)->None: ...
+def moe_sum(input: Tensor, output: Tensor) -> None:
+    """Sum input [tokens, topk, hidden] into output [tokens, hidden].
+
+    Input/output have the same dtype and HIP device. Native topk=2/4/5/6/8
+    kernels require contiguous tensors and accumulate in the input dtype;
+    other topk values use torch.sum (a strided FP32-accumulating HIP kernel on
+    gfx946 for FP16/BF16/FP32).
+    Native gfx946 launches select the multi-die path from runtime HIP topology.
+    Work uses the current stream; empty output is a no-op.
+    """
+    ...
 
 @compile_ops("module_moe_sum")
 def asm_moe_sum(input: Tensor, output: Tensor, sorted_ids: Tensor)->None: ...
@@ -46,7 +56,7 @@ def moe_align_block_size(
 def ep_scatter(
     aq: Tensor,                      # [M, H] int8, per-token quantized
     aq_scale: Tensor,                # [M] or [M, 1] fp32
-    topk_ids: Tensor,                # [M, K] int64
+    topk_ids: Tensor,                # [M, K] int32/int64, 1 <= K <= 30
     expert_map: Optional[Tensor],    # int32, -1 = dropped (None for TP)
     expert_num_tokens: Tensor,       # [E] int32 counts (in) / offsets (out)
     aq_out: Tensor,                  # [M_sum, H] int8
@@ -61,7 +71,7 @@ def ep_scatter(
 @compile_ops("module_moe_utils")
 def ep_gather(
     a: Tensor,                       # [M_sum, H] fp16/bf16/fp32
-    topk_ids: Tensor,                # [M, K] int64
+    topk_ids: Tensor,                # [M, K] int32/int64, 1 <= K <= 30
     topk_weights: Tensor,            # [M, K] fp32
     inv_perm: Tensor,                # [M, K] int32
     expert_map: Optional[Tensor],
@@ -81,7 +91,7 @@ def ep_build_m_indices(
 @compile_ops("module_moe_utils")
 def ep_fused_quant_scatter(
     input: Tensor,                   # [M, H] fp16/bf16
-    topk_ids: Tensor,                # [M, K] int64
+    topk_ids: Tensor,                # [M, K] int32/int64, 1 <= K <= 30
     expert_map: Optional[Tensor],
     expert_num_tokens: Tensor,       # [E] int32 counts (in) / offsets (out)
     aq_out: Tensor,                  # [M_sum, H] int8
@@ -96,7 +106,7 @@ def ep_fused_quant_scatter(
 @compile_ops("module_moe_utils")
 def ep_fused_fp8_quant_scatter(
     input: Tensor,                   # [M, H] fp16/bf16
-    topk_ids: Tensor,                # [M, K] int64
+    topk_ids: Tensor,                # [M, K] int32/int64, 1 <= K <= 30
     expert_map: Optional[Tensor],
     expert_num_tokens: Tensor,       # [E] int32 counts (in) / offsets (out)
     aq_out: Tensor,                  # [M_sum, H] fp8 bytes
@@ -113,7 +123,7 @@ def ep_fused_fp8_quant_scatter(
 @compile_ops("module_moe_utils")
 def ep_fused_smooth_quant_scatter(
     input: Tensor,                   # [M, H] fp16/bf16
-    topk_ids: Tensor,                # [M, K] int64 (K = 4 or 8)
+    topk_ids: Tensor,                # [M, K] int32/int64, 1 <= K <= 30
     expert_map: Optional[Tensor],
     expert_offsets: Tensor,          # [E] int32 start offsets (pre-scanned)
     smooth_scale: Tensor,            # [E, H] fp32

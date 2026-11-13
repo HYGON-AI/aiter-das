@@ -13,12 +13,15 @@ implicit fallback between them.
 CK GDN constraints (enforced by the native layer):
 
 * ``head_dim == 128`` and ``chunk_size == 64`` are fixed;
-* ``h_v / h_qk`` must be in ``{1, 2, 4}``;
+* prefill requires ``h_v / h_qk`` in ``{1, 2, 3, 4}``;
 * inputs are packed -- there is no leading batch dimension;
 * prefill always materialises ``v_new`` internally because CK's output stage
   consumes it;
 * the prefill workspace is caller-provided (see
-  :func:`ck_gdn_prefill_workspace_bytes` / :func:`ck_gdn_prefill_alloc_workspace`).
+  :func:`ck_gdn_prefill_workspace_bytes` / :func:`ck_gdn_prefill_alloc_workspace`);
+* decode accepts either a dense ``[sequences, ...]`` state or, through
+  ``initial_state_indices``, a slot pool addressed by a block table (see
+  :func:`ck_gdn_decode`).
 
 Example
 -------
@@ -98,6 +101,7 @@ def _ck_gdn_decode(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     initial_state: Optional[torch.Tensor] = None,
+    initial_state_indices: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     use_g: bool = True,
@@ -262,6 +266,7 @@ def ck_gdn_decode(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     initial_state: Optional[torch.Tensor] = None,
+    initial_state_indices: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     use_g: bool = True,
@@ -286,17 +291,21 @@ def ck_gdn_decode(
     * ``gk``, ``gv``: ``[tokens, h_v]`` optional extra decays
     * ``beta``: ``[tokens, h_v]``; ``beta_headwise`` selects one BETA per value
       head, which is what the vLLM/SGLang paths use
-    * ``initial_state``: ``[sequences, h_v, 128, 128]`` fp32
+    * ``initial_state``: ``[sequences, h_v, 128, 128]`` fp32, or -- together
+      with ``initial_state_indices`` -- a ``[slots, h_v, 128, 128]`` fp32 pool
+    * ``initial_state_indices``: ``[sequences]`` int32/int64 block table. When
+      given, ``initial_state`` is treated as a pool: sequence ``i`` uses slot
+      ``initial_state_indices[i]``, a non-positive id means "no state row", the
+      pool's ``stride(0)`` is the slot stride, and the final state is written
+      back in place (so the pool is returned).
     * ``cu_seqlens``: ``[sequences + 1]`` int64. Supply it for packed inputs;
       without it the whole packed range is treated as one sequence. Fixed
       multi-batch inputs are expressed by equal-length entries.
 
     Returns ``(output, final_state)`` with ``output`` shaped
     ``[tokens, h_v, 128]`` and ``final_state`` ``[sequences, h_v, 128, 128]``
-    fp32, or ``None`` when ``store_final_state`` is false.
-
-    Note: CK has no state-pool index argument. A state pool must be gathered on
-    the Python side before the call and scattered back afterwards.
+    fp32, or ``None`` when ``store_final_state`` is false. In pool mode
+    ``final_state`` is the pool tensor itself.
 
     ``validate_varlen=False`` skips the host-side ``cu_seqlens`` checks. Those
     checks are the only reason this entry needs the values on the host, so they
@@ -316,6 +325,7 @@ def ck_gdn_decode(
         a_log,
         dt_bias,
         initial_state,
+        initial_state_indices,
         cu_seqlens,
         scale,
         use_g=use_g,

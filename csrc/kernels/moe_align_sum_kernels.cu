@@ -14,6 +14,8 @@
 
 #include "hip_compat.h"
 #include "dispatch_utils.h"
+#include "moe_routing_common.cuh"
+#include <cfloat>
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
@@ -620,7 +622,7 @@ __inline__ __device__ T warpReduceMax(T val) {
 template <int BLOCK_THREADS>
 __global__ void ep_scan_kernel(const int32_t *__restrict__ num_tokens_per_expert,
                                int32_t *__restrict__ expert_counters,
-                               int num_experts, int alignment) {
+                               int num_experts, int alignment, int capacity) {
   int tid = threadIdx.x;
   int32_t count = 0;
   if (tid < num_experts)
@@ -635,7 +637,29 @@ __global__ void ep_scan_kernel(const int32_t *__restrict__ num_tokens_per_expert
 
   int32_t start_offset = 0;
   hipcub::Sum scan_op;
+  if (num_experts > BLOCK_THREADS) {
+    int values[2], starts[2];
+    #pragma unroll
+    for(int i=0;i<2;++i) {
+      int e=tid*2+i;
+      int c=e<num_experts ? num_tokens_per_expert[e] : 0;
+      values[i]=(c+alignment-1)&~(alignment-1);
+    }
+    BlockScan(temp_storage).ExclusiveSum(values, starts);
+    #pragma unroll
+    for(int i=0;i<2;++i) {
+      int e=tid*2+i;
+      if(e<num_experts) {
+        expert_counters[e]=starts[i];
+
+        if(e==num_experts-1) { if(starts[i]<0 || static_cast<int64_t>(starts[i])+values[i]>capacity) __builtin_trap(); }
+      }
+    }
+
+    return;
+  }
   BlockScan(temp_storage).ExclusiveScan(padded_count, start_offset, 0, scan_op);
+  if (tid == num_experts-1 && (start_offset < 0 || static_cast<int64_t>(start_offset)+padded_count > capacity)) __builtin_trap();
 
   if (tid < num_experts) {
     expert_counters[tid] = start_offset;
@@ -651,9 +675,9 @@ template <int BLOCK_THREADS, bool FILL_PADDED_WITH_EXPERT>
 __global__ void ep_scan_fill_m_indices_kernel(
     const int32_t *__restrict__ num_tokens_per_expert,
     int32_t *__restrict__ expert_counters, int32_t *__restrict__ m_indices,
-    int num_experts, int alignment) {
+    int num_experts, int alignment, int capacity) {
   int tid = threadIdx.x;
-  __shared__ int32_t s_starts[EP_SCAN_MAX_EXPERTS];
+  __shared__ int32_t s_starts[routing::max_experts];
   __shared__ int32_t s_total;
 
   int32_t count = 0;
@@ -671,7 +695,35 @@ __global__ void ep_scan_fill_m_indices_kernel(
 
   int32_t start_offset = 0;
   hipcub::Sum scan_op;
+  if (num_experts > BLOCK_THREADS) {
+    int values[2], starts[2];
+    #pragma unroll
+    for(int i=0;i<2;++i) {
+      int e=tid*2+i;
+      int c=e<num_experts ? num_tokens_per_expert[e] : 0;
+      values[i]=(c+alignment-1)&~(alignment-1);
+    }
+    BlockScan(temp_storage).ExclusiveSum(values, starts);
+    #pragma unroll
+    for(int i=0;i<2;++i) {
+      int e=tid*2+i;
+      if(e<num_experts) {
+        expert_counters[e]=starts[i];
+        s_starts[e]=starts[i];
+        if(e==num_experts-1) { s_total=starts[i]+values[i]; }
+      }
+    }
+    __syncthreads();
+    if(s_total<0 || s_total>capacity) __builtin_trap();
+    for(int idx=tid; idx<capacity;idx+=BLOCK_THREADS) {
+      int lo=0,hi=num_experts-1;
+      while(lo<hi) { int mid=(lo+hi+1)/2; if(s_starts[mid]<=idx) lo=mid; else hi=mid-1; }
+      m_indices[idx]=(idx<s_total && FILL_PADDED_WITH_EXPERT) ? lo : -1;
+    }
+    return;
+  }
   BlockScan(temp_storage).ExclusiveScan(padded_count, start_offset, 0, scan_op);
+  if (tid == num_experts-1 && (start_offset < 0 || static_cast<int64_t>(start_offset)+padded_count > capacity)) __builtin_trap();
 
   if (tid < num_experts) {
     expert_counters[tid] = start_offset;
@@ -683,7 +735,7 @@ __global__ void ep_scan_fill_m_indices_kernel(
   __syncthreads();
 
   const int32_t total = s_total;
-  for (int32_t idx = tid; idx < total; idx += BLOCK_THREADS) {
+  for (int32_t idx = tid; idx < capacity; idx += BLOCK_THREADS) {
     // owning expert = last e with s_starts[e] <= idx (empty experts tie with
     // the next non-empty one and lose the tie-break)
     int lo = 0, hi = num_experts - 1;
@@ -695,7 +747,7 @@ __global__ void ep_scan_fill_m_indices_kernel(
         hi = mid - 1;
       }
     }
-    m_indices[idx] = FILL_PADDED_WITH_EXPERT ? lo : -1;
+    m_indices[idx] = (idx < total && FILL_PADDED_WITH_EXPERT) ? lo : -1;
   }
 }
 
@@ -706,16 +758,16 @@ __global__ void ep_scan_fill_m_indices_kernel(
 // the token row (staged in smem) to aq_out.
 // ---------------------------------------------------------------------------
 template <typename T, typename ScaleT, int SCATTER_THREADS_PER_GROUP,
-          int SCATTER_MAX_K>
+          int SCATTER_MAX_K, bool Direct64=false>
 __launch_bounds__(1024) __global__ void ep_scatter_kernel(
     const T *__restrict__ aq,            // int8
     const ScaleT *__restrict__ aq_scale, // float
-    const int64_t *__restrict__ topk_ids,
+    const void *__restrict__ topk_ids,
     const int32_t *__restrict__ expert_map,
     int32_t *__restrict__ expert_counters, T *__restrict__ aq_out,
     ScaleT *__restrict__ aq_scale_out, int32_t *__restrict__ inv_perm,
     int32_t *__restrict__ m_indices, int num_tokens, int K, int num_experts,
-    int hidden_size, int scale_hidden_size, bool has_expert_map) {
+    int hidden_size, int scale_hidden_size, bool has_expert_map, routing::RouteInfo route) {
 
   extern __shared__ int4 shmem_data_int4[];
   __shared__ int dest_row_shared[SCATTER_MAX_K];
@@ -737,39 +789,23 @@ __launch_bounds__(1024) __global__ void ep_scatter_kernel(
     int k_idx = tid / SCATTER_THREADS_PER_GROUP;
     int lane_id = tid % SCATTER_THREADS_PER_GROUP;
 
-    if (lane_id == 0) {
-      bool is_valid = k_idx < K;
+    if (tid < K) {
+      k_idx = tid;
+      bool is_valid = true;
       int64_t row_idx = token_idx * K + k_idx;
       int expert_id = -1;
 
       if (is_valid) {
-        int global_expert_id = static_cast<int>(topk_ids[row_idx]);
-
-        if (has_expert_map) {
-          if (global_expert_id < 0) {
-            is_valid = false;
-          } else {
-            int mapped_id = expert_map[global_expert_id];
-            if (mapped_id < 0 || mapped_id >= num_experts) {
-              is_valid = false;
-            } else {
-              expert_id = mapped_id;
-            }
-          }
-        } else {
-          if (global_expert_id < 0 || global_expert_id >= num_experts) {
-            is_valid = false;
-          } else {
-            expert_id = global_expert_id;
-          }
-        }
+        if constexpr(Direct64) expert_id = route.local_typed<int64_t,false>(static_cast<const int64_t*>(topk_ids),row_idx,nullptr);
+        else expert_id = route.local(topk_ids, row_idx, expert_map);
+        is_valid = expert_id >= 0;
       }
 
       is_valid_shared[k_idx] = is_valid;
 
       if (k_idx < K) {
         if (is_valid) {
-          int dest_row = atomicAdd(&expert_counters[expert_id], 1);
+          int dest_row = route.claim(expert_counters, expert_id);
           dest_row_shared[k_idx] = dest_row;
           inv_perm[row_idx] = dest_row;
           if (m_indices != nullptr) {
@@ -785,7 +821,8 @@ __launch_bounds__(1024) __global__ void ep_scatter_kernel(
     __syncthreads();
 
     H_vec = hidden_size / 16;
-    if (is_valid_shared[k_idx]) {
+    for (k_idx = tid / SCATTER_THREADS_PER_GROUP; k_idx < (SCATTER_MAX_K==8 ? 8 : K); k_idx += blockDim.x / SCATTER_THREADS_PER_GROUP) {
+    if (k_idx < K && is_valid_shared[k_idx]) {
       int64_t dest_row = dest_row_shared[k_idx];
       int64_t dst_offset = dest_row * hidden_size;
       int4 *dst_vec_global = reinterpret_cast<int4 *>(aq_out + dst_offset);
@@ -795,6 +832,7 @@ __launch_bounds__(1024) __global__ void ep_scatter_kernel(
         dst_vec_global[v] = src_vec_shmem[v];
       }
     }
+    }
     __syncthreads();
   }
 }
@@ -803,7 +841,7 @@ template <typename ScaleT, int SCATTER_MAX_K>
 __launch_bounds__(1024) __global__ void ep_scatter_kernel_1024_opt(
     const int8_t *__restrict__ aq,
     const ScaleT *__restrict__ aq_scale,
-    const int64_t *__restrict__ topk_ids,
+    const void *__restrict__ topk_ids,
     const int32_t *__restrict__ expert_map,
     int32_t *__restrict__ expert_counters,
     int8_t *__restrict__ aq_out,
@@ -814,7 +852,7 @@ __launch_bounds__(1024) __global__ void ep_scatter_kernel_1024_opt(
     int K,
     int num_experts,
     int hidden_size,
-    bool has_expert_map) {
+    bool has_expert_map, routing::RouteInfo route) {
 
   // 2 tokens per 1024-thread block (512 threads each)
   extern __shared__ float4 shmem_data_f4[];
@@ -846,32 +884,11 @@ __launch_bounds__(1024) __global__ void ep_scatter_kernel_1024_opt(
     if (group_id < K) {
       if (lane_id == 0) {
         int64_t row_idx = global_token_idx * K + group_id;
-        int global_expert_id = static_cast<int>(topk_ids[row_idx]);
-        int expert_id = -1;
-        bool is_valid = true;
-
-        if (has_expert_map) {
-          if (global_expert_id < 0) {
-            is_valid = false;
-          } else {
-            int mapped_id = expert_map[global_expert_id];
-
-            if (mapped_id < 0 || mapped_id >= num_experts) {
-              is_valid = false;
-            } else {
-              expert_id = mapped_id;
-            }
-          }
-        } else {
-          if (global_expert_id < 0 || global_expert_id >= num_experts) {
-            is_valid = false;
-          } else {
-            expert_id = global_expert_id;
-          }
-        }
+        int expert_id = route.local(topk_ids, row_idx, expert_map);
+        bool is_valid = expert_id >= 0;
 
         if (is_valid) {
-          my_dest_row = atomicAdd(&expert_counters[expert_id], 1);
+          my_dest_row = route.claim(expert_counters, expert_id);
           inv_perm[row_idx] = my_dest_row;
           if (m_indices)
             m_indices[my_dest_row] = expert_id;
@@ -913,8 +930,8 @@ __launch_bounds__(BLOCK_THREADS) __global__ void ep_build_m_indices_kernel(
     const topk_t *__restrict__ topk_ids, int32_t *__restrict__ m_indices,
     int64_t topk_numel, int64_t total_elements, int num_experts,
     int alignment) {
-  __shared__ int32_t s_counts[EP_SCAN_MAX_EXPERTS];
-  __shared__ int32_t s_starts[EP_SCAN_MAX_EXPERTS];
+  __shared__ int32_t s_counts[routing::max_experts];
+  __shared__ int32_t s_starts[routing::max_experts];
   __shared__ int32_t s_total;
 
   const int tid = threadIdx.x;
@@ -924,7 +941,7 @@ __launch_bounds__(BLOCK_THREADS) __global__ void ep_build_m_indices_kernel(
   __syncthreads();
 
   for (int64_t idx = tid; idx < topk_numel; idx += blockDim.x) {
-    int expert = static_cast<int>(topk_ids[idx]);
+    int64_t expert = static_cast<int64_t>(topk_ids[idx]);
     if (expert >= 0 && expert < num_experts) {
       atomicAdd(&s_counts[expert], 1);
     }
@@ -939,6 +956,14 @@ __launch_bounds__(BLOCK_THREADS) __global__ void ep_build_m_indices_kernel(
   __shared__ typename BlockScan::TempStorage temp_storage;
   int32_t start = 0;
   hipcub::Sum scan_op;
+  if(num_experts>BLOCK_THREADS) {
+    int values[2],starts[2];
+    #pragma unroll
+    for(int i=0;i<2;++i) { int e=tid*2+i; values[i]=e<num_experts ? (s_counts[e]+alignment-1)&~(alignment-1) : 0; }
+    BlockScan(temp_storage).ExclusiveSum(values,starts);
+    #pragma unroll
+    for(int i=0;i<2;++i) { int e=tid*2+i; if(e<num_experts) s_starts[e]=starts[i]; if(e==num_experts-1) s_total=starts[i]+values[i]; }
+  } else {
   BlockScan(temp_storage).ExclusiveScan(padded_count, start, 0, scan_op);
 
   if (tid < num_experts) {
@@ -947,7 +972,9 @@ __launch_bounds__(BLOCK_THREADS) __global__ void ep_build_m_indices_kernel(
   if (tid == num_experts - 1) {
     s_total = start + padded_count;
   }
+  }
   __syncthreads();
+  if(s_total<0 || s_total>total_elements) __builtin_trap();
 
   const int32_t total = s_total;
   // each thread walks idx monotonically, so the owning-expert cursor only
@@ -981,12 +1008,12 @@ __launch_bounds__(BLOCK_THREADS) __global__ void ep_build_m_indices_kernel(
 template <typename scalar_t, int BLOCK_SIZE, int GROUP_SIZE, int num_warps>
 __launch_bounds__(BLOCK_SIZE) __global__ void quant_scatter_opt_kernel(
     const scalar_t *__restrict__ input,
-    const int64_t *__restrict__ topk_ids,
+    const void *__restrict__ topk_ids,
     const int32_t *__restrict__ expert_map,
     int32_t *__restrict__ expert_counters, int8_t *__restrict__ aq_out,
     float *__restrict__ aq_scale_out, int32_t *__restrict__ inv_perm,
     int32_t *__restrict__ m_indices, int num_tokens, int K, int num_experts,
-    int hidden_size, bool has_expert_map) {
+    int hidden_size, bool has_expert_map, routing::RouteInfo route) {
   constexpr int VEC_SIZE = 8;
   extern __shared__ __align__(16) int8_t shmem_int8[];
 
@@ -1004,30 +1031,21 @@ __launch_bounds__(BLOCK_SIZE) __global__ void quant_scatter_opt_kernel(
     int group_lane = tid % GROUP_SIZE;
     constexpr int NUM_GROUPS = BLOCK_SIZE / GROUP_SIZE;
 
-    __shared__ int64_t s_dest_rows[NUM_GROUPS];
-    __shared__ bool s_is_valid[NUM_GROUPS];
+    __shared__ int64_t s_dest_rows[32];
+    __shared__ bool s_is_valid[32];
 
     if (tid == 0)
       s_any_valid = false;
     __syncthreads();
 
     if (tid < K) {
-      int expert_id = (int)topk_ids[token_idx * K + tid];
-      bool is_valid = expert_id >= 0 && expert_id < num_experts;
-
-      if (is_valid && has_expert_map) {
-        int mapped_id = expert_map[expert_id];
-        if (mapped_id == -1)
-          is_valid = false;
-        else
-          expert_id = mapped_id;
-      }
-
+      int expert_id = route.local(topk_ids, token_idx * K + tid, expert_map);
+      bool is_valid = expert_id >= 0;
       s_is_valid[tid] = is_valid;
 
       if (is_valid) {
         s_any_valid = true;
-        int64_t dest_row = atomicAdd(&expert_counters[expert_id], 1);
+        int64_t dest_row = route.claim(expert_counters, expert_id);
         s_dest_rows[tid] = dest_row;
 
         int64_t row_idx = token_idx * K + tid;
@@ -1080,7 +1098,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void quant_scatter_opt_kernel(
     }
     __syncthreads();
 
-    float inv_scale = __fdiv_rn(127.0f, s_max_abs);
+    float inv_scale = s_max_abs == 0.0f ? 1.0f : __fdiv_rn(127.0f, fmaxf(s_max_abs, FLT_MIN * 127.0f));
 
     float scale_for_output = __fdiv_rn(1.0f, inv_scale);
 
@@ -1105,8 +1123,8 @@ __launch_bounds__(BLOCK_SIZE) __global__ void quant_scatter_opt_kernel(
 
       int k = k_base + group_id;
 
-      if (k < K && s_is_valid[group_id]) {
-        int64_t dest_row = s_dest_rows[group_id];
+      if (k < K && s_is_valid[k]) {
+        int64_t dest_row = s_dest_rows[k];
         int64_t dst_offset = dest_row * hidden_size;
         int8_t *dst_ptr = aq_out + dst_offset;
         if (group_lane == 0) {
@@ -1131,22 +1149,23 @@ __launch_bounds__(BLOCK_SIZE) __global__ void quant_scatter_opt_kernel(
 // structure (16B vectorized input reads in both passes, quantized row staged
 // in smem, K 128-thread groups copy out) — the original walked the input
 // element-at-a-time in the max pass, which left it ~30% behind the int8 twin.
-template <typename scalar_t, int BLOCK_SIZE, int GROUP_SIZE, int num_warps>
+template <typename scalar_t, int BLOCK_SIZE, int GROUP_SIZE, int num_warps,
+          int K_MAX, bool Direct64=false>
 __launch_bounds__(BLOCK_SIZE) __global__ void ep_fp8_quant_scatter_kernel(
-    const scalar_t *__restrict__ input, const int64_t *__restrict__ topk_ids,
+    const scalar_t *__restrict__ input, const void *__restrict__ topk_ids,
     const int32_t *__restrict__ expert_map,
     int32_t *__restrict__ expert_counters, uint8_t *__restrict__ aq_out,
     float *__restrict__ aq_scale_out, int32_t *__restrict__ inv_perm,
     int32_t *__restrict__ m_indices, int num_tokens, int K, int num_experts,
-    int hidden_size, int fp8type, bool has_expert_map) {
+    int hidden_size, int fp8type, bool has_expert_map, routing::RouteInfo route) {
   constexpr int VEC_SIZE = 8;
   extern __shared__ __align__(16) uint8_t shmem_fp8[];
 
   __shared__ float warp_maxs[num_warps];
   __shared__ float s_scale;
   __shared__ bool s_any_valid;
-  __shared__ int s_dest_rows[BLOCK_SIZE / GROUP_SIZE];
-  __shared__ bool s_is_valid[BLOCK_SIZE / GROUP_SIZE];
+  __shared__ int s_dest_rows[K_MAX];
+  __shared__ bool s_is_valid[K_MAX];
 
   const int tid = threadIdx.x;
   const int lane_id = tid & 63;
@@ -1162,20 +1181,15 @@ __launch_bounds__(BLOCK_SIZE) __global__ void ep_fp8_quant_scatter_kernel(
     __syncthreads();
 
     if (tid < K) {
-      int expert_id = (int)topk_ids[token_idx * K + tid];
-      bool is_valid = expert_id >= 0 && expert_id < num_experts;
-      if (is_valid && has_expert_map) {
-        int mapped_id = expert_map[expert_id];
-        if (mapped_id < 0 || mapped_id >= num_experts) {
-          is_valid = false;
-        } else {
-          expert_id = mapped_id;
-        }
-      }
+      int expert_id;
+      if constexpr(Direct64)
+        expert_id=route.local_typed<int64_t,false>(static_cast<const int64_t*>(topk_ids),token_idx*K+tid,nullptr);
+      else expert_id=route.local(topk_ids,token_idx*K+tid,expert_map);
+      bool is_valid = expert_id >= 0;
       s_is_valid[tid] = is_valid;
       if (is_valid) {
         s_any_valid = true;
-        int64_t dest_row = atomicAdd(&expert_counters[expert_id], 1);
+        int64_t dest_row = route.claim(expert_counters, expert_id);
         s_dest_rows[tid] = dest_row;
         inv_perm[token_idx * K + tid] = (int32_t)dest_row;
         if (m_indices)
@@ -1266,10 +1280,10 @@ __launch_bounds__(BLOCK_SIZE) __global__ void ep_fp8_quant_scatter_kernel(
 // gather: inverse permutation with topk-weight weighted sum.
 // output[t] = sum_k w[t,k] * a[inv_perm[t,k]] over valid (expert-mapped) k.
 // ---------------------------------------------------------------------------
-template <typename scalar_t, int K_MAX>
+template <typename scalar_t, int K_MAX, typename Id, bool Mapped=true>
 __global__ void ep_gather_kernel(
     const scalar_t *__restrict__ input_tensor,
-    const int64_t *__restrict__ topk_ids,
+    const Id *__restrict__ topk_ids,
     const float *__restrict__ topk_weights,
     const int *__restrict__ src_indices, // inv_perm
     const int *__restrict__ expert_map,
@@ -1277,8 +1291,8 @@ __global__ void ep_gather_kernel(
     const int hidden_size,
     const int topk_num,
     const bool has_expert_map,
-    const int num_tokens) {
-  constexpr int VEC_SIZE = 8;
+    const int num_tokens, routing::RouteInfo route) {
+  constexpr int VEC_SIZE = 16 / sizeof(scalar_t);
   using VecType = AlignedVector<scalar_t, VEC_SIZE>;
 
   const int col_offset_base = blockIdx.x * blockDim.x * VEC_SIZE;
@@ -1296,12 +1310,9 @@ __global__ void ep_gather_kernel(
         continue;
       }
       size_t flat_idx = static_cast<size_t>(token_idx) * topk_num + k;
-      int expert_id = topk_ids[flat_idx];
-      if (has_expert_map && expert_id >= 0) {
-        expert_id = expert_map[expert_id];
-      }
+      int expert_id = route.local_typed<Id,Mapped>(topk_ids, flat_idx, expert_map);
       int src_idx = src_indices[flat_idx];
-      if (expert_id >= 0 && src_idx >= 0) {
+      if (expert_id >= 0 && src_idx >= 0 && src_idx < route.capacity) {
         float w = topk_weights[flat_idx];
 
         size_t src_offset = static_cast<size_t>(src_idx) * hidden_size + feat_idx;
@@ -1334,7 +1345,7 @@ __global__ void ep_gather_kernel(
 template <typename scalar_t, int BLOCK_SIZE, int MAX_K>
 __launch_bounds__(BLOCK_SIZE) __global__ void quant_scatter_smooth_opt_kernel(
     const scalar_t *__restrict__ input,
-    const int64_t *__restrict__ topk_ids,
+    const void *__restrict__ topk_ids,
     const int32_t *__restrict__ expert_map,
     int32_t *__restrict__ expert_offsets,
     int8_t *__restrict__ aq_out,
@@ -1343,7 +1354,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void quant_scatter_smooth_opt_kernel(
     int32_t *__restrict__ m_indices,
     const float *__restrict__ smooth_scale,
     int num_tokens, int K, int num_experts,
-    int hidden_size, bool has_expert_map) {
+    int hidden_size, bool has_expert_map, routing::RouteInfo route) {
 
   int64_t token_idx = blockIdx.x;
   if (token_idx >= num_tokens)
@@ -1366,20 +1377,13 @@ __launch_bounds__(BLOCK_SIZE) __global__ void quant_scatter_smooth_opt_kernel(
   __syncthreads();
 
   if (tid < K) {
-    int expert_id = (int)topk_ids[token_idx * K + tid];
-    bool is_valid = expert_id >= 0 && expert_id < num_experts;
-    if (is_valid && has_expert_map) {
-      int mapped_id = expert_map[expert_id];
-      if (mapped_id == -1)
-        is_valid = false;
-      else
-        expert_id = mapped_id;
-    }
+    int expert_id = route.local(topk_ids, token_idx * K + tid, expert_map);
+    bool is_valid = expert_id >= 0;
     s_valid[tid] = is_valid;
     s_expert_ids[tid] = expert_id;
     if (is_valid) {
       s_any_valid = true;
-      int64_t dest_row = atomicAdd(&expert_offsets[expert_id], 1);
+      int64_t dest_row = route.claim(expert_offsets, expert_id);
       s_dest_rows[tid] = dest_row;
       int64_t row_idx = token_idx * K + tid;
       inv_perm[row_idx] = (int32_t)dest_row;
@@ -1483,7 +1487,7 @@ template <typename scalar_t, int BLOCK_SIZE, int VEC_SIZE>
 __global__ void __launch_bounds__(BLOCK_SIZE)
 quant_scatter_smooth_low_reg_kernel(
     const scalar_t *__restrict__ input,
-    const int64_t *__restrict__ topk_ids,
+    const void *__restrict__ topk_ids,
     const int32_t *__restrict__ expert_map,
     int32_t *__restrict__ expert_offsets,
     int8_t *__restrict__ aq_out,
@@ -1491,7 +1495,7 @@ quant_scatter_smooth_low_reg_kernel(
     int32_t *__restrict__ inv_perm,
     int32_t *__restrict__ m_indices,
     const float *__restrict__ smooth_scale,
-    int num_tokens, int K, int hidden_size, bool has_expert_map) {
+    int num_tokens, int K, int hidden_size, bool has_expert_map, routing::RouteInfo route) {
 
   int64_t token_idx = blockIdx.x * 2;
   if (token_idx >= num_tokens)
@@ -1520,17 +1524,10 @@ quant_scatter_smooth_low_reg_kernel(
     bool is_load = true;
 
     for (int k = 0; k < K; ++k) {
-      int expert_id = (int)topk_ids[token_idx * K + k];
+      int expert_id = route.local(topk_ids, token_idx * K + k, expert_map);
       if (expert_id < 0) {
+        if (tid == 0) inv_perm[token_idx * K + k] = -1;
         continue;
-      }
-
-      if (has_expert_map) {
-        int mapped = expert_map[expert_id];
-        if (mapped == -1) {
-          continue;
-        }
-        expert_id = mapped;
       }
 
       if (is_load) {
@@ -1543,7 +1540,7 @@ quant_scatter_smooth_low_reg_kernel(
       }
 
       if (tid == 0) {
-        int32_t dr = atomicAdd(&expert_offsets[expert_id], 1);
+        int32_t dr = route.claim(expert_offsets, expert_id);
         s_dest_row = dr;
         inv_perm[token_idx * K + k] = dr;
         if (m_indices)
@@ -1621,7 +1618,7 @@ template <typename scalar_t, int BLOCK_SIZE, int VEC_SIZE>
 __global__ void __launch_bounds__(BLOCK_SIZE)
 quant_scatter_smooth_tk_kernel(
     const scalar_t *__restrict__ input,
-    const int64_t *__restrict__ topk_ids,
+    const void *__restrict__ topk_ids,
     const int32_t *__restrict__ expert_map,
     int32_t *__restrict__ expert_offsets,
     int8_t *__restrict__ aq_out,
@@ -1629,7 +1626,7 @@ quant_scatter_smooth_tk_kernel(
     int32_t *__restrict__ inv_perm,
     int32_t *__restrict__ m_indices,
     const float *__restrict__ smooth_scale,
-    int num_tokens, int K, int hidden_size, bool has_expert_map) {
+    int num_tokens, int K, int hidden_size, bool has_expert_map, routing::RouteInfo route) {
 
   static_assert(BLOCK_SIZE % WARP_SIZE == 0, "block must be warp-multiple");
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
@@ -1645,12 +1642,8 @@ quant_scatter_smooth_tk_kernel(
   const int warp_id = tid / WARP_SIZE;
 
   // every thread resolves the expert redundantly (uniform address, broadcast)
-  int expert_id = (int)topk_ids[pair];
+  int expert_id = route.local(topk_ids, pair, expert_map);
   bool valid = expert_id >= 0;
-  if (valid && has_expert_map) {
-    expert_id = expert_map[expert_id];
-    valid = expert_id >= 0;
-  }
 
   __shared__ int32_t s_dest_row;
   __shared__ float s_warp_maxs[NUM_WARPS > 1 ? NUM_WARPS : 1];
@@ -1663,7 +1656,7 @@ quant_scatter_smooth_tk_kernel(
     return;
   }
   if (tid == 0) {
-    int32_t dr = atomicAdd(&expert_offsets[expert_id], 1);
+    int32_t dr = route.claim(expert_offsets, expert_id);
     s_dest_row = dr;
     inv_perm[pair] = dr;
     if (m_indices)
@@ -1738,19 +1731,25 @@ void ep_scatter(torch::Tensor aq, torch::Tensor aq_scale,
                 torch::Tensor expert_num_tokens, torch::Tensor aq_out,
                 torch::Tensor aq_scale_out, torch::Tensor m_indices,
                 torch::Tensor inv_perm, int local_num_experts, int alignment) {
+  auto route = routing::legacy_scatter_check(aq, topk_ids, expert_map_opt, expert_num_tokens, aq_out, aq_scale_out, m_indices, inv_perm, local_num_experts, alignment, std::nullopt, aq_scale);
+  TORCH_CHECK(aq.scalar_type() == at::kChar && aq_out.scalar_type() == at::kChar,
+              "ep_scatter expects INT8 activation tensors");
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(aq));
   int num_tokens = aq.size(0);
   int H = aq.size(1);
   int HS = (aq_scale.dim() > 1) ? aq_scale.size(1) : 1;
   int K = topk_ids.size(1);
-
-  if (num_tokens == 0) {
+  if(num_tokens==0) {
+    auto stream=at::hip::getCurrentHIPStream();
+    hipMemsetAsync(expert_num_tokens.data_ptr(),0,expert_num_tokens.nbytes(),stream);
+    if(m_indices.numel()) hipMemsetAsync(m_indices.data_ptr(),0xff,m_indices.nbytes(),stream);
     return;
   }
 
+
+
   TORCH_CHECK(aq.dim() == 2, "ep_scatter expects aq to be 2D");
   TORCH_CHECK(aq_out.dim() == 2, "ep_scatter expects aq_out to be 2D");
-  TORCH_CHECK(aq.element_size() == 1 && aq_out.element_size() == 1,
-              "ep_scatter expects one-byte activation tensors");
   TORCH_CHECK(aq.is_contiguous() && aq_out.is_contiguous(),
               "ep_scatter expects contiguous activation tensors");
   TORCH_CHECK(aq_scale.scalar_type() == at::ScalarType::Float &&
@@ -1759,17 +1758,17 @@ void ep_scatter(torch::Tensor aq, torch::Tensor aq_scale,
   TORCH_CHECK(aq_scale.is_contiguous() && aq_scale_out.is_contiguous(),
               "ep_scatter expects contiguous scale tensors");
   TORCH_CHECK(HS == 1, "ep_scatter expects one fp32 scale per token");
-  TORCH_CHECK(topk_ids.scalar_type() == at::ScalarType::Long,
-              "ep_scatter expects int64 topk_ids");
+  TORCH_CHECK((topk_ids.scalar_type() == at::ScalarType::Long || topk_ids.scalar_type() == at::ScalarType::Int),
+              "ep_scatter expects int32/int64 topk_ids");
   TORCH_CHECK(expert_num_tokens.scalar_type() == at::ScalarType::Int,
               "ep_scatter expects int32 expert_num_tokens");
   TORCH_CHECK(inv_perm.scalar_type() == at::ScalarType::Int &&
                   m_indices.scalar_type() == at::ScalarType::Int,
               "ep_scatter expects int32 index tensors");
   TORCH_CHECK(H % 16 == 0, "ep_scatter hidden size must be divisible by 16");
-  TORCH_CHECK(K <= 8, "ep_scatter supports topk <= 8");
-  TORCH_CHECK(local_num_experts > 0 && local_num_experts <= EP_SCAN_MAX_EXPERTS,
-              "ep_scatter supports 1 to 1024 experts");
+  TORCH_CHECK(K >= 1 && K <= 30, "ep_scatter supports topk 1..30");
+  TORCH_CHECK(local_num_experts > 0 && local_num_experts <= routing::max_experts,
+              "ep_scatter supports 1 to 1200 experts");
 
   const int32_t *expert_map_ptr = nullptr;
   bool has_expert_map = false;
@@ -1794,46 +1793,51 @@ void ep_scatter(torch::Tensor aq, torch::Tensor aq_scale,
     moe_permute::ep_scan_fill_m_indices_kernel<CUB_BLOCK_THREADS, false>
         <<<grid, block, 0, stream>>>(
             expert_counters_ptr, expert_counters_ptr,
-            m_indices.data_ptr<int32_t>(), local_num_experts, alignment);
+            m_indices.data_ptr<int32_t>(), local_num_experts, alignment, route.capacity);
   }
 
   // scatter
   {
-    if (num_tokens <= 4096 && H <= 8192) {
+    if (K <= 8 && H <= 8192) {
       constexpr int SCATTER_MAX_K = 8;
       using scale_t = float;
       int threads = 1024;
-      int blocks = (num_tokens + 1) / 2;
+      int blocks = (static_cast<int64_t>(num_tokens) + 1) / 2;
       dim3 grid(blocks);
       dim3 block(threads);
       size_t shmem_size = 2 * (H / 16) * sizeof(float4);
       moe_permute::ep_scatter_kernel_1024_opt<scale_t, SCATTER_MAX_K>
           <<<grid, block, shmem_size, stream>>>(
-              aq_ptr, aq_scale_ptr, topk_ids.data_ptr<int64_t>(),
+              aq_ptr, aq_scale_ptr, topk_ids.data_ptr(),
               expert_map_ptr, expert_counters_ptr, aq_out_ptr,
               aq_scale_out_ptr, inv_perm.data_ptr<int32_t>(),
               m_indices.data_ptr<int32_t>(), num_tokens, K, local_num_experts,
-              H, has_expert_map);
+              H, has_expert_map, route);
     } else {
       constexpr int SCATTER_THREADS_PER_GROUP = 128;
-      constexpr int SCATTER_MAX_K = 8;
       using data_t = int8_t;
       using scale_t = float;
-      int threads = SCATTER_THREADS_PER_GROUP * SCATTER_MAX_K;
+      int threads = 1024;
       int blocks = num_tokens;
 
       dim3 grid(blocks);
       dim3 block(threads);
 
       size_t shmem_size = H * sizeof(data_t);
+      auto launch = [&](auto max_k, auto direct) {
       moe_permute::ep_scatter_kernel<data_t, scale_t, SCATTER_THREADS_PER_GROUP,
-                                     SCATTER_MAX_K>
+                                     decltype(max_k)::value, decltype(direct)::value>
           <<<grid, block, shmem_size, stream>>>(
-              aq_ptr, aq_scale_ptr, topk_ids.data_ptr<int64_t>(),
+              aq_ptr, aq_scale_ptr, topk_ids.data_ptr(),
               expert_map_ptr, expert_counters_ptr, aq_out_ptr,
               aq_scale_out_ptr, inv_perm.data_ptr<int32_t>(),
               m_indices.data_ptr<int32_t>(), num_tokens, K, local_num_experts,
-              H, HS, has_expert_map);
+              H, HS, has_expert_map, route);
+      };
+      if(K<=8) {
+        if(route.ids64 && !has_expert_map) launch(std::integral_constant<int,8>{},std::true_type{});
+        else launch(std::integral_constant<int,8>{},std::false_type{});
+      } else launch(std::integral_constant<int,32>{},std::false_type{});
     }
   }
 }
@@ -1844,6 +1848,19 @@ void ep_gather(torch::Tensor a,
                torch::Tensor inv_perm,
                std::optional<torch::Tensor> expert_map,
                torch::Tensor output) {
+  for(const auto& t:{a,topk_ids,topk_weights,inv_perm,output}) routing::tensor(t,a);
+  TORCH_CHECK(a.dim()==2 && output.dim()==2 && a.size(1)==output.size(1) && a.size(1)>0,"gather expects matching 2D widths");
+  TORCH_CHECK(a.scalar_type()==at::kHalf || a.scalar_type()==at::kBFloat16 || a.scalar_type()==at::kFloat,"gather expects FP16/BF16/FP32");
+  TORCH_CHECK(output.scalar_type()==a.scalar_type() && a.size(0)<=INT_MAX,"gather output dtype/capacity mismatch");
+  routing::ids_shape(topk_ids,output.size(0)); routing::map_shape(expert_map,a);
+  routing::dtype(topk_weights,at::kFloat); routing::dtype(inv_perm,at::kInt);
+  TORCH_CHECK(topk_weights.sizes()==topk_ids.sizes() && inv_perm.sizes()==topk_ids.sizes(),"gather metadata shape mismatch");
+  routing::outputs({output},{a,topk_ids,topk_weights,inv_perm}); if(expert_map) routing::disjoint(output,*expert_map);
+  routing::vector_address(a,16); routing::vector_address(output,16);
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(a));
+  routing::RouteInfo route{INT_MAX,expert_map ? static_cast<int>(expert_map->numel()) : -1,static_cast<int>(a.size(0)),topk_ids.scalar_type()==at::kLong};
+  if(output.size(0)==0) return;
+
   const int num_tokens = output.size(0);
   const int hidden_size = output.size(1);
   const int topk_num = topk_ids.size(1);
@@ -1867,7 +1884,7 @@ void ep_gather(torch::Tensor a,
         int elements_per_block = threads_per_block * elements_per_thread;
         int grid_x =
             (hidden_size + elements_per_block - 1) / elements_per_block;
-        int grid_y = num_tokens;
+        int grid_y = std::min(num_tokens,65535);
 
         bool is_deepseek_config = (hidden_size == 7168) && (VEC_SIZE == 8);
         if (is_deepseek_config) {
@@ -1875,7 +1892,7 @@ void ep_gather(torch::Tensor a,
           grid_x = 7;
         }
 
-        if (num_tokens >= 256 && num_tokens <= 512 && hidden_size == 4096) {
+        if (num_tokens >= 256 && num_tokens <= 512 && hidden_size == 4096 && VEC_SIZE == 8) {
           threads_per_block = 128;
           grid_x = 4;
         }
@@ -1884,37 +1901,59 @@ void ep_gather(torch::Tensor a,
         dim3 grid(grid_x, grid_y);
 
         auto a_tensor = a.expect_contiguous();
+        auto launch = [&](auto id_tag, auto mapped) {
+        using id_t = decltype(id_tag);
+        constexpr bool Mapped=decltype(mapped)::value;
         if (topk_num <= 2) {
-          moe_permute::ep_gather_kernel<scalar_t, 2>
+          moe_permute::ep_gather_kernel<scalar_t, 2, id_t, Mapped>
               <<<grid, block, 0, at::hip::getCurrentHIPStream()>>>(
                   a_tensor->data_ptr<scalar_t>(),
-                  topk_ids.data_ptr<int64_t>(),
+                  topk_ids.data_ptr<id_t>(),
                   topk_weights.data_ptr<float>(), inv_perm.data_ptr<int>(),
                   expert_map_ptr, output.data_ptr<scalar_t>(), hidden_size,
-                  topk_num, has_expert_map, num_tokens);
+                  topk_num, has_expert_map, num_tokens, route);
         } else if (topk_num <= 4) {
-          moe_permute::ep_gather_kernel<scalar_t, 4>
+          moe_permute::ep_gather_kernel<scalar_t, 4, id_t, Mapped>
               <<<grid, block, 0, at::hip::getCurrentHIPStream()>>>(
                   a_tensor->data_ptr<scalar_t>(),
-                  topk_ids.data_ptr<int64_t>(),
+                  topk_ids.data_ptr<id_t>(),
                   topk_weights.data_ptr<float>(), inv_perm.data_ptr<int>(),
                   expert_map_ptr, output.data_ptr<scalar_t>(), hidden_size,
-                  topk_num, has_expert_map, num_tokens);
+                  topk_num, has_expert_map, num_tokens, route);
+        } else if (topk_num <= 8) {
+          moe_permute::ep_gather_kernel<scalar_t, 8, id_t, Mapped>
+              <<<grid, block, 0, at::hip::getCurrentHIPStream()>>>(
+                  a_tensor->data_ptr<scalar_t>(),
+                  topk_ids.data_ptr<id_t>(),
+                  topk_weights.data_ptr<float>(), inv_perm.data_ptr<int>(),
+                  expert_map_ptr, output.data_ptr<scalar_t>(), hidden_size,
+                  topk_num, has_expert_map, num_tokens, route);
         } else {
-          moe_permute::ep_gather_kernel<scalar_t, 8>
-              <<<grid, block, 0, at::hip::getCurrentHIPStream()>>>(
-                  a_tensor->data_ptr<scalar_t>(),
-                  topk_ids.data_ptr<int64_t>(),
-                  topk_weights.data_ptr<float>(), inv_perm.data_ptr<int>(),
-                  expert_map_ptr, output.data_ptr<scalar_t>(), hidden_size,
-                  topk_num, has_expert_map, num_tokens);
+          moe_permute::ep_gather_kernel<scalar_t, 32, id_t><<<grid,block,0,at::hip::getCurrentHIPStream()>>>(
+              a_tensor->data_ptr<scalar_t>(), topk_ids.data_ptr<id_t>(),topk_weights.data_ptr<float>(),inv_perm.data_ptr<int>(),
+              expert_map_ptr,output.data_ptr<scalar_t>(),hidden_size,topk_num,has_expert_map,num_tokens,route);
+        }
+        };
+        if(topk_ids.scalar_type()==at::kLong) {
+          if(has_expert_map) launch(int64_t{},std::true_type{});
+          else launch(int64_t{},std::false_type{});
+        } else {
+          if(has_expert_map) launch(int32_t{},std::true_type{});
+          else launch(int32_t{},std::false_type{});
         }
       });
 }
 
 void ep_build_m_indices(torch::Tensor topk_ids, torch::Tensor m_indices,
                         int local_num_experts, int alignment) {
-  if (topk_ids.numel() == 0 || m_indices.numel() == 0) {
+  routing::tensor(topk_ids,topk_ids); routing::tensor(m_indices,topk_ids);
+  TORCH_CHECK(topk_ids.dim()==2 && m_indices.dim()==1 && m_indices.numel()<=INT_MAX,"build indices shape/capacity mismatch");
+  routing::ids_shape(topk_ids,topk_ids.size(0),false); routing::dtype(m_indices,at::kInt);
+  routing::expert_shape(local_num_experts,alignment); routing::disjoint(topk_ids,m_indices);
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(topk_ids));
+
+  if (topk_ids.numel() == 0) {
+    if(m_indices.numel()) hipMemsetAsync(m_indices.data_ptr(),0xff,m_indices.nbytes(),at::hip::getCurrentHIPStream());
     return;
   }
 
@@ -1927,8 +1966,8 @@ void ep_build_m_indices(torch::Tensor topk_ids, torch::Tensor m_indices,
               "ep_build_m_indices expects int32 or int64 topk_ids");
   TORCH_CHECK(m_indices.scalar_type() == at::ScalarType::Int,
               "ep_build_m_indices expects int32 m_indices");
-  TORCH_CHECK(local_num_experts > 0 && local_num_experts <= EP_SCAN_MAX_EXPERTS,
-              "ep_build_m_indices supports 1 to 1024 experts");
+  TORCH_CHECK(local_num_experts > 0 && local_num_experts <= routing::max_experts,
+              "ep_build_m_indices supports 1 to 1200 experts");
   TORCH_CHECK(alignment > 0, "ep_build_m_indices expects positive alignment");
 
   constexpr int BLOCK_THREADS = EP_SCAN_MAX_EXPERTS;
@@ -1949,16 +1988,27 @@ void ep_fused_quant_scatter(torch::Tensor input, // fp16 or bf16
                             torch::Tensor aq_out, torch::Tensor aq_scale_out,
                             torch::Tensor m_indices, torch::Tensor inv_perm,
                             int local_num_experts, int alignment) {
+  auto route = routing::legacy_scatter_check(input, topk_ids, expert_map_opt, expert_num_tokens, aq_out, aq_scale_out, m_indices, inv_perm, local_num_experts, alignment, std::nullopt, std::nullopt);
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+  TORCH_CHECK(input.scalar_type()==at::kHalf || input.scalar_type()==at::kBFloat16 || input.scalar_type()==at::kFloat, "expected FP16/BF16/FP32 input");
+  routing::dtype(aq_out,at::kChar);
   int num_tokens = input.size(0);
   int hidden_size = input.size(1);
   int K = topk_ids.size(1);
+  if(num_tokens==0) {
+    auto stream=at::hip::getCurrentHIPStream();
+    hipMemsetAsync(expert_num_tokens.data_ptr(),0,expert_num_tokens.nbytes(),stream);
+    if(m_indices.numel()) hipMemsetAsync(m_indices.data_ptr(),0xff,m_indices.nbytes(),stream);
+    return;
+  }
+
 
   TORCH_CHECK(hidden_size % 16 == 0,
               "Hidden size must be divisible by 16 for int4 copy");
-  TORCH_CHECK(K <= 8, "ep_fused_quant_scatter supports topk <= 8");
+  TORCH_CHECK(K >= 1 && K <= 30, "ep_fused_quant_scatter supports topk 1..30");
   TORCH_CHECK(
-      local_num_experts > 0 && local_num_experts <= EP_SCAN_MAX_EXPERTS,
-      "ep_fused_quant_scatter supports 1 to 1024 experts");
+      local_num_experts > 0 && local_num_experts <= routing::max_experts,
+      "ep_fused_quant_scatter supports 1 to 1200 experts");
 
   auto input_tensor = input.expect_contiguous();
   const int32_t *expert_map_ptr = nullptr;
@@ -1976,7 +2026,7 @@ void ep_fused_quant_scatter(torch::Tensor input, // fp16 or bf16
     moe_permute::ep_scan_kernel<EP_SCAN_MAX_EXPERTS>
         <<<1, EP_SCAN_MAX_EXPERTS, 0, stream>>>(
             expert_counters_ptr, expert_counters_ptr, local_num_experts,
-            alignment);
+            alignment, route.capacity);
   }
   // scatter
   {
@@ -1993,11 +2043,11 @@ void ep_fused_quant_scatter(torch::Tensor input, // fp16 or bf16
                                                 GROUP_SIZE, NUM_WARPS>
               <<<grid, block, shmem_size, stream>>>(
                   input_tensor->data_ptr<scalar_t>(),
-                  topk_ids.data_ptr<int64_t>(), expert_map_ptr,
+                  topk_ids.data_ptr(), expert_map_ptr,
                   expert_counters_ptr, aq_out.data_ptr<int8_t>(),
                   aq_scale_out.data_ptr<float>(), inv_perm.data_ptr<int32_t>(),
                   m_indices.data_ptr<int32_t>(), num_tokens, K,
-                  local_num_experts, hidden_size, has_expert_map);
+                  local_num_experts, hidden_size, has_expert_map, route);
         });
   }
 }
@@ -2011,36 +2061,43 @@ void ep_fused_fp8_quant_scatter(torch::Tensor input, torch::Tensor topk_ids,
                                 torch::Tensor inv_perm,
                                 int local_num_experts, int alignment,
                                 int fp8type, bool fill_padded_m_indices) {
+  auto route = routing::legacy_scatter_check(input, topk_ids, expert_map_opt, expert_num_tokens, aq_out, aq_scale_out, m_indices, inv_perm, local_num_experts, alignment, std::nullopt, std::nullopt);
+  TORCH_CHECK(aq_out.element_size() == 1,
+              "ep_fused_fp8_quant_scatter expects one-byte fp8 output");
+  TORCH_CHECK(fp8type == 0 || fp8type == 1,
+              "ep_fused_fp8_quant_scatter fp8type must be 0(e4m3) or 1(e5m2)");
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+  TORCH_CHECK(input.scalar_type()==at::kHalf || input.scalar_type()==at::kBFloat16 || input.scalar_type()==at::kFloat, "expected FP16/BF16/FP32 input");
   int num_tokens = input.size(0);
   int hidden_size = input.size(1);
   int K = topk_ids.size(1);
-
-  if (num_tokens == 0) {
+  if(num_tokens==0) {
+    auto stream=at::hip::getCurrentHIPStream();
+    hipMemsetAsync(expert_num_tokens.data_ptr(),0,expert_num_tokens.nbytes(),stream);
+    if(m_indices.numel()) hipMemsetAsync(m_indices.data_ptr(),0xff,m_indices.nbytes(),stream);
     return;
   }
+
+
 
   TORCH_CHECK(input.dim() == 2 && aq_out.dim() == 2,
               "ep_fused_fp8_quant_scatter expects 2D tensors");
   TORCH_CHECK(input.is_contiguous() && aq_out.is_contiguous(),
               "ep_fused_fp8_quant_scatter expects contiguous tensors");
-  TORCH_CHECK(aq_out.element_size() == 1,
-              "ep_fused_fp8_quant_scatter expects one-byte fp8 output");
   TORCH_CHECK(aq_scale_out.scalar_type() == at::ScalarType::Float,
               "ep_fused_fp8_quant_scatter expects fp32 output scales");
-  TORCH_CHECK(topk_ids.scalar_type() == at::ScalarType::Long,
-              "ep_fused_fp8_quant_scatter expects int64 topk_ids");
+  TORCH_CHECK((topk_ids.scalar_type() == at::ScalarType::Long || topk_ids.scalar_type() == at::ScalarType::Int),
+              "ep_fused_fp8_quant_scatter expects int32/int64 topk_ids");
   TORCH_CHECK(expert_num_tokens.scalar_type() == at::ScalarType::Int &&
                   inv_perm.scalar_type() == at::ScalarType::Int &&
                   m_indices.scalar_type() == at::ScalarType::Int,
               "ep_fused_fp8_quant_scatter expects int32 index tensors");
   TORCH_CHECK(hidden_size % 16 == 0,
               "ep_fused_fp8_quant_scatter hidden size must be divisible by 16");
-  TORCH_CHECK(K <= 8, "ep_fused_fp8_quant_scatter supports topk <= 8");
-  TORCH_CHECK(fp8type == 0 || fp8type == 1,
-              "ep_fused_fp8_quant_scatter fp8type must be 0(e4m3) or 1(e5m2)");
+  TORCH_CHECK(K >= 1 && K <= 30, "ep_fused_fp8_quant_scatter supports topk 1..30");
   TORCH_CHECK(
-      local_num_experts > 0 && local_num_experts <= EP_SCAN_MAX_EXPERTS,
-      "ep_fused_fp8_quant_scatter supports 1 to 1024 experts");
+      local_num_experts > 0 && local_num_experts <= routing::max_experts,
+      "ep_fused_fp8_quant_scatter supports 1 to 1200 experts");
 
   const int32_t *expert_map_ptr = nullptr;
   bool has_expert_map = false;
@@ -2056,12 +2113,12 @@ void ep_fused_fp8_quant_scatter(torch::Tensor input, torch::Tensor topk_ids,
     moe_permute::ep_scan_fill_m_indices_kernel<EP_SCAN_MAX_EXPERTS, true>
         <<<1, EP_SCAN_MAX_EXPERTS, 0, stream>>>(
             expert_counters_ptr, expert_counters_ptr,
-            m_indices.data_ptr<int32_t>(), local_num_experts, alignment);
+            m_indices.data_ptr<int32_t>(), local_num_experts, alignment, route.capacity);
   } else {
     moe_permute::ep_scan_fill_m_indices_kernel<EP_SCAN_MAX_EXPERTS, false>
         <<<1, EP_SCAN_MAX_EXPERTS, 0, stream>>>(
             expert_counters_ptr, expert_counters_ptr,
-            m_indices.data_ptr<int32_t>(), local_num_experts, alignment);
+            m_indices.data_ptr<int32_t>(), local_num_experts, alignment, route.capacity);
   }
 
   constexpr int BLOCK_SIZE = 1024;
@@ -2073,16 +2130,23 @@ void ep_fused_fp8_quant_scatter(torch::Tensor input, torch::Tensor topk_ids,
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(),
       "ep_fused_fp8_quant_scatter", [&] {
+        auto launch = [&](auto k_max, auto direct64) {
         moe_permute::ep_fp8_quant_scatter_kernel<scalar_t, BLOCK_SIZE,
-                                                 GROUP_SIZE,
-                                                 BLOCK_SIZE / WARP_SIZE>
+                                                 GROUP_SIZE, BLOCK_SIZE / WARP_SIZE,
+                                                 decltype(k_max)::value, decltype(direct64)::value>
             <<<grid, block, shmem_size, stream>>>(
-                input.data_ptr<scalar_t>(), topk_ids.data_ptr<int64_t>(),
+                input.data_ptr<scalar_t>(), topk_ids.data_ptr(),
                 expert_map_ptr, expert_counters_ptr,
                 reinterpret_cast<uint8_t *>(aq_out.data_ptr()),
                 aq_scale_out.data_ptr<float>(), inv_perm.data_ptr<int32_t>(),
                 m_indices.data_ptr<int32_t>(), num_tokens, K,
-                local_num_experts, hidden_size, fp8type, has_expert_map);
+                local_num_experts, hidden_size, fp8type, has_expert_map, route);
+        };
+        if(K<=8) {
+          if(!expert_map_opt && topk_ids.scalar_type()==at::kLong)
+            launch(std::integral_constant<int,8>{},std::true_type{});
+          else launch(std::integral_constant<int,8>{},std::false_type{});
+        } else launch(std::integral_constant<int,32>{},std::false_type{});
       });
 }
 
@@ -2096,17 +2160,27 @@ void ep_fused_smooth_quant_scatter(torch::Tensor input,
                                    torch::Tensor m_indices,
                                    torch::Tensor inv_perm,
                                    int local_num_experts, int alignment) {
+  auto route = routing::legacy_scatter_check(input, topk_ids, expert_map_opt, expert_offsets, aq_out, aq_scale_out, m_indices, inv_perm, local_num_experts, alignment, smooth_scale, std::nullopt);
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+  TORCH_CHECK(input.scalar_type()==at::kHalf || input.scalar_type()==at::kBFloat16 || input.scalar_type()==at::kFloat, "expected FP16/BF16/FP32 input");
+  routing::dtype(aq_out,at::kChar);
   int num_tokens = input.size(0);
   int hidden_size = input.size(1);
   int K = topk_ids.size(1);
+  if(num_tokens==0) {
+    auto stream=at::hip::getCurrentHIPStream();
+    hipMemsetAsync(expert_offsets.data_ptr(),0,expert_offsets.nbytes(),stream);
+    if(m_indices.numel()) hipMemsetAsync(m_indices.data_ptr(),0xff,m_indices.nbytes(),stream);
+    return;
+  }
+
 
   TORCH_CHECK(smooth_scale.scalar_type() == at::ScalarType::Float,
               "Smooth scale must be float32");
-  TORCH_CHECK(K == 4 || K == 8, "TopK must be 4 or 8");
   TORCH_CHECK(hidden_size % 16 == 0,
               "ep_fused_smooth_quant_scatter expects hidden size divisible "
               "by 16");
-  TORCH_CHECK(K <= 8, "ep_fused_smooth_quant_scatter supports topk <= 8");
+  TORCH_CHECK(K >= 1 && K <= 30, "ep_fused_smooth_quant_scatter supports topk 1..30");
 
   auto input_tensor = input.expect_contiguous();
   const int32_t *expert_map_ptr = nullptr;
@@ -2139,26 +2213,26 @@ void ep_fused_smooth_quant_scatter(torch::Tensor input,
                 scalar_t, CURR_BLOCK_SIZE, VEC_SIZE>
                 <<<grid, block, shmem_size, stream>>>(
                     input_tensor->data_ptr<scalar_t>(),
-                    topk_ids.data_ptr<int64_t>(), expert_map_ptr,
+                    topk_ids.data_ptr(), expert_map_ptr,
                     expert_offsets_ptr, aq_out.data_ptr<int8_t>(),
                     aq_scale_out.data_ptr<float>(),
                     inv_perm.data_ptr<int32_t>(),
                     m_indices.data_ptr<int32_t>(),
                     smooth_scale.data_ptr<float>(), num_tokens, K, hidden_size,
-                    has_expert_map);
+                    has_expert_map, route);
           } else {
             dim3 grid((num_tokens + 1) / 2);
             moe_permute::quant_scatter_smooth_low_reg_kernel<
                 scalar_t, CURR_BLOCK_SIZE, VEC_SIZE>
                 <<<grid, block, shmem_size, stream>>>(
                     input_tensor->data_ptr<scalar_t>(),
-                    topk_ids.data_ptr<int64_t>(), expert_map_ptr,
+                    topk_ids.data_ptr(), expert_map_ptr,
                     expert_offsets_ptr, aq_out.data_ptr<int8_t>(),
                     aq_scale_out.data_ptr<float>(),
                     inv_perm.data_ptr<int32_t>(),
                     m_indices.data_ptr<int32_t>(),
                     smooth_scale.data_ptr<float>(), num_tokens, K, hidden_size,
-                    has_expert_map);
+                    has_expert_map, route);
           }
         } else if (hidden_size == 2048) {
           constexpr int CURR_BLOCK_SIZE = 128;
@@ -2169,26 +2243,26 @@ void ep_fused_smooth_quant_scatter(torch::Tensor input,
                 scalar_t, CURR_BLOCK_SIZE, VEC_SIZE>
                 <<<grid, block, shmem_size, stream>>>(
                     input_tensor->data_ptr<scalar_t>(),
-                    topk_ids.data_ptr<int64_t>(), expert_map_ptr,
+                    topk_ids.data_ptr(), expert_map_ptr,
                     expert_offsets_ptr, aq_out.data_ptr<int8_t>(),
                     aq_scale_out.data_ptr<float>(),
                     inv_perm.data_ptr<int32_t>(),
                     m_indices.data_ptr<int32_t>(),
                     smooth_scale.data_ptr<float>(), num_tokens, K, hidden_size,
-                    has_expert_map);
+                    has_expert_map, route);
           } else {
             dim3 grid((num_tokens + 1) / 2);
             moe_permute::quant_scatter_smooth_low_reg_kernel<
                 scalar_t, CURR_BLOCK_SIZE, VEC_SIZE>
                 <<<grid, block, shmem_size, stream>>>(
                     input_tensor->data_ptr<scalar_t>(),
-                    topk_ids.data_ptr<int64_t>(), expert_map_ptr,
+                    topk_ids.data_ptr(), expert_map_ptr,
                     expert_offsets_ptr, aq_out.data_ptr<int8_t>(),
                     aq_scale_out.data_ptr<float>(),
                     inv_perm.data_ptr<int32_t>(),
                     m_indices.data_ptr<int32_t>(),
                     smooth_scale.data_ptr<float>(), num_tokens, K, hidden_size,
-                    has_expert_map);
+                    has_expert_map, route);
           }
         } else if (hidden_size == 4096) {
           constexpr int CURR_BLOCK_SIZE = 256;
@@ -2199,26 +2273,26 @@ void ep_fused_smooth_quant_scatter(torch::Tensor input,
                 scalar_t, CURR_BLOCK_SIZE, VEC_SIZE>
                 <<<grid, block, shmem_size, stream>>>(
                     input_tensor->data_ptr<scalar_t>(),
-                    topk_ids.data_ptr<int64_t>(), expert_map_ptr,
+                    topk_ids.data_ptr(), expert_map_ptr,
                     expert_offsets_ptr, aq_out.data_ptr<int8_t>(),
                     aq_scale_out.data_ptr<float>(),
                     inv_perm.data_ptr<int32_t>(),
                     m_indices.data_ptr<int32_t>(),
                     smooth_scale.data_ptr<float>(), num_tokens, K, hidden_size,
-                    has_expert_map);
+                    has_expert_map, route);
           } else {
             dim3 grid((num_tokens + 1) / 2);
             moe_permute::quant_scatter_smooth_low_reg_kernel<
                 scalar_t, CURR_BLOCK_SIZE, VEC_SIZE>
                 <<<grid, block, shmem_size, stream>>>(
                     input_tensor->data_ptr<scalar_t>(),
-                    topk_ids.data_ptr<int64_t>(), expert_map_ptr,
+                    topk_ids.data_ptr(), expert_map_ptr,
                     expert_offsets_ptr, aq_out.data_ptr<int8_t>(),
                     aq_scale_out.data_ptr<float>(),
                     inv_perm.data_ptr<int32_t>(),
                     m_indices.data_ptr<int32_t>(),
                     smooth_scale.data_ptr<float>(), num_tokens, K, hidden_size,
-                    has_expert_map);
+                    has_expert_map, route);
           }
         } else if (hidden_size == 7168) {
           constexpr int CURR_BLOCK_SIZE = 448;
@@ -2229,26 +2303,26 @@ void ep_fused_smooth_quant_scatter(torch::Tensor input,
                 scalar_t, CURR_BLOCK_SIZE, VEC_SIZE>
                 <<<grid, block, shmem_size, stream>>>(
                     input_tensor->data_ptr<scalar_t>(),
-                    topk_ids.data_ptr<int64_t>(), expert_map_ptr,
+                    topk_ids.data_ptr(), expert_map_ptr,
                     expert_offsets_ptr, aq_out.data_ptr<int8_t>(),
                     aq_scale_out.data_ptr<float>(),
                     inv_perm.data_ptr<int32_t>(),
                     m_indices.data_ptr<int32_t>(),
                     smooth_scale.data_ptr<float>(), num_tokens, K, hidden_size,
-                    has_expert_map);
+                    has_expert_map, route);
           } else {
             dim3 grid((num_tokens + 1) / 2);
             moe_permute::quant_scatter_smooth_low_reg_kernel<
                 scalar_t, CURR_BLOCK_SIZE, VEC_SIZE>
                 <<<grid, block, shmem_size, stream>>>(
                     input_tensor->data_ptr<scalar_t>(),
-                    topk_ids.data_ptr<int64_t>(), expert_map_ptr,
+                    topk_ids.data_ptr(), expert_map_ptr,
                     expert_offsets_ptr, aq_out.data_ptr<int8_t>(),
                     aq_scale_out.data_ptr<float>(),
                     inv_perm.data_ptr<int32_t>(),
                     m_indices.data_ptr<int32_t>(),
                     smooth_scale.data_ptr<float>(), num_tokens, K, hidden_size,
-                    has_expert_map);
+                    has_expert_map, route);
           }
         } else if (hidden_size == 8192) {
           constexpr int CURR_BLOCK_SIZE = 512;
@@ -2259,26 +2333,26 @@ void ep_fused_smooth_quant_scatter(torch::Tensor input,
                 scalar_t, CURR_BLOCK_SIZE, VEC_SIZE>
                 <<<grid, block, shmem_size, stream>>>(
                     input_tensor->data_ptr<scalar_t>(),
-                    topk_ids.data_ptr<int64_t>(), expert_map_ptr,
+                    topk_ids.data_ptr(), expert_map_ptr,
                     expert_offsets_ptr, aq_out.data_ptr<int8_t>(),
                     aq_scale_out.data_ptr<float>(),
                     inv_perm.data_ptr<int32_t>(),
                     m_indices.data_ptr<int32_t>(),
                     smooth_scale.data_ptr<float>(), num_tokens, K, hidden_size,
-                    has_expert_map);
+                    has_expert_map, route);
           } else {
             dim3 grid((num_tokens + 1) / 2);
             moe_permute::quant_scatter_smooth_low_reg_kernel<
                 scalar_t, CURR_BLOCK_SIZE, VEC_SIZE>
                 <<<grid, block, shmem_size, stream>>>(
                     input_tensor->data_ptr<scalar_t>(),
-                    topk_ids.data_ptr<int64_t>(), expert_map_ptr,
+                    topk_ids.data_ptr(), expert_map_ptr,
                     expert_offsets_ptr, aq_out.data_ptr<int8_t>(),
                     aq_scale_out.data_ptr<float>(),
                     inv_perm.data_ptr<int32_t>(),
                     m_indices.data_ptr<int32_t>(),
                     smooth_scale.data_ptr<float>(), num_tokens, K, hidden_size,
-                    has_expert_map);
+                    has_expert_map, route);
           }
         } else if (hidden_size == 16384) {
           constexpr int CURR_BLOCK_SIZE = 1024;
@@ -2289,41 +2363,41 @@ void ep_fused_smooth_quant_scatter(torch::Tensor input,
                 scalar_t, CURR_BLOCK_SIZE, VEC_SIZE>
                 <<<grid, block, shmem_size, stream>>>(
                     input_tensor->data_ptr<scalar_t>(),
-                    topk_ids.data_ptr<int64_t>(), expert_map_ptr,
+                    topk_ids.data_ptr(), expert_map_ptr,
                     expert_offsets_ptr, aq_out.data_ptr<int8_t>(),
                     aq_scale_out.data_ptr<float>(),
                     inv_perm.data_ptr<int32_t>(),
                     m_indices.data_ptr<int32_t>(),
                     smooth_scale.data_ptr<float>(), num_tokens, K, hidden_size,
-                    has_expert_map);
+                    has_expert_map, route);
           } else {
             dim3 grid((num_tokens + 1) / 2);
             moe_permute::quant_scatter_smooth_low_reg_kernel<
                 scalar_t, CURR_BLOCK_SIZE, VEC_SIZE>
                 <<<grid, block, shmem_size, stream>>>(
                     input_tensor->data_ptr<scalar_t>(),
-                    topk_ids.data_ptr<int64_t>(), expert_map_ptr,
+                    topk_ids.data_ptr(), expert_map_ptr,
                     expert_offsets_ptr, aq_out.data_ptr<int8_t>(),
                     aq_scale_out.data_ptr<float>(),
                     inv_perm.data_ptr<int32_t>(),
                     m_indices.data_ptr<int32_t>(),
                     smooth_scale.data_ptr<float>(), num_tokens, K, hidden_size,
-                    has_expert_map);
+                    has_expert_map, route);
           }
         } else {
           constexpr int FALLBACK_BLOCK_SIZE = 256;
           dim3 grid(num_tokens);
           dim3 block(FALLBACK_BLOCK_SIZE);
           moe_permute::quant_scatter_smooth_opt_kernel<scalar_t,
-                                                       FALLBACK_BLOCK_SIZE, 8>
+                                                       FALLBACK_BLOCK_SIZE, 32>
               <<<grid, block, shmem_size, stream>>>(
                   input_tensor->data_ptr<scalar_t>(),
-                  topk_ids.data_ptr<int64_t>(), expert_map_ptr,
+                  topk_ids.data_ptr(), expert_map_ptr,
                   expert_offsets_ptr, aq_out.data_ptr<int8_t>(),
                   aq_scale_out.data_ptr<float>(),
                   inv_perm.data_ptr<int32_t>(), m_indices.data_ptr<int32_t>(),
                   smooth_scale.data_ptr<float>(), num_tokens, K,
-                  local_num_experts, hidden_size, has_expert_map);
+                  local_num_experts, hidden_size, has_expert_map, route);
         }
       });
 }

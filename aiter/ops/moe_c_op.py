@@ -611,7 +611,7 @@ def moe_c_topk_softmax(
 # - input: contiguous [..., 2N], last dim split as [gate, up].
 # - out: contiguous [..., N], same dtype as input.
 # - rows_per_block/vec_size optionally override the HIP launch config.
-@compile_ops("module_moe_c_activation")
+@compile_ops("module_moe_c_silu")
 def moe_c_silu_and_mul(
     out: torch.Tensor,
     input: torch.Tensor,

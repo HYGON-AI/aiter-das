@@ -107,7 +107,7 @@ namespace py = pybind11;
 
 #define ACTIVATION_PYBIND                                                                               \
       m.def("silu_and_mul", &aiter::silu_and_mul, "Activation function used in SwiGLU.",                \
-            py::arg("out"), py::arg("input"));                                                          \
+            py::arg("out"), py::arg("input"), py::arg("limit") = 0.0f);                                 \
       m.def("scaled_silu_and_mul", &aiter::scaled_silu_and_mul, "Activation function used in scaled SwiGLU.",\
             py::arg("out"), py::arg("input"), py::arg("scale"));                                             \
       m.def("gelu_and_mul", &aiter::gelu_and_mul, "Activation function used in GELU.",                       \
@@ -146,6 +146,12 @@ namespace py = pybind11;
             py::arg("out"), py::arg("input"), py::arg("mask_m"), py::arg("expect_m") = -1);              \
       m.def("relu2", &aiter::relu2, "out = relu(x)^2.",                                   \
             py::arg("out"), py::arg("input"));
+
+#define REDUCE_SUM_PYBIND                                                              \
+      m.def("reduce_sum", &aiter::reduce_sum,                                            \
+            "Row-wise reduce-sum along the last dimension.",                             \
+            py::arg("out"), py::arg("input"),                                            \
+            py::arg("waves_per_block") = -1);
 
 #define MOE_C_ACTIVATION_PYBIND                                                        \
       m.def("moe_c_silu_and_mul",                                                      \
@@ -621,6 +627,31 @@ namespace py = pybind11;
           py::arg("ssm_state_indices") = std::nullopt,                                          \
           py::arg("num_accepted_tokens") = std::nullopt,                                        \
           py::arg("use_qk_l2norm_in_kernel") = false, py::arg("is_kda") = false);               \
+                                                                                                \
+                                                                                                \
+    m.def("sglang_fused_sigmoid_gating_delta_rule_update",                                      \
+          &aiter::native::sglang_fused_sigmoid_gating_delta_rule_update,                        \
+          py::arg("A_log"), py::arg("a"), py::arg("dt_bias"),                                   \
+          py::arg("softplus_beta"), py::arg("softplus_threshold"),                              \
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("b"),                               \
+          py::arg("initial_state_source") = std::nullopt,                                       \
+          py::arg("initial_state_indices") = std::nullopt,                                      \
+          py::arg("scale") = std::nullopt,                                                      \
+          py::arg("use_qk_l2norm_in_kernel") = false,                                           \
+          py::arg("cu_seqlens") = std::nullopt,                                                 \
+          py::arg("is_kda") = false,                                                            \
+          py::arg("lower_bound") = std::nullopt,                                                \
+          py::arg("beta_scale") = 1.0f,                                                         \
+          py::arg("disable_state_update") = false,                                              \
+          py::arg("intermediate_states_buffer") = std::nullopt,                                 \
+          py::arg("intermediate_state_indices") = std::nullopt,                                 \
+          py::arg("cache_steps") = 0,                                                           \
+          py::arg("retrieve_parent_token") = std::nullopt,                                      \
+          py::arg("cache_replayssm_inputs") = false,                                            \
+          py::arg("replayssm_rawv") = std::nullopt,                                             \
+          py::arg("replayssm_rawk") = std::nullopt,                                             \
+          py::arg("replayssm_g") = std::nullopt,                                                \
+          py::arg("replayssm_beta") = std::nullopt);                                            \
                                                                                                 \
     m.def("aiter_fused_recurrent_gated_delta_rule_packed_decode",                               \
           &aiter::native::aiter_fused_recurrent_gated_delta_rule_packed_decode,                 \
@@ -1462,6 +1493,90 @@ namespace py = pybind11;
           py::arg("use_ue8m0") = false,                                  \
           "Per-token-group FP8 dynamic quantization.");
 
+// Fast HIP RMSNorm family (module_rmsnorm_quant), ported from aiter-github.
+// Independent of RMSNORM_PYBIND below: these take aiter_tensor_t and live in
+// their own JIT module. See csrc/include/rmsnorm_quant.h for the HCU
+// architecture cuts (no fp4, fp8/e8m0 only under GPU_ENABLE_FP8,
+// scale_layout_m32k4 rejected).
+// DSV4 rotate / rope+rotate activation (module_dsv4_rotate_quant), ported from
+// aiter-github. See csrc/include/dsv4_rotate_quant.h for the HCU cuts: the
+// three fp4 entry points are not ported at all, and the fp8 one is compiled
+// only under GPU_ENABLE_FP8.
+#define DSV4_ROTATE_QUANT_PYBIND                                                           \
+    m.def("rotate_activation", &aiter::rotate_activation, py::arg("out"), py::arg("input")); \
+    m.def("rope_rotate_activation",                                                        \
+          &aiter::rope_rotate_activation,                                                  \
+          py::arg("out"),                                                                  \
+          py::arg("input"),                                                                \
+          py::arg("cos"),                                                                  \
+          py::arg("sin"),                                                                  \
+          py::arg("positions"),                                                            \
+          py::arg("rope_dim"),                                                             \
+          py::arg("do_rotate_act") = true);                                                \
+    DSV4_ROTATE_QUANT_FP8_PYBIND
+
+#ifdef GPU_ENABLE_FP8
+#define DSV4_ROTATE_QUANT_FP8_PYBIND                                                       \
+    m.def("rope_rotate_activation_fp8quant",                                               \
+          &aiter::rope_rotate_activation_fp8quant,                                          \
+          py::arg("out"),                                                                  \
+          py::arg("scale"),                                                                \
+          py::arg("input"),                                                                \
+          py::arg("cos"),                                                                  \
+          py::arg("sin"),                                                                  \
+          py::arg("positions"),                                                            \
+          py::arg("rope_dim"),                                                             \
+          py::arg("group_size")    = 128,                                                  \
+          py::arg("do_rotate_act") = true);
+#else
+// gfx936: no packed fp8 conversion, so the entry point is not compiled and the
+// Python wrapper raises AttributeError rather than returning zeros.
+#define DSV4_ROTATE_QUANT_FP8_PYBIND
+#endif
+
+#define RMSNORM_QUANT_PYBIND                            \
+    AITER_SET_STREAM_PYBIND;                            \
+    m.def("add_rmsnorm_quant",                          \
+          &aiter::add_rmsnorm_quant,                    \
+          py::arg("out"),                               \
+          py::arg("input"),                             \
+          py::arg("residual_in"),                       \
+          py::arg("residual_out"),                      \
+          py::arg("scale"),                             \
+          py::arg("weight"),                            \
+          py::arg("epsilon"),                           \
+          py::arg("group_size")         = 0,            \
+          py::arg("shuffle_scale")      = false,        \
+          py::arg("gemma_norm")         = false,        \
+          py::arg("scale_layout_m32k4") = false);       \
+    m.def("add_rmsnorm",                                \
+          &aiter::add_rmsnorm,                          \
+          py::arg("out"),                               \
+          py::arg("input"),                             \
+          py::arg("residual_in"),                       \
+          py::arg("residual_out"),                      \
+          py::arg("weight"),                            \
+          py::arg("epsilon"),                           \
+          py::arg("gemma_norm") = false);               \
+    m.def("rmsnorm_quant",                              \
+          &aiter::rmsnorm_quant,                        \
+          py::arg("out"),                               \
+          py::arg("input"),                             \
+          py::arg("scale"),                             \
+          py::arg("weight"),                            \
+          py::arg("epsilon"),                           \
+          py::arg("group_size")         = 0,            \
+          py::arg("shuffle_scale")      = false,        \
+          py::arg("gemma_norm")         = false,        \
+          py::arg("scale_layout_m32k4") = false);       \
+    m.def("rmsnorm",                                    \
+          &aiter::rmsnorm,                              \
+          py::arg("out"),                               \
+          py::arg("input"),                             \
+          py::arg("weight"),                            \
+          py::arg("epsilon"),                           \
+          py::arg("gemma_norm") = false);
+
 #define RMSNORM_PYBIND                                                                             \
     m.def("rms_norm_cu",                                                                           \
           &rms_norm,                                                                               \
@@ -1473,6 +1588,12 @@ namespace py = pybind11;
           py::arg("input"),                                                                        \
           py::arg("weight"),                                                                       \
           py::arg("epsilon"));                                             \
+    m.def("rmsnorm2d_fwd_out",                                                                     \
+          &rmsnorm2d_out,                                                                          \
+          py::arg("out"),                                                                          \
+          py::arg("input"),                                                                        \
+          py::arg("weight"),                                                                       \
+          py::arg("epsilon"));                                                                     \
     m.def("rmsnorm2d_fwd_with_add",                                                                \
           &rmsnorm2d_with_add,                                                                     \
           py::arg("out"),                                                                          \
@@ -1638,7 +1759,17 @@ namespace py = pybind11;
           py::arg("k_scale"),                                   \
           py::arg("v_scale"),                                   \
           py::arg("max_tokens_per_batch") = 0);                 \
-    m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);
+    m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way); \
+    m.def("fused_qk_rmsnorm",                                   \
+          &aiter::fused_qk_rmsnorm,                             \
+          py::arg("q"),                                         \
+          py::arg("q_weight"),                                  \
+          py::arg("q_eps"),                                     \
+          py::arg("k"),                                         \
+          py::arg("k_weight"),                                  \
+          py::arg("k_eps"),                                     \
+          py::arg("q_out") = std::nullopt,                      \
+          py::arg("k_out") = std::nullopt);
 
 #define SMOOTHQUANT_PYBIND                        \
       m.def("smoothquant_fwd", &smoothquant_fwd); \
@@ -1715,6 +1846,54 @@ namespace py = pybind11;
           py::arg("numRows"),                                                     \
           py::arg("stride0"),                                                     \
           py::arg("stride1"));
+
+// module_sample: torch-free sampling kernels taking aiter_tensor_t.
+// Deliberately does NOT register the aiter_tensor_t pybind class -- that class
+// is registered once by CUSTOM_ALL_REDUCE_PYBIND (via AITER_TENSOR_PYBIND) and
+// torch_to_aiter_pybind() builds instances from it, so registering it a second
+// time here would abort module import with "type already registered".
+#define SAMPLE_PYBIND                                                                \
+    AITER_SET_STREAM_PYBIND;                                                         \
+    m.def("greedy_sample", &aiter::greedy_sample, py::arg("out"), py::arg("input")); \
+    m.def("random_sample_outer_exponential",                                         \
+          &aiter::random_sample_outer_exponential,                                   \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("exponentials"),                                                   \
+          py::arg("temperature"),                                                    \
+          py::arg("eps") = 1e-10);                                                   \
+    m.def("random_sample",                                                           \
+          &aiter::random_sample,                                                     \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("temperature"),                                                    \
+          py::arg("lambd")         = 1.0,                                            \
+          py::arg("philox_seed")   = 0,                                              \
+          py::arg("philox_offset") = 0,                                              \
+          py::arg("eps")           = 1e-10);                                         \
+    m.def("mixed_sample_outer_exponential",                                          \
+          &aiter::mixed_sample_outer_exponential,                                    \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("exponentials"),                                                   \
+          py::arg("temperature"),                                                    \
+          py::arg("eps") = 1e-10);                                                   \
+    m.def("mixed_sample",                                                            \
+          &aiter::mixed_sample,                                                      \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("temperature"),                                                    \
+          py::arg("lambd")         = 1.0,                                            \
+          py::arg("philox_seed")   = 0,                                              \
+          py::arg("philox_offset") = 0,                                              \
+          py::arg("eps")           = 1e-10);                                         \
+    m.def("exponential",                                                             \
+          &aiter::exponential,                                                       \
+          py::arg("out"),                                                            \
+          py::arg("lambd")         = 1.0,                                            \
+          py::arg("philox_seed")   = 0,                                              \
+          py::arg("philox_offset") = 0,                                              \
+          py::arg("eps")           = 1e-10);
 
 #define SAMPLING_PYBIND                                                        \
     m.def("top_k_sampling_from_probs",                                         \

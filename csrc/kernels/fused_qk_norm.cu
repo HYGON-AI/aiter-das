@@ -2,12 +2,40 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "aiter_hip_common.h"
+#include "hip_compat.h"
 #include "py_itfs_common.h"
 #include "aiter_opus_plus.h"
 #include "dispatch_utils.h"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 namespace aiter {
+
+// Packed 2-wide fp32 multiply.
+//
+// v_pk_mul_f32 exists on gfx92a/gfx936/gfx938/gfx946 (the same arch list the
+// packed-multiply helper in csrc/include/ck_tile/vec_convert.h uses), but the
+// destination must not alias a source: "=v" is write-only, so the register
+// allocator is free to place the output over a source operand the instruction
+// still has to read. Writing into a separate `c` is what makes this safe --
+// the earlier in-place form ("=v"(x) with "v"(x) as input) produced correct
+// results on gfx938/DTK 26.10 and bf16 garbage on gfx936/DTK 26.04, because the
+// allocation differed.
+template <typename V>
+__device__ __forceinline__ V pk_mul_f32(const V& a, const V& b)
+{
+    V c;
+#if defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
+    asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(c) : "v"(a), "v"(b));
+#else
+    // Two scalar multiplies. The first result must not clobber a source the
+    // second still needs, hence the early-clobber "=&v" on the first output.
+    asm volatile("v_mul_f32 %[r0], %[a0], %[b0]\n\t"
+                 "v_mul_f32 %[r1], %[a1], %[b1]\n\t"
+                 : [r0] "=&v"(c[0]), [r1] "=v"(c[1])
+                 : [a0] "v"(a[0]), [a1] "v"(a[1]), [b0] "v"(b[0]), [b1] "v"(b[1]));
+#endif
+    return c;
+}
 
 // ============================================================================
 // Fused QK RMSNorm kernel with 2D grid: blockIdx.y selects Q (0) or K (1).
@@ -109,19 +137,22 @@ __global__ void fused_qk_rmsnorm_kernel(
         vec2_f* thread_data_float2 = reinterpret_cast<vec2_f*>(&thread_data_float);
         for(int i = 0; i < thread_data_size / 2; i++)
         {
-            asm volatile("v_pk_mul_f32 %0, %1, %2"
-                         : "=v"(thread_data_float2[i])
-                         : "v"(thread_data_float2[i]), "v"(rcp));
+            thread_data_float2[i] = pk_mul_f32(thread_data_float2[i], rcp);
         }
 
         for(int i = 0; i < thread_data_size / 2; i++)
         {
             vec2_f& thread_data_weight_float2 = rcp;
-            thread_data_weight_float2[0] = static_cast<float>(thread_data_weight[2 * i]);
-            thread_data_weight_float2[1] = static_cast<float>(thread_data_weight[2 * i + 1]);
-            asm volatile("v_pk_mul_f32 %0, %1, %2"
-                         : "=v"(thread_data_float2[i])
-                         : "v"(thread_data_float2[i]), "v"(thread_data_weight_float2));
+            // opus::cast, not static_cast: opus.hpp:884-891 defines bf16_t as
+            // `unsigned short` when __clang_major__ < 20 (DTK 26.04 ships
+            // clang 18; DTK 26.10 ships clang 22 and gets the real __bf16).
+            // Under the older toolchain static_cast<float> is an *integer*
+            // conversion of the raw bf16 bits, which silently produced output
+            // off by ~1e4 on gfx936 while gfx938 was fine. fp16_t is _Float16
+            // in both branches, which is why only bf16 broke.
+            thread_data_weight_float2[0] = opus::cast<float>(thread_data_weight[2 * i]);
+            thread_data_weight_float2[1] = opus::cast<float>(thread_data_weight[2 * i + 1]);
+            thread_data_float2[i] = pk_mul_f32(thread_data_float2[i], thread_data_weight_float2);
         }
 
         DTYPE_I* out_ptr = out_base + cur_idx * static_cast<int64_t>(out_stride);

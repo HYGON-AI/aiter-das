@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 // Modified by Hygon Information Technology Co., Ltd.: adapt vector loads and
-// quantization dispatch, handle zero scales, and add fused SwiGLU quantization.
+// quantization dispatch, handle zero scales, add fused SwiGLU quantization,
+// and optimize per-token INT8 quantization with wave-contained reductions.
 // SPDX-License-Identifier: Apache-2.0 AND MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 // Copyright (c) 2026 Hygon Information Technology Co., Ltd.
@@ -24,6 +25,7 @@
 #include "dispatch_utils.h"
 #include "hip_reduce.h"
 #include "quant_common.cuh"
+#include "hip_kernel_launch.h"
 #include "rocprim/rocprim.hpp"
 #include "vec_convert.h"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
@@ -33,7 +35,18 @@ const int32_t BlockSize           = 256;
 const int32_t groupQuantBlockSize = 64;
 
 namespace aiter {
-template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32>
+// E2M1 round-to-nearest-even fallback for architectures without native FP4.
+__device__ inline uint8_t group_fp4_rne(float value)
+{
+    const float a = fabsf(value);
+    const uint8_t sign = (__float_as_uint(value) >> 28) & 8;
+    const uint8_t q = a > 5.f ? 7 : a >= 3.5f ? 6 : a > 2.5f ? 5 :
+                      a >= 1.75f ? 4 : a > 1.25f ? 3 : a >= .75f ? 2 :
+                      a > .25f ? 1 : 0;
+    return sign | q;
+}
+
+template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, bool e8m0_scale = false>
 __global__ void
 dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       float* __restrict__ scale,
@@ -51,9 +64,10 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         return (x / 32 * scaleN_pad) * 32 + (y / 8) * 256 + (y % 4) * 64 + (x % 16) * 4 +
                (y % 8) / 4 * 2 + (x % 32) / 16;
     };
+    const int64_t capacity_rows = ori_rows;
     if(num_rows != nullptr)
     {
-        ori_rows = *num_rows * num_cols_factor;
+        ori_rows = min(ori_rows, max(int64_t(0), int64_t(*num_rows) * num_cols_factor));
     }
     int num_thread_per_group = group_size / thread_data_size;
     int64_t row_offset       = blockIdx.x * groupQuantBlockSize;
@@ -96,7 +110,9 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     // static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
     static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
     // const int32_t oob_i             = (cols + ooba_i - 1) / ooba_i * ooba_i;
-    const int64_t oob_o = (ori_rows * ori_cols + ooba_o - 1) / ooba_o * ooba_o;
+    const int64_t output_elements = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
+                                       ? ori_rows * ori_cols / 2 : ori_rows * ori_cols;
+    const int64_t oob_o = (output_elements + ooba_o - 1) / ooba_o * ooba_o;
     // auto buffer_i = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(input +
     // row_offset, oob_i); buffer_i.init_raw();
 
@@ -124,8 +140,15 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     float inverted_scale = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
                                ? fp4_scale(absMax) * inverted_DTYPE_MAX
                                : absMax * inverted_DTYPE_MAX;
+    if constexpr(e8m0_scale)
+    {
+        // E8M0 scale is the smallest power of two not below amax / 448.
+        const uint32_t bits = __float_as_uint(inverted_scale);
+        const uint32_t exponent = (bits >> 23) + ((bits & 0x7fffff) != 0);
+        inverted_scale = __uint_as_float(exponent << 23);
+    }
     row_offset           = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
-                               ? groupId * group_size / 2 + (threadIdx.x % num_thread_per_group) * vec_size_o
+                               ? (x * scaleN + y) * group_size / 2 + (threadIdx.x % num_thread_per_group) * vec_size_o
                                : groupId * group_size + (threadIdx.x % num_thread_per_group) * vec_size_o;
     if(threadIdx.x % num_thread_per_group == 0)
     {
@@ -143,9 +166,12 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         {
             if(shuffle_scale)
             {
-                groupId = y * ori_rows + x;
+                groupId = y * capacity_rows + x;
             }
-            scale[groupId] = inverted_scale;
+            if constexpr(e8m0_scale)
+                reinterpret_cast<uint8_t*>(scale)[groupId] = __float_as_uint(inverted_scale) >> 23;
+            else
+                scale[groupId] = inverted_scale;
         }
     }
     inverted_scale =
@@ -155,6 +181,38 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         inverted_scale = 127.0f / absMax;
     }
 
+#if defined(__gfx946__)
+    if constexpr(std::is_same_v<DTYPE_O, ck_tile::int8_t>)
+    {
+        // Keep each byte unsigned and pack explicitly: PMD currently mishandles
+        // the compiler's packed-byte sequence for negative INT8 values.
+#pragma unroll
+        for(int j = 0; j < thread_data_size; j += 4)
+        {
+            uint32_t bytes[4];
+#pragma unroll
+            for(int k = 0; k < 4; ++k)
+            {
+                float value = ck_tile::type_convert<float>(thread_data[j + k]) * inverted_scale;
+                const float rounded = rintf(value);
+                uint32_t converted;
+                asm volatile("v_cvt_i32_f32 %0, %1\n\tv_and_b32 %0, 255, %0"
+                             : "=&v"(converted) : "v"(rounded));
+                bytes[k] = converted;
+            }
+            uint32_t a=bytes[0], b=bytes[1], c=bytes[2], d=bytes[3];
+            asm volatile("v_lshlrev_b32 %1, 8, %1\n\t"
+                         "v_lshlrev_b32 %2, 16, %2\n\t"
+                         "v_lshlrev_b32 %3, 24, %3\n\t"
+                         "v_or_b32 %0, %0, %1\n\t"
+                         "v_or_b32 %0, %0, %2\n\t"
+                         "v_or_b32 %0, %0, %3"
+                         : "+v"(a), "+v"(b), "+v"(c), "+v"(d));
+            *reinterpret_cast<uint32_t*>(out + row_offset + j) = a;
+        }
+        return;
+    }
+#endif
     using DTYPE_STORE = typename ck_tile::vector_traits<DTYPE_O>::scalar_type;
     auto* out_ptr     = reinterpret_cast<DTYPE_STORE*>(out);
     auto buffer_o =
@@ -162,9 +220,43 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                   ck_tile::amd_buffer_coherence_enum::glc>(out_ptr, oob_o);
     buffer_o.init_raw();
 
-    auto out_s =
-        ck_tile::vec_convert<DTYPE_O, DTYPE_I, thread_data_size>(thread_data, inverted_scale)
-            .template get_as<DTYPE_STORE>();
+    ck_tile::vec_t<DTYPE_STORE, vec_size_o> out_s;
+    if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
+    {
+#pragma unroll
+        for(int j = 0; j < thread_data_size / 2; ++j)
+        {
+            const float a = ck_tile::type_convert<float>(thread_data[2 * j]);
+            const float b = ck_tile::type_convert<float>(thread_data[2 * j + 1]);
+#if defined(__gfx946__)
+            const uint32_t exponent = (__float_as_uint(inverted_scale) >> 23) & 255;
+            const uint32_t packed = __builtin_hcu_cvt_scale_pk_fp4_f32(a, b, exponent, 0, 0, 0);
+            out_s[j] = ((packed >> 2) & 15) | ((packed >> 6) & 240);
+#else
+            out_s[j] = group_fp4_rne(a / inverted_scale) |
+                       (group_fp4_rne(b / inverted_scale) << 4);
+#endif
+        }
+    }
+    else
+    {
+#if defined(__gfx946__) || defined(__gfx936__)
+        // Scalar conversion avoids the gfx946 PMD packed INT8 conversion defect;
+        // CK supplies software E4M3 conversion on gfx936.
+#pragma unroll
+        for(int j = 0; j < thread_data_size; ++j)
+        {
+            const float value = ck_tile::type_convert<float>(thread_data[j]) * inverted_scale;
+            if constexpr(std::is_same_v<DTYPE_O, ck_tile::int8_t>)
+                out_s[j] = static_cast<int8_t>(rintf(value));
+            else
+                out_s[j] = ck_tile::type_convert<DTYPE_O>(value);
+        }
+#else
+        out_s = ck_tile::vec_convert<DTYPE_O, DTYPE_I, thread_data_size>(thread_data, inverted_scale)
+                    .template get_as<DTYPE_STORE>();
+#endif
+    }
     if constexpr(thread_data_size <= 16)
     {
         buffer_o.set(row_offset, 0, true, out_s);
@@ -305,15 +397,50 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     return std::make_tuple(row_scale, reinterpret_cast<DTYPE_I*>(&vec_cur));
 }
 
+// Keep partial row maxima raw: a zero row must not contribute the per-token
+// zero-scale sentinel (1.0) to a tensor-wide reduction.
+template <typename DTYPE_I>
+__device__ float quant_row_absmax(const DTYPE_I* input, int cols)
+{
+    float value = 0.0f;
+    const auto* row = input + int64_t(blockIdx.x) * cols;
+    if(cols % 8 == 0 && reinterpret_cast<uintptr_t>(row) % 16 == 0)
+    {
+        using vec = ck_tile::vec_t<DTYPE_I, 8>;
+        for(int i = threadIdx.x; i < cols / 8; i += BlockSize)
+        {
+            const auto x = reinterpret_cast<const vec*>(row)[i];
+#pragma unroll
+            for(int j = 0; j < 8; ++j)
+                value = fmaxf(value, fabsf(ck_tile::type_convert<float>(x[j])));
+        }
+    }
+    else
+    {
+        for(int i = threadIdx.x; i < cols; i += BlockSize)
+            value = fmaxf(value, fabsf(ck_tile::type_convert<float>(row[i])));
+    }
+    return block_reduce<float, hipcub::Max, BlockSize, true>(value, hipcub::Max());
+}
+
 template <typename DTYPE_I, typename DTYPE_O>
 __global__ void
 data_to_scale_kernel(float* __restrict__ scale, const DTYPE_I* __restrict__ input, const int cols)
 {
-    auto res        = data_to_per_row_scale<DTYPE_I, DTYPE_O, 0>(input, cols);
-    float row_scale = std::get<0>(res);
+    const float row_max = quant_row_absmax(input, cols);
     if(threadIdx.x == 0)
     {
-        vllm::atomicMaxFloat(scale, row_scale);
+        vllm::atomicMaxFloat(scale, row_max);
+    }
+}
+
+template <typename DTYPE_O>
+__global__ void finalize_tensor_scale(float* scale)
+{
+    if(threadIdx.x == 0)
+    {
+        const float maximum = ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max());
+        *scale = *scale == 0.0f ? 1.0f : *scale / maximum;
     }
 }
 
@@ -478,13 +605,127 @@ __device__ void scaled_quant_vgpr_impl(DTYPE_O* __restrict__ out,
     }
 }
 
+template <typename DTYPE_O, typename DTYPE_I, int N>
+__device__ auto quant_convert_clamped(ck_tile::vec_t<DTYPE_I, N> values, float multiplier)
+{
+    ck_tile::vec_t<float, N> normalized;
+    const float maximum = ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max());
+    const float minimum = std::is_same_v<DTYPE_O, ck_tile::int8_t> ? -128.0f : -maximum;
+#pragma unroll
+    for(int j = 0; j < N; ++j)
+        normalized[j] = fminf(maximum, fmaxf(minimum,
+                            ck_tile::type_convert<float>(values[j]) * multiplier));
+    return ck_tile::vec_convert<DTYPE_O, float, N>(normalized, 1.0f);
+}
+
+template <typename DTYPE_I, typename DTYPE_O>
+__device__ void quant_store_row(DTYPE_O* out, const DTYPE_I* input,
+                                int cols, float multiplier)
+{
+    const int64_t offset = int64_t(blockIdx.x) * cols;
+    const auto* row = input + offset;
+    auto* dest = out + offset;
+    if constexpr(std::is_same_v<DTYPE_O, ck_tile::int8_t>)
+    {
+        // Construct each packed word from masked unsigned bytes.  In the
+        // gfx946 PMD SDK, the vector<int8> store produced 0xff in byte 3.
+        auto quant_byte = [&](int i) {
+            float v = ck_tile::type_convert<float>(row[i]) * multiplier;
+            float rounded = rintf(fminf(127.0f, fmaxf(-128.0f, v)));
+#if defined(__gfx946__)
+            // The failing PMD binary contains SDWA byte/word conversion.
+            // Keep conversion and byte masking as full-width instructions.
+            uint32_t q;
+            asm volatile("v_cvt_i32_f32 %0, %1\n\tv_and_b32 %0, 255, %0"
+                         : "=&v"(q) : "v"(rounded));
+            return q;
+#else
+            return static_cast<uint32_t>(static_cast<int>(rounded)) & 0xffu;
+#endif
+        };
+        if(cols % 4 == 0 && reinterpret_cast<uintptr_t>(dest) % 4 == 0)
+        {
+            for(int i = threadIdx.x * 4; i < cols; i += BlockSize * 4)
+            {
+                uint32_t a = quant_byte(i), b = quant_byte(i + 1);
+                uint32_t c = quant_byte(i + 2), d = quant_byte(i + 3);
+#if defined(__gfx946__)
+                asm volatile("v_lshlrev_b32 %1, 8, %1\n\t"
+                             "v_lshlrev_b32 %2, 16, %2\n\t"
+                             "v_lshlrev_b32 %3, 24, %3\n\t"
+                             "v_or_b32 %0, %0, %1\n\t"
+                             "v_or_b32 %0, %0, %2\n\t"
+                             "v_or_b32 %0, %0, %3"
+                             : "+v"(a), "+v"(b), "+v"(c), "+v"(d));
+                uint32_t packed = a;
+#else
+                uint32_t packed = a | (b << 8) | (c << 16) | (d << 24);
+#endif
+                reinterpret_cast<uint32_t*>(dest)[i / 4] = packed;
+            }
+        }
+        else
+        {
+            auto* bytes = reinterpret_cast<uint8_t*>(dest);
+            for(int i = threadIdx.x; i < cols; i += BlockSize)
+                bytes[i] = static_cast<uint8_t>(quant_byte(i));
+        }
+        return;
+    }
+    if(cols % 8 == 0 && reinterpret_cast<uintptr_t>(row) % 16 == 0 &&
+       reinterpret_cast<uintptr_t>(dest) % 8 == 0)
+    {
+        using vi = ck_tile::vec_t<DTYPE_I, 8>;
+        using vo = ck_tile::vec_t<DTYPE_O, 8>;
+        for(int i = threadIdx.x; i < cols / 8; i += BlockSize)
+            reinterpret_cast<vo*>(dest)[i] = quant_convert_clamped<DTYPE_O>(
+                reinterpret_cast<const vi*>(row)[i], multiplier);
+    }
+    else
+    {
+        for(int i = threadIdx.x * 2; i < cols; i += BlockSize * 2)
+        {
+            ck_tile::vec_t<DTYPE_I, 2> values;
+            values[0] = row[i];
+            values[1] = i + 1 < cols ? row[i + 1] : ck_tile::type_convert<DTYPE_I>(0.0f);
+            auto result = quant_convert_clamped<DTYPE_O>(values, multiplier);
+            dest[i] = result[0];
+            if(i + 1 < cols)
+                dest[i + 1] = result[1];
+        }
+    }
+}
+
 template <typename DTYPE_I, typename DTYPE_O>
 __global__ void scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                     const DTYPE_I* __restrict__ input,
                                     const float* __restrict__ scale,
                                     const int cols)
 {
-    scaled_quant_impl<DTYPE_I>(out, input, scale, cols);
+    quant_store_row(out, input, cols, 1.0f / *scale);
+}
+
+template <typename DTYPE_I, typename DTYPE_O>
+__global__ void dynamic_per_token_scaled_quant_safe_kernel(
+    DTYPE_O* out, float* scales, const DTYPE_I* input, int cols,
+    const int32_t* num_rows, int factor)
+{
+    if(num_rows != nullptr && int64_t(blockIdx.x) >= int64_t(*num_rows) * factor)
+        return;
+    float maximum = quant_row_absmax(input, cols);
+    if constexpr(std::is_same_v<DTYPE_O, ck_tile::int8_t>)
+        maximum = fmaxf(maximum, 1e-10f);
+    else if(cols == 32 || cols == 64 || cols == 128)
+        maximum = fmaxf(maximum, 1e-10f);
+    const float limit = ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max());
+    const float scale = maximum == 0.0f ? 1.0f : maximum / limit;
+    if(threadIdx.x == 0)
+        scales[blockIdx.x] = scale;
+    // Match the public Torch reference's FP32 reciprocal-then-multiply
+    // evaluation for INT8. Direct division can round differently at ties.
+    const float multiplier = std::is_same_v<DTYPE_O, ck_tile::int8_t>
+                                 ? (1.0f / maximum) * limit : 1.0f / scale;
+    quant_store_row(out, input, cols, multiplier);
 }
 
 template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16>
@@ -534,6 +775,56 @@ dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     {
         scaled_quant_vgpr_impl<DTYPE_I, DTYPE_O, thread_data_size, direct_multiplier>(
             out, vec_ptr, direct_multiplier ? &quant_multiplier : &row_scale, cols);
+    }
+}
+
+template <typename DTYPE_I, int cols>
+__global__ void dynamic_per_token_int8_quant_wave_kernel(
+    ck_tile::int8_t* __restrict__ out,
+    float* __restrict__ scale,
+    const DTYPE_I* __restrict__ input,
+    int rows,
+    const int32_t* __restrict__ num_rows,
+    int num_rows_factor)
+{
+    constexpr int group_size     = 32;
+    constexpr int vec_size       = 4;
+    constexpr int rows_per_block = 4;
+    constexpr int chunks         = cols / (group_size * vec_size);
+    static_assert(cols % (group_size * vec_size) == 0);
+    const int row = blockIdx.x * rows_per_block + threadIdx.x / group_size;
+    if(row >= rows || (num_rows != nullptr && row >= *num_rows * num_rows_factor))
+        return;
+
+    const int lane = threadIdx.x % group_size;
+    using vec_i    = ck_tile::vec_t<DTYPE_I, vec_size>;
+    using vec_o    = ck_tile::vec_t<ck_tile::int8_t, vec_size>;
+    vec_i values[chunks];
+    float abs_max = 0.0f;
+#pragma unroll
+    for(int c = 0; c < chunks; ++c)
+    {
+        const int64_t offset = int64_t(row) * cols + (lane + c * group_size) * vec_size;
+        values[c] = *reinterpret_cast<const vec_i*>(input + offset);
+#pragma unroll
+        for(int j = 0; j < vec_size; ++j)
+            abs_max = fmaxf(abs_max, fabsf(ck_tile::type_convert<float>(values[c][j])));
+    }
+    // Each row fits in half a wave; no LDS or block-wide synchronization is needed.
+#pragma unroll
+    for(int offset = group_size / 2; offset > 0; offset /= 2)
+        abs_max = fmaxf(abs_max, __shfl_xor(abs_max, offset, group_size));
+
+    abs_max = fmaxf(abs_max, 1e-10f);
+    const float multiplier = 127.0f / abs_max;
+    if(lane == 0)
+        scale[row] = abs_max * (1.0f / 127.0f);
+#pragma unroll
+    for(int c = 0; c < chunks; ++c)
+    {
+        const int64_t offset = int64_t(row) * cols + (lane + c * group_size) * vec_size;
+        *reinterpret_cast<vec_o*>(out + offset) =
+            ck_tile::vec_convert<ck_tile::int8_t, DTYPE_I, vec_size>(values[c], multiplier);
     }
 }
 
@@ -652,21 +943,49 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     scaled_quant_vgpr_impl<float, DTYPE_O, thread_data_size>(out, vec_ptr, &row_scale, cols);
 }
 
+inline void check_quant_buffers(const torch::Tensor& out, const torch::Tensor& input,
+                                const torch::Tensor& scale, bool per_tensor,
+                                bool allow_e8m0 = false)
+{
+    TORCH_CHECK(input.is_cuda() && out.is_cuda() && scale.is_cuda(),
+                "quant input, output and scale must be on a HIP device");
+    TORCH_CHECK(input.device() == out.device() && input.device() == scale.device(),
+                "quant buffers must be on the same device");
+    TORCH_CHECK(out.scalar_type() != torch::kFloat8_e4m3fnuz &&
+                scale.scalar_type() != torch::kFloat8_e4m3fnuz,
+                "Hygon quantization does not support float8_e4m3fnuz");
+    TORCH_CHECK(input.dim() >= 1 && input.size(-1) > 0, "quant requires a nonempty last dimension");
+    TORCH_CHECK(input.is_contiguous() && out.is_contiguous() && scale.is_contiguous(),
+                "quant buffers must be contiguous");
+    TORCH_CHECK(input.scalar_type() == torch::kHalf || input.scalar_type() == torch::kBFloat16,
+                "quant input must be FP16 or BF16");
+    TORCH_CHECK(out.numel() == input.numel(), "quant output size must match input");
+    TORCH_CHECK(scale.scalar_type() == torch::kFloat32 || (allow_e8m0 && scale.element_size() == 1),
+                "quant scale must be FP32 or supported E8M0 storage");
+    TORCH_CHECK(scale.numel() == (per_tensor ? 1 : input.numel() / input.size(-1)),
+                "quant scale has the wrong number of elements");
+    TORCH_CHECK(input.size(-1) <= INT32_MAX && input.numel() / input.size(-1) <= INT32_MAX,
+                "quant row/column count exceeds int32 range");
+}
+
 void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
                              torch::Tensor const& input, // [..., d]
                              torch::Tensor const& scale) // [1]
 {
+    check_quant_buffers(out, input, scale, true);
     const int cols = input.size(-1);
     int rows       = input.numel() / cols;
     dim3 grid(rows);
     dim3 block(BlockSize);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
+    if(rows == 0)
+        return;
     if(out.dtype() == torch::kInt8)
     {
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
             using input_dtype = typename t2ck<scalar_t>::type;
-            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+            launch_kernel(aiter::launch_policy::quant, aiter::scaled_quant_kernel<input_dtype, ck_tile::int8_t>, grid, block, stream,
                 reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 scale.data_ptr<float>(),
@@ -678,7 +997,7 @@ void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
     {
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
             using input_dtype = typename t2ck<scalar_t>::type;
-            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+            launch_kernel(aiter::launch_policy::quant, aiter::scaled_quant_kernel<input_dtype, FP8_TYPE>, grid, block, stream,
                 reinterpret_cast<FP8_TYPE*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 scale.data_ptr<float>(),
@@ -692,17 +1011,21 @@ void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
     }
 }
 
-#define DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA)      \
-    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {              \
-        using input_dtype = typename t2ck<scalar_t>::type;                                  \
-        aiter::quant_kernel<input_dtype, DTYPE_O, THREAD_DATA><<<grid, block, 0, stream>>>( \
-            reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                     \
-            scales.data_ptr<float>(),                                                       \
-            reinterpret_cast<input_dtype*>(input.data_ptr()),                               \
-            scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,                   \
-            cols,                                                                           \
-            num_rows_ptr,                                                                   \
-            num_rows_factor);                                                               \
+#define DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA)         \
+    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                 \
+        using input_dtype = typename t2ck<scalar_t>::type;                                     \
+        if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)                               \
+            aiter::quant_kernel<input_dtype, DTYPE_O, THREAD_DATA><<<grid, block, 0, stream>>>(\
+                reinterpret_cast<DTYPE_O*>(out.data_ptr()), scales.data_ptr<float>(),          \
+                reinterpret_cast<input_dtype*>(input.data_ptr()),                              \
+                scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,                  \
+                cols, num_rows_ptr, num_rows_factor);                                           \
+        else                                                                                   \
+            launch_kernel(aiter::launch_policy::quant, aiter::quant_kernel<input_dtype, DTYPE_O, THREAD_DATA>,       \
+                grid, block, stream, reinterpret_cast<DTYPE_O*>(out.data_ptr()),                \
+                scales.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()),    \
+                scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,                  \
+                cols, num_rows_ptr, num_rows_factor);                                           \
     });
 
 #define DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(quant_kernel, DTYPE_O, cols) \
@@ -727,12 +1050,19 @@ void dynamic_per_tensor_quant(torch::Tensor& out,         // [..., d]
                               torch::Tensor const& input, // [..., d]
                               torch::Tensor& scale)       // [1]
 {
+    check_quant_buffers(out, input, scale, true);
     const int cols = input.size(-1);
     int rows       = input.numel() / cols;
     dim3 grid(rows);
     dim3 block(BlockSize);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
+    if(rows == 0)
+    {
+        vllm::initializeScale<<<1, 64, 0, stream>>>(scale.data_ptr<float>(), 1, 1.0f);
+        HIP_CHECK_ERROR(hipGetLastError());
+        return;
+    }
 
     if(out.dtype() == torch::kInt8)
     {
@@ -740,9 +1070,11 @@ void dynamic_per_tensor_quant(torch::Tensor& out,         // [..., d]
             using input_dtype = typename t2ck<scalar_t>::type;
             vllm::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
                 scale.data_ptr<float>(), 1, 0.0f);
-            aiter::data_to_scale_kernel<input_dtype, ck_tile::int8_t><<<grid, block, 0, stream>>>(
+            launch_kernel(aiter::launch_policy::quant, aiter::data_to_scale_kernel<input_dtype, ck_tile::int8_t>, grid, block, stream,
                 scale.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
-            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+            launch_kernel(aiter::launch_policy::quant, aiter::finalize_tensor_scale<ck_tile::int8_t>,
+                                 dim3(1), dim3(64), stream, scale.data_ptr<float>());
+            launch_kernel(aiter::launch_policy::quant, aiter::scaled_quant_kernel<input_dtype, ck_tile::int8_t>, grid, block, stream,
                 reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 scale.data_ptr<float>(),
@@ -756,9 +1088,11 @@ void dynamic_per_tensor_quant(torch::Tensor& out,         // [..., d]
             using input_dtype = typename t2ck<scalar_t>::type;
             vllm::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
                 scale.data_ptr<float>(), 1, 0.0f);
-            aiter::data_to_scale_kernel<input_dtype, FP8_TYPE><<<grid, block, 0, stream>>>(
+            launch_kernel(aiter::launch_policy::quant, aiter::data_to_scale_kernel<input_dtype, FP8_TYPE>, grid, block, stream,
                 scale.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
-            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+            launch_kernel(aiter::launch_policy::quant, aiter::finalize_tensor_scale<FP8_TYPE>,
+                                 dim3(1), dim3(64), stream, scale.data_ptr<float>());
+            launch_kernel(aiter::launch_policy::quant, aiter::scaled_quant_kernel<input_dtype, FP8_TYPE>, grid, block, stream,
                 reinterpret_cast<FP8_TYPE*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 scale.data_ptr<float>(),
@@ -782,14 +1116,76 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
 {
     TORCH_CHECK(input.is_contiguous());
     TORCH_CHECK(out.is_contiguous());
+#ifndef GPU_ENABLE_FP8
+    TORCH_CHECK(out.scalar_type() != torch_fp8, "FP8 quantization is not enabled in this build");
+#endif
+
+    // Packed FP4/group APIs share this implementation and retain their own
+    // output/scale layout. Validate the per-token INT8/FP8 contract here.
+    if(out.scalar_type() == torch::kInt8 || out.scalar_type() == torch_fp8)
+        check_quant_buffers(out, input, scales, false);
+    TORCH_CHECK(num_rows_factor > 0, "num_rows_factor must be positive");
+    if(num_rows.has_value())
+        TORCH_CHECK(num_rows->is_cuda() && num_rows->device() == input.device() &&
+                    num_rows->scalar_type() == torch::kInt32 && num_rows->is_contiguous() &&
+                    num_rows->numel() == 1, "num_rows must be one contiguous device int32");
 
     int const cols        = input.size(-1);
     int const rows        = input.numel() / cols;
     int32_t* num_rows_ptr = num_rows.has_value() ? num_rows->data_ptr<int32_t>() : nullptr;
 
+    if(rows == 0)
+        return;
+
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
+    const int vector_width = cols <= 2048 ? 8 : (cols <= 4096 || cols > 8192 ? 16 : 32);
+    bool use_safe = cols % vector_width != 0 ||
+                    reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 != 0 ||
+                    reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 != 0;
+#if AITER_ENABLE_MULTIDIE
+    // The existing vector INT8 paths fail the gfx946 PMD byte-packing
+    // reference test; FP8 also differs at some FP32 rounding midpoints.
+    // Use the bounded conversion with the same scale order as tensor quant.
+    if(!shuffle_scale && out.size(-1) == cols &&
+       ck_tile::get_hip_device_info().arch_name == "gfx946")
+        use_safe = true;
+#endif
+    if((out.scalar_type() == torch::kInt8 || out.scalar_type() == torch_fp8) &&
+       use_safe && !shuffle_scale && out.size(-1) == cols)
+    {
+        AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_safe", [&] {
+            using input_dtype = typename t2ck<scalar_t>::type;
+            if(out.scalar_type() == torch::kInt8)
+                launch_kernel(aiter::launch_policy::quant, dynamic_per_token_scaled_quant_safe_kernel<input_dtype, ck_tile::int8_t>,
+                    dim3(rows), dim3(BlockSize), stream,
+                    reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()), scales.data_ptr<float>(),
+                    reinterpret_cast<const input_dtype*>(input.data_ptr()), cols, num_rows_ptr, num_rows_factor);
+#ifdef GPU_ENABLE_FP8
+            else
+                launch_kernel(aiter::launch_policy::quant, dynamic_per_token_scaled_quant_safe_kernel<input_dtype, FP8_TYPE>,
+                    dim3(rows), dim3(BlockSize), stream,
+                    reinterpret_cast<FP8_TYPE*>(out.data_ptr()), scales.data_ptr<float>(),
+                    reinterpret_cast<const input_dtype*>(input.data_ptr()), cols, num_rows_ptr, num_rows_factor);
+#endif
+        });
+        return;
+    }
+
+    if(cols == 640 && rows >= 512 && input.scalar_type() == torch::kBFloat16 &&
+       out.scalar_type() == torch::kInt8)
+    {
+        launch_kernel(aiter::launch_policy::quant, aiter::dynamic_per_token_int8_quant_wave_kernel<ck_tile::bf16_t, 640>,
+            dim3((rows + 3) / 4), dim3(128), stream,
+                reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()),
+                scales.data_ptr<float>(),
+                reinterpret_cast<const ck_tile::bf16_t*>(input.data_ptr()),
+                rows,
+                num_rows_ptr,
+                num_rows_factor);
+        return;
+    }
 
     if(cols == 32 || cols == 64 || cols == 128)
     {
@@ -913,6 +1309,58 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
     }
 }
 
+void dynamic_per_group_scaled_quant(torch::Tensor& out,
+                                    torch::Tensor const& input,
+                                    torch::Tensor& scales,
+                                    std::optional<at::Tensor> const& scale_ub,
+                                    bool shuffle_scale,
+                                    std::optional<at::Tensor> const& num_rows,
+                                    int num_rows_factor)
+{
+    check_quant_buffers(out, input, scales, false, true);
+    const bool e8m0_scale = scales.element_size() == 1;
+    TORCH_CHECK(!e8m0_scale || out.scalar_type() == torch_fp8, "E8M0 scales require E4M3FN output");
+    const int cols = input.size(-1);
+    TORCH_CHECK(cols == 32 || cols == 64 || cols == 128, "group size must be 32, 64 or 128");
+    TORCH_CHECK(out.scalar_type() == torch::kInt8 || out.scalar_type() == torch_fp8,
+                "group quant output must be INT8 or E4M3FN");
+    TORCH_CHECK(num_rows_factor > 0, "num_rows_factor must be positive");
+    if(num_rows.has_value())
+        TORCH_CHECK(num_rows->is_cuda() && num_rows->device() == input.device() &&
+                    num_rows->scalar_type() == torch::kInt32 && num_rows->is_contiguous() &&
+                    num_rows->numel() == 1, "num_rows must be one contiguous device int32");
+    const int ori_cols = out.size(-1);
+    TORCH_CHECK(ori_cols > 0 && ori_cols % cols == 0, "output columns must contain complete groups");
+    const int64_t ori_rows = input.numel() / ori_cols;
+    if(ori_rows == 0)
+        return;
+    const int groups_per_tg = groupQuantBlockSize / (cols / 32);
+    const int64_t groups = input.numel() / cols;
+    const dim3 grid((groups + groups_per_tg - 1) / groups_per_tg);
+    const dim3 block(groupQuantBlockSize);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "group_quant", [&] {
+        using input_dtype = typename t2ck<scalar_t>::type;
+        auto launch_group = [&](auto* output) {
+            using output_dtype = std::remove_pointer_t<decltype(output)>;
+            const auto kernel = e8m0_scale
+                ? dynamic_per_group_scaled_quant_kernel<input_dtype, output_dtype, 32, true>
+                : dynamic_per_group_scaled_quant_kernel<input_dtype, output_dtype, 32, false>;
+            launch_kernel(aiter::launch_policy::quant, kernel,
+                grid, block, stream, output, reinterpret_cast<float*>(scales.data_ptr()),
+                reinterpret_cast<const input_dtype*>(input.data_ptr()),
+                scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
+                cols, ori_rows, ori_cols, ori_cols, shuffle_scale,
+                num_rows.has_value() ? num_rows->data_ptr<int32_t>() : nullptr, num_rows_factor);
+        };
+        if(out.scalar_type() == torch::kInt8)
+            launch_group(reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()));
+        else
+            launch_group(reinterpret_cast<FP8_TYPE*>(out.data_ptr()));
+    });
+}
+
 void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
                                         torch::Tensor const& input, // [..., d]
                                         torch::Tensor& scales,
@@ -924,7 +1372,24 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
     TORCH_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
                 __func__,
                 " only support group_size [32, 64 , 128]");
-    TORCH_CHECK(out.is_contiguous());
+    TORCH_CHECK(input.dim() == 2 && input.size(1) > 0 && input.stride(1) == 1,
+                "FP4 input must be a matrix with contiguous columns");
+    TORCH_CHECK(input.is_cuda() && out.is_cuda() && scales.is_cuda() &&
+                input.device() == out.device() && input.device() == scales.device(),
+                "FP4 buffers must share a HIP device");
+    TORCH_CHECK(out.scalar_type() != torch::kFloat8_e4m3fnuz &&
+                scales.scalar_type() != torch::kFloat8_e4m3fnuz,
+                "Hygon quantization does not support float8_e4m3fnuz");
+    TORCH_CHECK(input.scalar_type() == torch::kHalf || input.scalar_type() == torch::kBFloat16,
+                "FP4 input must be FP16 or BF16");
+    TORCH_CHECK(out.is_contiguous() && scales.is_contiguous() &&
+                out.element_size() == 1 && scales.element_size() == 1 &&
+                out.numel() == input.numel() / 2, "invalid packed FP4 output/scale storage");
+    TORCH_CHECK(num_rows_factor > 0, "num_rows_factor must be positive");
+    if(num_rows.has_value())
+        TORCH_CHECK(num_rows->is_cuda() && num_rows->device() == input.device() &&
+                    num_rows->scalar_type() == torch::kInt32 && num_rows->is_contiguous() &&
+                    num_rows->numel() == 1, "num_rows must be one contiguous device int32");
 
     int const cols        = input.size(-1);
     int const rows        = input.numel() / cols;
@@ -941,17 +1406,22 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
     int num_group_per_tg     = groupQuantBlockSize / num_thread_per_group;
 
     int scaleN    = cols / group_size;
+    const int64_t required_scales = shuffle_scale ? int64_t((rows + 255) / 256 * 256) *
+                                                   ((scaleN + 7) / 8 * 8) : int64_t(rows) * scaleN;
+    TORCH_CHECK(scales.numel() >= required_scales, "FP4 scale storage is too small");
+    if(rows == 0)
+        return;
     int num_group = shuffle_scale ? rows * ((scaleN + 7) / 8 * 8) : rows * scaleN;
     // int num_group = shuffle_scale ? ((rows + 255) / 256 * 256) * ((scaleN + 7) / 8 * 8) : rows *
     // scaleN;
     dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
     dim3 const block(groupQuantBlockSize);
 
-#if defined(__Float4_e2m1fn_x2)
     AITER_DISPATCH_FLOATING16_TYPES(
         input.scalar_type(), "dynamic_per_group_scaled_quant_kernel", [&] {
             using input_dtype = typename t2ck<scalar_t>::type;
-            aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
+            launch_kernel(aiter::launch_policy::quant, aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, ck_tile::fp4x2_t>,
+                grid, block, stream,
                 reinterpret_cast<ck_tile::fp4x2_t*>(out.data_ptr()),
                 reinterpret_cast<float*>(scales.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
@@ -964,9 +1434,6 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
                 num_rows_ptr,
                 num_rows_factor);
         });
-#else
-    TORCH_CHECK(false, __func__, " device not support Float4_e2m1fn_x2 dtype");
-#endif
 }
 
 #define SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE) \
@@ -1212,7 +1679,16 @@ static inline __device__ int8_t float_to_int8_rn(float x) {
       static_cast<float>(std::numeric_limits<int8_t>::max());
   float dst = std::nearbyint(x);
   dst = fminf(fmaxf(dst, i8_min), i8_max);
+#if defined(__gfx946__)
+  // Keep conversion and masking full-width: the packed SDWA byte conversion
+  // produces incorrect odd lanes on the gfx946 performance model.
+  uint32_t bits;
+  asm volatile("v_cvt_i32_f32 %0, %1\n\tv_and_b32 %0, 255, %0"
+               : "=&v"(bits) : "v"(dst));
+  return static_cast<int8_t>(bits);
+#else
   return static_cast<int8_t>(dst);
+#endif
 #else
   uint32_t dst;
   asm volatile("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(dst) : "f"(x));
@@ -1259,10 +1735,21 @@ __device__ __forceinline__ T silu_kernel(const T& x) {
 }
 
 template <typename scalar_t, bool act_first>
-__device__ __forceinline__ scalar_t compute(const scalar_t& x,
+__device__ __forceinline__ auto compute(const scalar_t& x,
                                             const scalar_t& y) {
+#if defined(__gfx946__)
+  // Match the vector paths: round SiLU to the input dtype, then keep the
+  // product in FP32 before smoothing and the row maximum reduction.
+  return act_first ? static_cast<float>(silu_kernel(x)) * static_cast<float>(y)
+                   : static_cast<float>(x) * static_cast<float>(silu_kernel(y));
+#else
   return act_first ? silu_kernel(x) * y : x * silu_kernel(y);
+#endif
 }
+
+// The vectorized kernels stage the expert metadata in shared memory, so the
+// host rejects larger expert counts for those paths.
+static constexpr int kMoeSwigluMaxExperts = 64;
 
 //------------------------------------------------------------------------------
 // Kernel 1: 通用 fallback
@@ -1278,29 +1765,35 @@ __global__ void moe_swiglu_dynamic_quant_kernel_gernel(
     int* __restrict__ experts_tokens_start,
     const int d,
     const int num_experts) {
-  int64_t token_idx = blockIdx.x;
-  const int64_t input_offset = token_idx * 2 * d;
-  const int64_t output_offset = token_idx * d;
-
   constexpr int share_size = block_size / WARP_SIZE;
   __shared__ float shared_mem[share_size];
   __shared__ int s_expert_index;
+  __shared__ float s_token_scale;
 
-  if (threadIdx.x == 0) {
-    int expert_idx = -1;
-    for (int i = 0; i < num_experts; ++i) {
-      int start = experts_tokens_start[i];
-      int count = experts_tokens_count[i];
-      if (token_idx >= start && token_idx < start + count) {
-        expert_idx = i;
-        break;
+  for (int64_t token_idx = blockIdx.x; token_idx < num_tokens;
+       token_idx += gridDim.x) {
+    // The row offsets and the expert lookup must follow token_idx, not the
+    // block index, or every grid-stride iteration rewrites the first row.
+    const int64_t input_offset = token_idx * 2 * d;
+    const int64_t output_offset = token_idx * d;
+
+    // Guard the shared values against the next row overwriting them while
+    // slower threads still read the current one.
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      int expert_idx = -1;
+      for (int i = 0; i < num_experts; ++i) {
+        int start = experts_tokens_start[i];
+        int count = experts_tokens_count[i];
+        if (token_idx >= start && token_idx < start + count) {
+          expert_idx = i;
+          break;
+        }
       }
+      s_expert_index = expert_idx;
     }
-    s_expert_index = expert_idx;
-  }
-  __syncthreads();
+    __syncthreads();
 
-  for (; token_idx < num_tokens; token_idx += gridDim.x) {
     int expert_index = s_expert_index;
     if (expert_index == -1) {
       for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
@@ -1309,7 +1802,7 @@ __global__ void moe_swiglu_dynamic_quant_kernel_gernel(
       if (threadIdx.x == 0) {
         scales[token_idx] = 0.0f;
       }
-      return;
+      continue;
     }
 
     const int64_t smooth_offset = expert_index * d;
@@ -1325,7 +1818,6 @@ __global__ void moe_swiglu_dynamic_quant_kernel_gernel(
 
     row_max = BlockReduceMax_ROW<float, block_size>(row_max, shared_mem);
 
-    __shared__ float s_token_scale;
     if (threadIdx.x == 0) {
       s_token_scale = row_max;
       scales[token_idx] = s_token_scale / 127.f;
@@ -1362,7 +1854,7 @@ __global__ void moe_swiglu_dynamic_quant_kernel_one_warp(
   int64_t token_idx = blockIdx.x;
   int tidx = threadIdx.x;
   int idx = threadIdx.x * VEC;
-  constexpr int MAX_EXPERTS = 64;
+  constexpr int MAX_EXPERTS = kMoeSwigluMaxExperts;
   __shared__ int sec[MAX_EXPERTS];
   __shared__ int ses[MAX_EXPERTS];
 
@@ -1399,10 +1891,26 @@ __global__ void moe_swiglu_dynamic_quant_kernel_one_warp(
       }
     }
     expert_index = __shfl(expert_index, 0, WARP_SIZE);
-    if (expert_index == -1) return;
 
     const int64_t y_index = token_idx * d + idx;
     VecInt8Type* y = (VecInt8Type*)(out + y_index);
+
+    // Tokens outside every expert range get a defined zero row; `continue`
+    // keeps the remaining grid-stride rows of this block alive.
+    if (expert_index == -1) {
+      if (idx < d) {
+        int8_t zero_vec[VEC];
+#pragma unroll
+        for (int ii = 0; ii < VEC; ii++) {
+          zero_vec[ii] = 0;
+        }
+        *y = *(VecInt8Type*)zero_vec;
+      }
+      if (tidx == 0) {
+        scales[token_idx] = 0.0f;
+      }
+      continue;
+    }
 
     const int64_t x_index = token_idx * 2 * d + idx;
     VecType* x1 = (VecType*)(input + x_index);
@@ -1437,7 +1945,8 @@ __global__ void moe_swiglu_dynamic_quant_kernel_one_warp(
     row_max = WarpReduceMax_ROW<float>(row_max);
     float quant_scale = 1.0f;
     if (tidx == 0) {
-      quant_scale = 127.0f / row_max;
+      // An all-zero row would make 127/row_max infinite and the product NaN.
+      quant_scale = (row_max == 0.f) ? 0.f : 127.0f / row_max;
       scales[token_idx] = row_max / 127.f;
     }
     quant_scale = __shfl(quant_scale, 0, WARP_SIZE);
@@ -1470,13 +1979,14 @@ __global__ void moe_swiglu_dynamic_quant_kernel(
   int64_t token_idx = blockIdx.x;
   int tidx = threadIdx.x;
   int idx = threadIdx.x * VEC;
-  constexpr int MAX_EXPERTS = 64;
+  constexpr int MAX_EXPERTS = kMoeSwigluMaxExperts;
   __shared__ int sec[MAX_EXPERTS];
   __shared__ int ses[MAX_EXPERTS];
 
   constexpr int share_size = block_size / WARP_SIZE;
   __shared__ float val_shared[share_size];
   __shared__ int s_expert_index;
+  __shared__ float s_token_scale;
 
   using VecType = aiter::aligned_vector<scalar_t, VEC>;
   using VecInt8Type = aiter::aligned_vector<int8_t, VEC>;
@@ -1489,6 +1999,9 @@ __global__ void moe_swiglu_dynamic_quant_kernel(
   __syncthreads();
 
   for (; token_idx < num_tokens; token_idx += gridDim.x) {
+    // Guard val_shared / s_expert_index / s_token_scale against the next row
+    // overwriting them while slower threads still read the current one.
+    __syncthreads();
     int local_expert_index = -1;
     if (tidx == 0) {
       int left = 0, right = num_experts - 1, res = -1;
@@ -1513,10 +2026,26 @@ __global__ void moe_swiglu_dynamic_quant_kernel(
     }
     __syncthreads();
     int expert_index = s_expert_index;
-    if (expert_index == -1) return;
 
     const int64_t y_index = token_idx * d + idx;
     VecInt8Type* y = (VecInt8Type*)(out + y_index);
+
+    // Tokens outside every expert range get a defined zero row; `continue`
+    // keeps the remaining grid-stride rows of this block alive.
+    if (expert_index == -1) {
+      if (idx < d) {
+        int8_t zero_vec[VEC];
+#pragma unroll
+        for (int ii = 0; ii < VEC; ii++) {
+          zero_vec[ii] = 0;
+        }
+        *y = *(VecInt8Type*)zero_vec;
+      }
+      if (tidx == 0) {
+        scales[token_idx] = 0.0f;
+      }
+      continue;
+    }
 
     const int64_t x_index = token_idx * 2 * d + idx;
     VecType* x1 = (VecType*)(input + x_index);
@@ -1549,7 +2078,6 @@ __global__ void moe_swiglu_dynamic_quant_kernel(
     }
 
     row_max = BlockReduceMax_ROW<float, block_size>(row_max, val_shared);
-    __shared__ float s_token_scale;
 
     if (tidx == 0) {
       s_token_scale = row_max;
@@ -1580,9 +2108,33 @@ void moe_swiglu_dynamic_quant(torch::Tensor& scatter_tokens,
                               torch::Tensor& output,
                               torch::Tensor& scales,
                               float beta) {
+  TORCH_CHECK(scatter_tokens.dim() >= 2, "scatter_tokens must be at least 2-D");
+  TORCH_CHECK(scatter_tokens.size(-1) % 2 == 0,
+              "scatter_tokens last dim must be 2*d, got ", scatter_tokens.size(-1));
   int d = scatter_tokens.size(-1) / 2;
   int64_t num_tokens = scatter_tokens.numel() / scatter_tokens.size(-1);
   int num_experts = experts_tokens_count.size(0);
+
+  TORCH_CHECK(experts_tokens_start.size(0) == num_experts,
+              "experts_tokens_start and experts_tokens_count must have the same length");
+  TORCH_CHECK(experts_tokens_count.scalar_type() == torch::kInt32 &&
+                  experts_tokens_start.scalar_type() == torch::kInt32,
+              "expert metadata must be int32");
+  TORCH_CHECK(smooth.scalar_type() == torch::kFloat32, "smooth must be float32");
+  TORCH_CHECK(smooth.dim() == 2 && smooth.size(0) == num_experts && smooth.size(1) == d,
+              "smooth must be [num_experts, d]");
+  TORCH_CHECK(output.scalar_type() == torch::kInt8, "output must be int8");
+  TORCH_CHECK(scales.scalar_type() == torch::kFloat32, "scales must be float32");
+  TORCH_CHECK(output.numel() == num_tokens * d, "output must hold num_tokens*d elements");
+  TORCH_CHECK(scales.numel() == num_tokens, "scales must hold num_tokens elements");
+
+  // The vectorized paths read and write a fixed VEC-wide chunk per thread with
+  // no row tail, so a d that is not a multiple of VEC would spill past the row.
+  const int vec = (d <= 512) ? 2 : (d <= 16384) ? 16 : (d <= 32768) ? 32 : 1;
+  TORCH_CHECK(d % vec == 0, "d must be a multiple of ", vec, " for d=", d);
+  TORCH_CHECK(vec == 1 || num_experts <= kMoeSwigluMaxExperts,
+              "num_experts must be at most ", kMoeSwigluMaxExperts, " for d=", d);
+
   int grid_opt = num_tokens;
 
   if (num_tokens == 9216 || num_tokens == 10240 || num_tokens == 11264 ||
@@ -1605,89 +2157,50 @@ void moe_swiglu_dynamic_quant(torch::Tensor& scatter_tokens,
   const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(scatter_tokens));
   const hipStream_t stream = at::hip::getCurrentHIPStream();
 
+#define AITER_LAUNCH_MOE_SWIGLU(KERNEL, BLOCK)                                \
+  launch_kernel(aiter::launch_policy::quant,                                  \
+                KERNEL,                                                       \
+                grid,                                                         \
+                BLOCK,                                                        \
+                stream,                                                       \
+                num_tokens,                                                   \
+                output.data_ptr<int8_t>(),                                    \
+                scatter_tokens.data_ptr<scalar_t>(),                          \
+                scales.data_ptr<float>(),                                     \
+                smooth.data_ptr<float>(),                                     \
+                experts_tokens_count.data_ptr<int>(),                         \
+                experts_tokens_start.data_ptr<int>(),                         \
+                d,                                                            \
+                num_experts)
+
   AITER_DISPATCH_FLOATING16_TYPES(
       scatter_tokens.scalar_type(), "moe_swiglu_dynamic_quant_kernel", [&] {
         if (d <= 512) {
-          moe_swiglu_dynamic_quant_kernel<scalar_t, 2, true, 256>
-              <<<grid, 256, 0, stream>>>(num_tokens,
-                                         output.data_ptr<int8_t>(),
-                                         scatter_tokens.data_ptr<scalar_t>(),
-                                         scales.data_ptr<float>(),
-                                         smooth.data_ptr<float>(),
-                                         experts_tokens_count.data_ptr<int>(),
-                                         experts_tokens_start.data_ptr<int>(),
-                                         d, num_experts);
+          AITER_LAUNCH_MOE_SWIGLU(
+              (moe_swiglu_dynamic_quant_kernel<scalar_t, 2, true, 256>), 256);
         } else if (d <= 1024) {
-          moe_swiglu_dynamic_quant_kernel_one_warp<scalar_t, 16, true, 64>
-              <<<grid, 64, 0, stream>>>(num_tokens,
-                                        output.data_ptr<int8_t>(),
-                                        scatter_tokens.data_ptr<scalar_t>(),
-                                        scales.data_ptr<float>(),
-                                        smooth.data_ptr<float>(),
-                                        experts_tokens_count.data_ptr<int>(),
-                                        experts_tokens_start.data_ptr<int>(),
-                                        d, num_experts);
+          AITER_LAUNCH_MOE_SWIGLU(
+              (moe_swiglu_dynamic_quant_kernel_one_warp<scalar_t, 16, true, 64>), 64);
         } else if (d <= 2048) {
-          moe_swiglu_dynamic_quant_kernel<scalar_t, 16, true, 128>
-              <<<grid, 128, 0, stream>>>(num_tokens,
-                                         output.data_ptr<int8_t>(),
-                                         scatter_tokens.data_ptr<scalar_t>(),
-                                         scales.data_ptr<float>(),
-                                         smooth.data_ptr<float>(),
-                                         experts_tokens_count.data_ptr<int>(),
-                                         experts_tokens_start.data_ptr<int>(),
-                                         d, num_experts);
+          AITER_LAUNCH_MOE_SWIGLU(
+              (moe_swiglu_dynamic_quant_kernel<scalar_t, 16, true, 128>), 128);
         } else if (d <= 4096) {
-          moe_swiglu_dynamic_quant_kernel<scalar_t, 16, true, 256>
-              <<<grid, 256, 0, stream>>>(num_tokens,
-                                         output.data_ptr<int8_t>(),
-                                         scatter_tokens.data_ptr<scalar_t>(),
-                                         scales.data_ptr<float>(),
-                                         smooth.data_ptr<float>(),
-                                         experts_tokens_count.data_ptr<int>(),
-                                         experts_tokens_start.data_ptr<int>(),
-                                         d, num_experts);
+          AITER_LAUNCH_MOE_SWIGLU(
+              (moe_swiglu_dynamic_quant_kernel<scalar_t, 16, true, 256>), 256);
         } else if (d <= 8192) {
-          moe_swiglu_dynamic_quant_kernel<scalar_t, 16, true, 512>
-              <<<grid, 512, 0, stream>>>(num_tokens,
-                                         output.data_ptr<int8_t>(),
-                                         scatter_tokens.data_ptr<scalar_t>(),
-                                         scales.data_ptr<float>(),
-                                         smooth.data_ptr<float>(),
-                                         experts_tokens_count.data_ptr<int>(),
-                                         experts_tokens_start.data_ptr<int>(),
-                                         d, num_experts);
+          AITER_LAUNCH_MOE_SWIGLU(
+              (moe_swiglu_dynamic_quant_kernel<scalar_t, 16, true, 512>), 512);
         } else if (d <= 16384) {
-          moe_swiglu_dynamic_quant_kernel<scalar_t, 16, true, 1024>
-              <<<grid, 1024, 0, stream>>>(num_tokens,
-                                          output.data_ptr<int8_t>(),
-                                          scatter_tokens.data_ptr<scalar_t>(),
-                                          scales.data_ptr<float>(),
-                                          smooth.data_ptr<float>(),
-                                          experts_tokens_count.data_ptr<int>(),
-                                          experts_tokens_start.data_ptr<int>(),
-                                          d, num_experts);
+          AITER_LAUNCH_MOE_SWIGLU(
+              (moe_swiglu_dynamic_quant_kernel<scalar_t, 16, true, 1024>), 1024);
         } else if (d <= 32768) {
-          moe_swiglu_dynamic_quant_kernel<scalar_t, 32, true, 1024>
-              <<<grid, 1024, 0, stream>>>(num_tokens,
-                                          output.data_ptr<int8_t>(),
-                                          scatter_tokens.data_ptr<scalar_t>(),
-                                          scales.data_ptr<float>(),
-                                          smooth.data_ptr<float>(),
-                                          experts_tokens_count.data_ptr<int>(),
-                                          experts_tokens_start.data_ptr<int>(),
-                                          d, num_experts);
+          AITER_LAUNCH_MOE_SWIGLU(
+              (moe_swiglu_dynamic_quant_kernel<scalar_t, 32, true, 1024>), 1024);
         } else {
-          moe_swiglu_dynamic_quant_kernel_gernel<scalar_t, true, 1024>
-              <<<grid, 1024, 0, stream>>>(num_tokens,
-                                          output.data_ptr<int8_t>(),
-                                          scatter_tokens.data_ptr<scalar_t>(),
-                                          scales.data_ptr<float>(),
-                                          smooth.data_ptr<float>(),
-                                          experts_tokens_count.data_ptr<int>(),
-                                          experts_tokens_start.data_ptr<int>(),
-                                          d, num_experts);
+          AITER_LAUNCH_MOE_SWIGLU(
+              (moe_swiglu_dynamic_quant_kernel_gernel<scalar_t, true, 1024>), 1024);
         }
       });
+#undef AITER_LAUNCH_MOE_SWIGLU
 }
 } // namespace aiter

@@ -29,24 +29,32 @@ OPUS_D fp32x2_t pk_mul_f32(fp32x2_t a, fp32x2_t b)
 }
 
 // fp32x2 -> fp8x2 with scale + saturation clamp (E4M3)
-// ISA: v_pk_mul_f32 + v_med3_f32 x2 + v_cvt_pk_fp8_f32
+// ISA: v_pk_mul_f32 + v_med3_f32 x2 + the packed fp8 convert
+//
+// HYGON: the clamp stays in asm so v_med3_f32 is guaranteed, but the convert
+// now goes through opus::fp32_to_fp8_packed_x2. The upstream 3-operand
+// `v_cvt_pk_fp8_f32 %0, %1, %2` does not assemble on HCU -- gfx938 needs the
+// 4-operand `op_sel` form (see the packed fp8 helper in
+// csrc/include/ck_tile/vec_convert.h) and gfx946 goes through
+// __builtin_hcu_cvt_pk_fp8_f32. opus.hpp already encodes both, so delegating
+// there keeps one source of truth. This helper had no caller before
+// module_rmsnorm_quant, which is why the bad encoding was never compiled.
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
 OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
 {
     fp32x2_t tmp = pk_mul_f32(s, fp32x2_t{inverted_scale, inverted_scale});
-#if defined(__gfx942__)
-    constexpr float hi = 240.0f, lo = -240.0f;
-#else
-    constexpr float hi = 448.0f, lo = -448.0f;
-#endif
+    // opus::finfo<fp8_t>::max() picks the same bound (240 on gfx942, 448 on
+    // every HCU target).
+    constexpr float hi = finfo<fp8_t>::max(), lo = finfo<fp8_t>::min();
     float a = tmp[0], b = tmp[1];
-    int w;
-    asm volatile("v_med3_f32 %1, %1, %3, %4\n"
-                 "v_med3_f32 %2, %2, %3, %4\n"
-                 "v_cvt_pk_fp8_f32 %0, %1, %2"
-                 : "=v"(w), "+v"(a), "+v"(b)
+    // "+v": a and b are genuinely read *and* written. Per the HCU compiler
+    // guide, a real read-write operand must be "+v" -- never "=v" plus a
+    // separate read-only input naming the same variable.
+    asm volatile("v_med3_f32 %0, %0, %2, %3\n"
+                 "v_med3_f32 %1, %1, %2, %3\n"
+                 : "+v"(a), "+v"(b)
                  : "v"(lo), "v"(hi));
-    return __builtin_bit_cast(fp8x2_t, static_cast<int16_t>(w));
+    return opus::fp32_to_fp8_packed_x2(fp32x2_t{a, b});
 }
 
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
@@ -58,20 +66,40 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x4(const S& s, float inverted_scale)
 }
 
 // fp32x2 -> bf8x2 with scale + saturation clamp (E5M2)
-// ISA: v_pk_mul_f32 + v_med3_f32 x2 + v_cvt_pk_bf8_f32
+// ISA: v_pk_mul_f32 + v_med3_f32 x2 + the packed bf8 convert
+//
+// HYGON: same encoding defect as the fp8 helper above, but opus.hpp has no
+// bf8 conversion to delegate to, so the HCU encodings are spelled out here --
+// the 4-operand `op_sel` form on gfx938 and __builtin_hcu_cvt_pk_bf8_f32 on
+// gfx946, matching the packed bf8 helper in csrc/include/ck_tile/vec_convert.h.
+// Nothing in this fork converts to bf8 yet; the stub keeps non-HCU builds
+// compiling, as the surrounding fp4/fp8 helpers already do.
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
 OPUS_D decltype(auto) fp32_to_bf8_scaled_x2(const S& s, float inverted_scale)
 {
     fp32x2_t tmp       = pk_mul_f32(s, fp32x2_t{inverted_scale, inverted_scale});
     constexpr float hi = 57344.0f, lo = -57344.0f;
     float a = tmp[0], b = tmp[1];
-    int w;
-    asm volatile("v_med3_f32 %1, %1, %3, %4\n"
-                 "v_med3_f32 %2, %2, %3, %4\n"
-                 "v_cvt_pk_bf8_f32 %0, %1, %2"
-                 : "=v"(w), "+v"(a), "+v"(b)
+    asm volatile("v_med3_f32 %0, %0, %2, %3\n"
+                 "v_med3_f32 %1, %1, %2, %3\n"
+                 : "+v"(a), "+v"(b)
                  : "v"(lo), "v"(hi));
+#if defined(__gfx938__)
+    int w = 0;
+    asm volatile("v_cvt_pk_bf8_f32 %0, %1, %2, %3 op_sel:[0,0,0,0]"
+                 : "=v"(w)
+                 : "v"(a), "v"(b), "v"(w));
     return __builtin_bit_cast(bf8x2_t, static_cast<int16_t>(w));
+#elif defined(__gfx946__)
+    int w = 0;
+    w     = __builtin_hcu_cvt_pk_bf8_f32(a, b, w, false);
+    return __builtin_bit_cast(bf8x2_t, static_cast<int16_t>(w));
+#else
+    // No packed bf8 convert on this target (gfx936, host): compile-only stub.
+    (void)a;
+    (void)b;
+    return bf8x2_t{};
+#endif
 }
 
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
@@ -84,11 +112,35 @@ OPUS_D decltype(auto) fp32_to_bf8_scaled_x4(const S& s, float inverted_scale)
 
 // fp32x2 -> i8x2 with scale
 // ISA: v_pk_mul_f32 + v_cvt_i32_f32 x2
+#if defined(__gfx946__)
+// HYGON: on the gfx946 perf model the compiler's packed-byte sequence for a
+// float -> signed char conversion is mishandled for negative values -- every
+// byte comes back 0x00 or 0xFF (the model reports `dp4x:disable`). Convert and
+// pack one byte at a time instead, which is the same workaround the int8 store
+// path in csrc/kernels/quant_kernels.cu already carries.
+//
+// v_cvt_i32_f32 truncates toward zero, which is exactly what
+// `static_cast<i8_t>(float)` does on the other architectures, so all three
+// architectures stay bit-identical. Out-of-range inputs cannot occur here: the
+// caller's scale bounds the value to +-127.
+OPUS_D u32_t fp32_to_i8_byte(float v)
+{
+    u32_t b;
+    asm volatile("v_cvt_i32_f32 %0, %1\n\tv_and_b32 %0, 255, %0" : "=&v"(b) : "v"(v));
+    return b;
+}
+#endif
+
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
 OPUS_D decltype(auto) fp32_to_i8_scaled_x2(const S& s, float inverted_scale)
 {
     fp32x2_t tmp = pk_mul_f32(s, fp32x2_t{inverted_scale, inverted_scale});
+#if defined(__gfx946__)
+    const u32_t packed = fp32_to_i8_byte(tmp[0]) | (fp32_to_i8_byte(tmp[1]) << 8);
+    return __builtin_bit_cast(i8x2_t, static_cast<unsigned short>(packed));
+#else
     return i8x2_t{static_cast<i8_t>(tmp[0]), static_cast<i8_t>(tmp[1])};
+#endif
 }
 
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
@@ -96,10 +148,18 @@ OPUS_D decltype(auto) fp32_to_i8_scaled_x4(const S& s, float inverted_scale)
 {
     fp32x2_t tmp0 = pk_mul_f32(fp32x2_t{s[0], s[1]}, fp32x2_t{inverted_scale, inverted_scale});
     fp32x2_t tmp1 = pk_mul_f32(fp32x2_t{s[2], s[3]}, fp32x2_t{inverted_scale, inverted_scale});
+#if defined(__gfx946__)
+    // Assemble all four bytes in one dword: re-extracting i8_t lanes from two
+    // i8x2_t results would put the mishandled packing back in.
+    const u32_t packed = fp32_to_i8_byte(tmp0[0]) | (fp32_to_i8_byte(tmp0[1]) << 8) |
+                         (fp32_to_i8_byte(tmp1[0]) << 16) | (fp32_to_i8_byte(tmp1[1]) << 24);
+    return __builtin_bit_cast(i8x4_t, packed);
+#else
     return i8x4_t{static_cast<i8_t>(tmp0[0]),
                   static_cast<i8_t>(tmp0[1]),
                   static_cast<i8_t>(tmp1[0]),
                   static_cast<i8_t>(tmp1[1])};
+#endif
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -112,7 +112,7 @@ fla_buffer_load_vgpr(const void *base_ptr, const int32_t voffset)
     static_assert(DWORD_CNT == 1 || DWORD_CNT == 2 || DWORD_CNT == 4,
                   "fla_buffer_load_vgpr supports 1/2/4 dword loads");
     using Vec = fla_dword_vec_t<DWORD_CNT>;
-#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
     if constexpr (USE_ASM) {
         fla_buffer_accessor ptr(base_ptr);
         Vec raw;
@@ -158,7 +158,7 @@ fla_buffer_store_vgpr(void *base_ptr, const int32_t voffset,
 {
     static_assert(DWORD_CNT == 1 || DWORD_CNT == 2 || DWORD_CNT == 4,
                   "fla_buffer_store_vgpr supports 1/2/4 dword stores");
-#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
     if constexpr (USE_ASM) {
         fla_buffer_accessor ptr(base_ptr);
         const int32_t dst_voffset = ptr.vofft + voffset;
@@ -217,7 +217,22 @@ fla_buffer_load_dwordx4_to_lds_inline(const fla_i32x4 buffer_rsrc,
                                       const int target_addr,
                                       const int offset_v)
 {
-#if defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx946__)
+    // Keep the existing 16-byte-slot LDS image without depending on the
+    // target's different M0 wrap encoding and bank rotation rules.
+    fla_u32x4 raw;
+    asm volatile("buffer_load_dwordx4 %0, %1, %2, 0 offen offset:0\n\t"
+                 "s_waitcnt vmcnt(0)\n\t"
+                 : "=v"(raw)
+                 : "v"(offset_v), "s"(buffer_rsrc)
+                 : "memory");
+    const unsigned base = static_cast<unsigned>(target_addr) & 0xffffu;
+    const unsigned wrap = (static_cast<unsigned>(target_addr) >> 16) & 7u;
+    const unsigned slot = ((threadIdx.x & 63u) + wrap) & 63u;
+    auto *dst = reinterpret_cast<__attribute__((address_space(3))) fla_u32x4 *>(
+        static_cast<uintptr_t>(base + slot * 16u));
+    *dst = raw;
+#elif defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
     asm volatile(
         "s_mov_b32 m0, %1\n\t"
         "buffer_load_dwordx4 %0, %2, 0, offen offset:0, lds\n\t"
@@ -235,7 +250,7 @@ __device__ __forceinline__ fla_u32x4
 fla_buffer_load_dwordx4_vgpr_inline(const fla_i32x4 buffer_rsrc,
                                     const int32_t voffset)
 {
-#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
     fla_u32x4 raw;
     asm volatile("buffer_load_dwordx4 %0, %1, %2, 0 offen offset:0\n\t"
                  : "=v"(raw)
@@ -549,7 +564,7 @@ __device__ __forceinline__ fla_f32x4 fla_mmac_f32_16x16x16(
 {
     static_assert(fla_dtype_traits<Element>::supported,
                   "FLA MMAC supports fp16 and bf16 only");
-#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
     if constexpr (fla_dtype_traits<Element>::is_fp16) {
         return __builtin_hcu_mmac_f32_16x16x16_f16(a, b, c);
     } else {
@@ -621,7 +636,7 @@ __device__ __forceinline__ fla_f32x4 fla_mmac_f32_16x16x16_trans_c(
 {
     static_assert(fla_dtype_traits<Element>::supported,
                   "FLA MMAC supports fp16 and bf16 only");
-#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
     if constexpr (fla_dtype_traits<Element>::is_fp16) {
         return __builtin_hcu_mmac_f32_16x16x16_f16(b, a, c);
     } else {
@@ -638,7 +653,7 @@ fla_ds_read_m32x16_alt(Element *src_ptr)
 {
     static_assert(fla_dtype_traits<Element>::supported,
                   "FLA ds_read_m32x16 supports fp16 and bf16 only");
-#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
     if constexpr (fla_dtype_traits<Element>::is_fp16) {
         const auto reg = __builtin_hcu_ds_read_m32x16_f16_alt(
             (__attribute__((address_space(3))) __fp16 *)src_ptr);
@@ -659,7 +674,7 @@ fla_ds_read_m32x16_alt_asm(Element *src_ptr)
 {
     static_assert(fla_dtype_traits<Element>::supported,
                   "FLA ds_read_m32x16 asm supports fp16 and bf16 only");
-#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
     fla_u32x4 out;
     const uint32_t lds_addr =
         static_cast<uint32_t>(reinterpret_cast<uintptr_t>(src_ptr));
@@ -680,7 +695,7 @@ fla_ds_read_m32x16(Element *src_ptr)
 {
     static_assert(fla_dtype_traits<Element>::supported,
                   "FLA ds_read_m32x16 supports fp16 and bf16 only");
-#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
     if constexpr (fla_dtype_traits<Element>::is_fp16) {
         const auto reg = __builtin_hcu_ds_read_m32x16_f16(
             (__attribute__((address_space(3))) __fp16 *)src_ptr);
@@ -701,7 +716,7 @@ fla_ds_read_m32x16_asm(Element *src_ptr)
 {
     static_assert(fla_dtype_traits<Element>::supported,
                   "FLA ds_read_m32x16 asm supports fp16 and bf16 only");
-#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
     fla_u32x4 out;
     const uint32_t lds_addr =
         static_cast<uint32_t>(reinterpret_cast<uintptr_t>(src_ptr));
@@ -727,7 +742,7 @@ template <typename Element>
 __device__ __forceinline__ fla_u32x4
 fla_ds_read_b128_asm(Element *src_ptr)
 {
-#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
     fla_u32x4 out;
     const uint32_t lds_addr =
         static_cast<uint32_t>(reinterpret_cast<uintptr_t>(src_ptr));
@@ -745,7 +760,7 @@ fla_ds_read_b128_asm(Element *src_ptr)
 __device__ __forceinline__ void fla_ds_write_b32(const uint32_t lds_addr,
                                                  const uint32_t data)
 {
-#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
     asm volatile("ds_write_b32 %0, %1 offset:0\n\t"
                  :
                  : "v"(lds_addr), "v"(data)
@@ -769,7 +784,7 @@ fla_ds_write_b32_at(Element *lds_base, const int elem_offset,
 __device__ __forceinline__ uint32_t
 fla_ds_bpermute_u32(const int byte_offset, const uint32_t value)
 {
-#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__)
+#if defined(__gfx928__) || defined(__gfx92a__) || defined(__gfx936__) || defined(__gfx938__) || defined(__gfx946__)
     const int32_t raw = __builtin_amdgcn_ds_bpermute(
         byte_offset, ck_tile::bit_cast<int32_t>(value));
     return ck_tile::bit_cast<uint32_t>(raw);

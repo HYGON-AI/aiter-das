@@ -83,6 +83,15 @@ std::vector<torch::Tensor> prefill(
 // g/gk/gv/beta [tokens, h_v], cu_seqlens [sequences+1] int64,
 // initial_state [sequences, h_v, 128, 128] fp32.
 //
+// Paged state: pass `initial_state_indices` (int32/int64, [sequences]) to treat
+// `initial_state` as a state pool indexed by a block table instead of the dense
+// [sequences, ...] layout. In that mode slot `initial_state_indices[i]` holds
+// sequence i, a non-positive id means "no state" (the row runs from a zero
+// state and writes no slot back), the pool's `stride(0)` is used as the slot
+// stride, and `store_final_state` writes in place so the pool is updated
+// exactly like the framework's own kernels. The returned final_state is then
+// the pool itself.
+//
 // validate_varlen=false skips the host-side cu_seqlens checks, which are the
 // only reason the entry needs the values on the host (and therefore a stream
 // sync). It is a pure optimization: the kernel reads cu_seqlens on device, so
@@ -99,6 +108,7 @@ std::vector<torch::Tensor> decode(
     const std::optional<torch::Tensor>& a_log,
     const std::optional<torch::Tensor>& dt_bias,
     const std::optional<torch::Tensor>& initial_state,
+    const std::optional<torch::Tensor>& initial_state_indices,
     const std::optional<torch::Tensor>& cu_seqlens,
     const std::optional<double>& scale,
     bool use_g,

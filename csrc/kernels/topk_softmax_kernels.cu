@@ -23,6 +23,7 @@
 #include "dispatch_utils.h"
 #include "hip_compat.h"
 #include "hip_reduce.h"
+#include "hip_kernel_launch.h"
 #include "py_itfs_common.h"
 #include "vec_convert.h"
 #include <ATen/hip/HIPContext.h>
@@ -76,7 +77,7 @@ __launch_bounds__(TPB) __global__
     for(int ii = threadIdx.x; ii < num_cols; ii += TPB)
     {
         const int idx = thread_row_offset + ii;
-        threadData    = max(static_cast<float>(input[idx]), threadData);
+        threadData    = max(ck_tile::type_convert<float>(input[idx]), threadData);
     }
 
     const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, hipcub::Max());
@@ -91,7 +92,7 @@ __launch_bounds__(TPB) __global__
     for(int ii = threadIdx.x; ii < num_cols; ii += TPB)
     {
         const int idx = thread_row_offset + ii;
-        threadData += exp((static_cast<float>(input[idx]) - float_max));
+        threadData += exp((ck_tile::type_convert<float>(input[idx]) - float_max));
     }
 
     const auto Z = BlockReduce(tmpStorage).Reduce(threadData, sum);
@@ -105,7 +106,7 @@ __launch_bounds__(TPB) __global__
     for(int ii = threadIdx.x; ii < num_cols; ii += TPB)
     {
         const int idx   = thread_row_offset + ii;
-        const float val = exp((static_cast<float>(input[idx]) - float_max)) * normalizing_factor;
+        const float val = exp((ck_tile::type_convert<float>(input[idx]) - float_max)) * normalizing_factor;
         output[idx]     = val;
     }
 }
@@ -502,8 +503,9 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
     dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
     if(need_renorm)
     {
-        topkGatingSoftmax<DTYPE, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, true>
-            <<<num_blocks, block_dim, 0, stream>>>(input,
+        aiter::launch_kernel(aiter::launch_policy::moe_topk,
+            topkGatingSoftmax<DTYPE, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, true>,
+            dim3(num_blocks), block_dim, 0, stream, input,
                                                    finished,
                                                    output,
                                                    num_rows,
@@ -517,8 +519,9 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
     }
     else
     {
-        topkGatingSoftmax<DTYPE, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, false>
-            <<<num_blocks, block_dim, 0, stream>>>(input,
+        aiter::launch_kernel(aiter::launch_policy::moe_topk,
+            topkGatingSoftmax<DTYPE, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, false>,
+            dim3(num_blocks), block_dim, 0, stream, input,
                                                    finished,
                                                    output,
                                                    num_rows,
@@ -579,9 +582,11 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
             softmax_workspace != nullptr,
             "softmax_workspace must be provided for num_experts that are not a power of 2.");
         static constexpr int TPB = 256;
-        moeSoftmax<DTYPE, TPB><<<num_tokens, TPB, 0, stream>>>(
+        aiter::launch_kernel(aiter::launch_policy::moe_topk, moeSoftmax<DTYPE, TPB>,
+            dim3(num_tokens), dim3(TPB), 0, stream,
             gating_output, nullptr, softmax_workspace, num_experts);
-        moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(softmax_workspace,
+        aiter::launch_kernel(aiter::launch_policy::moe_topk, moeTopK<TPB>,
+            dim3(num_tokens), dim3(TPB), 0, stream, softmax_workspace,
                                                      nullptr,
                                                      topk_weights,
                                                      topk_indicies,
@@ -610,6 +615,24 @@ __global__ void moe_sum_kernel(scalar_t* __restrict__ out,         // [..., d]
             x += VLLM_LDG(&input[token_idx * TOPK * d + k * d + idx]);
         }
         out[token_idx * d + idx] = x;
+    }
+}
+
+// gfx946 fallback for top-k values outside the fixed native specializations.
+// Match torch.sum's FP32 accumulation for FP16/BF16, and preserve strided views.
+template <typename scalar_t>
+__global__ void moe_sum_strided_kernel(scalar_t* out, const scalar_t* input,
+                                      int topk, int hidden,
+                                      int64_t input_s0, int64_t input_s1, int64_t input_s2,
+                                      int64_t output_s0, int64_t output_s1)
+{
+    const int64_t token = blockIdx.x;
+    for(int64_t column = threadIdx.x; column < hidden; column += blockDim.x)
+    {
+        float value = 0.0f;
+        for(int k = 0; k < topk; ++k)
+            value += static_cast<float>(input[token * input_s0 + k * input_s1 + column * input_s2]);
+        out[token * output_s0 + column * output_s1] = static_cast<scalar_t>(value);
     }
 }
 
@@ -659,9 +682,21 @@ void topk_softmax(torch::Tensor& topk_weights,         // [num_tokens, topk]
 void moe_sum(torch::Tensor& input,  // [num_tokens, topk, hidden_size]
              torch::Tensor& output) // [num_tokens, hidden_size]
 {
-    const int hidden_size = input.size(-1);
-    const int num_tokens  = output.numel() / hidden_size;
+    TORCH_CHECK(input.is_cuda() && output.device() == input.device(),
+                "moe_sum input/output must be on the same HIP device");
+    TORCH_CHECK(input.dim() == 3 && output.dim() == 2,
+                "moe_sum expects input [tokens, topk, hidden] and output [tokens, hidden]");
+    TORCH_CHECK(input.scalar_type() == output.scalar_type(), "moe_sum dtype mismatch");
+    TORCH_CHECK(output.size(0) == input.size(0) && output.size(1) == input.size(2),
+                "moe_sum output shape mismatch");
+    const int hidden_size = input.size(2);
+    const int num_tokens  = input.size(0);
     const int topk        = input.size(1);
+    if(topk == 2 || topk == 4 || topk == 5 || topk == 6 || topk == 8)
+        TORCH_CHECK(input.is_contiguous() && output.is_contiguous(),
+                    "native moe_sum input/output must be contiguous");
+    if(output.numel() == 0)
+        return;
 
     dim3 grid(num_tokens);
     dim3 block(std::min(hidden_size, 1024));
@@ -673,37 +708,59 @@ void moe_sum(torch::Tensor& input,  // [num_tokens, topk, hidden_size]
     {
     case 2:
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-            vllm::moe::moe_sum_kernel<scalar_t, 2><<<grid, block, 0, stream>>>(
+            aiter::launch_kernel(aiter::launch_policy::moe_sum, vllm::moe::moe_sum_kernel<scalar_t, 2>,
+                grid, block, 0, stream,
                 output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         });
         break;
 
     case 4:
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-            vllm::moe::moe_sum_kernel<scalar_t, 4><<<grid, block, 0, stream>>>(
+            aiter::launch_kernel(aiter::launch_policy::moe_sum, vllm::moe::moe_sum_kernel<scalar_t, 4>,
+                grid, block, 0, stream,
                 output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         });
         break;
 
     case 5:
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-            vllm::moe::moe_sum_kernel<scalar_t, 5><<<grid, block, 0, stream>>>(
+            aiter::launch_kernel(aiter::launch_policy::moe_sum, vllm::moe::moe_sum_kernel<scalar_t, 5>,
+                grid, block, 0, stream,
                 output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         });
         break;
     case 6:
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-            vllm::moe::moe_sum_kernel<scalar_t, 6><<<grid, block, 0, stream>>>(
+            aiter::launch_kernel(aiter::launch_policy::moe_sum, vllm::moe::moe_sum_kernel<scalar_t, 6>,
+                grid, block, 0, stream,
                 output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         });
         break;
     case 8:
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
-            vllm::moe::moe_sum_kernel<scalar_t, 8><<<grid, block, 0, stream>>>(
+            aiter::launch_kernel(aiter::launch_policy::moe_sum, vllm::moe::moe_sum_kernel<scalar_t, 8>,
+                grid, block, 0, stream,
                 output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         });
         break;
-    default: at::sum_out(output, input, 1); break;
+    default:
+#if AITER_ENABLE_MULTIDIE
+        if(ck_tile::get_hip_device_info().arch_name == "gfx946" &&
+           (input.scalar_type() == at::ScalarType::Float ||
+            input.scalar_type() == at::ScalarType::Half ||
+            input.scalar_type() == at::ScalarType::BFloat16))
+        {
+            VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_strided_kernel", [&] {
+                aiter::launch_kernel(aiter::launch_policy::moe_sum, vllm::moe::moe_sum_strided_kernel<scalar_t>,
+                    grid, block, 0, stream, output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
+                    topk, hidden_size, input.stride(0), input.stride(1), input.stride(2),
+                    output.stride(0), output.stride(1));
+            });
+            break;
+        }
+#endif
+        at::sum_out(output, input, 1);
+        break;
     }
 }
 

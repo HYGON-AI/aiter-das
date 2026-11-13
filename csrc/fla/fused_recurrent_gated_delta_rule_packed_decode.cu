@@ -14,6 +14,7 @@
 
 #include "arch.h"
 #include "fla.h"
+#include "hip_kernel_launch.h"
 
 #ifndef AITER_HIP_KERNEL_LAUNCH_CHECK
 #if defined(C10_CUDA_KERNEL_LAUNCH_CHECK)
@@ -449,7 +450,7 @@ void launch_tier(const LaunchArgs& A, hipStream_t stream)
                     static_cast<unsigned int>(A.HV),
                     static_cast<unsigned int>(A.B));
 
-    hipLaunchKernelGGL(
+    aiter::launch_kernel(aiter::launch_policy::fla,
         HIP_KERNEL_NAME(fused_recurrent_gated_delta_rule_packed_decode_base_kernel<
             input_t, state_t, index_t, GroupSize, Packs, Rows, BlockThreads,
             KConst, VConst, UseQkL2Norm>),

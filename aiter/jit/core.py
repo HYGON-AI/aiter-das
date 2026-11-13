@@ -710,6 +710,13 @@ def clear_build(md_name):
         shutil.rmtree(path)
 
 
+def _aicc_available() -> bool:
+    """海光 aicc/dcc 编译器是否可用（flash_kda 等模块依赖其专有内建）。"""
+    if shutil.which("aicc"):
+        return True
+    return os.path.exists("/opt/dtk/bin/aicc")
+
+
 def build_module(
     md_name,
     srcs,
@@ -835,6 +842,42 @@ def build_module(
             ]
         archs = validate_and_update_archs()
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
+        if md_name == "module_custom_all_reduce" and "gfx92a" in archs:
+            # Publication uses host HIP APIs, where __gfx92a__ is not defined.
+            # Keep the host/device class layout consistent, including fat builds.
+            publish_flag = "-DAITER_CAR_ENABLE_GFX92A_STAGING_PUBLISH=1"
+            flags_cc.append(publish_flag)
+            flags_hip.append(publish_flag)
+        # gfx946 builds require its HIP multi-die SDK. Compile both launch paths;
+        # the selected device's runtime topology decides which one to use.
+        if "gfx946" in archs:
+            if md_name in {
+                "module_norm",
+                "module_rmsnorm",
+                "module_cpp_api",
+                "module_gemm_a8w8",
+                "module_gemm_a8w8_blockscale",
+            }:
+                flags_hip.append("-DCK_ENABLE_MULTIDIE=1")
+            if md_name in {
+                "module_activation",
+                "module_quant",
+                "module_cpp_api",
+                "module_moe_utils",
+                "module_custom",
+                "module_kpool_topk",
+                "module_custom_all_reduce",
+                "module_topk_per_row",
+                "module_topk_plain",
+                "module_sampling",
+                "module_rope_general_fwd",
+                "module_rope_general_bwd",
+                "module_rope_pos_fwd",
+                "module_cache",
+                "module_fused_qk_norm_rope_cache_quant_shuffle",
+                "module_fused_qk_norm_mrope_cache_quant_shuffle",
+            }:
+                flags_hip.append("-DAITER_ENABLE_MULTIDIE=1")
         parallel_jobs = os.getenv("AITER_HIP_PARALLEL_JOBS")
         if parallel_jobs is not None:
             if not parallel_jobs.isdigit() or int(parallel_jobs) < 1:
@@ -853,7 +896,7 @@ def build_module(
                 code_object_version,
                 md_name,
             )
-        fp8_archs = {"gfx938", "gfx92a"}
+        fp8_archs = {"gfx938", "gfx92a", "gfx946"}
         enable_fp8 = (
             int(os.getenv("AITER_ENABLE_FP8", "0")) > 0
             or any(arch in fp8_archs for arch in archs)
@@ -878,6 +921,9 @@ def build_module(
 
         def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
             if blob_gen_cmd:
+                # Instance generation and host/device macros share one FP8 policy.
+                if md_name == "module_rmsnorm" and enable_fp8:
+                    blob_gen_cmd += " --enable-fp8"
                 blob_dir = f"{op_dir}/blob"
                 os.makedirs(blob_dir, exist_ok=True)
                 if AITER_LOG_MORE:
@@ -1127,6 +1173,15 @@ def compile_ops(
                     md_name, build_module_name=build_module_name
                 )
                 d_args.update(custom_build_args)
+
+                if d_args.get("require_aicc", False) and not _aicc_available():
+                    raise RuntimeError(
+                        f"[aiter] module '{md_name}' 需要海光 aicc 编译器（DTK）。"
+                        f"该模块使用 aicc 专有的 buffer 描述符类型与构造内建，"
+                        f"标准 hipcc 不支持这些内建，用 hipcc 编译会失败或产出不可用模块。"
+                        f"请安装 DTK 并确保 '/opt/dtk/bin/aicc' 或 PATH 中的 aicc 可用；"
+                        f"当前选择的编译器: {os.environ.get('HIPCC') or shutil.which('hipcc') or 'unknown'}"
+                    )
 
                 if d_args.get("skip_if", False):
                     logger.info(f"skip build [{md_name}] due to skip_if condition")
