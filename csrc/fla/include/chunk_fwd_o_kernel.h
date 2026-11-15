@@ -1252,6 +1252,11 @@ void chunk_fwd_o_demo_kernel(const ChunkFwdOParams params)
             c_A, g_lds_tile, g_t, gamma_coeff, av_scale, t_local,
             lane_group);
 
+    // All waves must finish reading the gate tile before LDS is reused for V.
+    if constexpr (UseG) {
+        wait_all_and_barrier();
+    }
+
     prefetch_v_stage32_to_lds_doc<Element, FullChunk>(
         v_lds_stage0, v + v_tile_base + index_t(v_group * BV),
         params.v_row_stride, 0, binfo.valid_t());
