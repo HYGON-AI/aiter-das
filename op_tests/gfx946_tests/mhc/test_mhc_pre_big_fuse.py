@@ -6,7 +6,7 @@ Inputs are generated on CPU, the reference is an independent CPU
 float32 implementation (RMSNorm, sigmoid, 20-round Sinkhorn), and every case
 calls the operator exactly once: no warmup, no timing loop.
 
-Run inside the perf-model container with the PMD chip selector exported:
+Run inside the PMD container with the PMD chip selector exported:
     export PMD_PATH=/opt/rocm/pmd GPU_CHIP=sb GPU_ARCHS=gfx946
     python op_tests/gfx946_tests/mhc/test_mhc_pre_big_fuse.py --suite core \
         --expect-xcds 1 --json ../../../test_mhc_pre/mhc_pre_big_fuse_sb_core.json

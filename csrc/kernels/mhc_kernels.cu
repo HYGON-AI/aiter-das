@@ -149,21 +149,20 @@ static_assert(opus::get_warp_size() == 64, "HCU expects wave64");
 #endif
 
 //! ====================================================================
-//! AITER_MHC_PMD_RECIP_GUARD —— perf-model 仿真器的 fp32 倒数／除法 workaround
+//! AITER_MHC_PMD_RECIP_GUARD —— PMD 仿真器的 fp32 倒数／除法 workaround
 //! --------------------------------------------------------------------
-//! 现象: 在 perf-model(PMD) 上, fp32 除法序列
+//! 现象: 在 PMD 仿真器上, fp32 除法序列
 //!   v_div_scale_f32 / v_rcp_f32 / v_div_fmas_f32 / v_div_fixup_f32
 //! 在结果的二进制指数绝对值约 >= 96 时, 把指数偏移 96:
 //!   1/(1+2.075e29) -> 0.38179708 (正确 4.8e-30)
 //!   1/1e29         -> 0.792282   (正确 1e-29)
 //! PMD 的 gfx946 与 gfx938 两个模型错得逐位相同。
-//! 对照实验: 同一探针在 dcugemm 真机 (gfx938, BW1101) 上全部正确, 相对差 < 1e-6
+//! 对照实验: 同一探针在 gfx938(BW1101) 真机上全部正确, 相对差 < 1e-6
 //!   ⇒ 触发源是仿真器的 defect, 不是硬件行为。
 //! 处理: 本文件两处「极端比值」除法只在 __gfx946__ 编译目标下加保护, 其余架构走
 //!   原始表达式、与改动前逐位一致。真机上这两处保护与原始表达式的差异 <= 1e-20。
 //! 待办: gfx946 真机实测确认没有该现象后, 把本宏置 0 并删除两处保护分支, 统一改回
 //!   原始除法; 在此之前不要把该 workaround 当作 kernel 缺陷的修复。
-//! 关联: step2 执行记录 3.5.1 节的 PMD 与真机对照表。
 //! ====================================================================
 #if defined(__gfx946__)
     #define AITER_MHC_PMD_RECIP_GUARD 1
@@ -1394,7 +1393,7 @@ namespace aiter {
         const int k_offset = sub_hidden_size * blockIdx.y;   //! 本 block 起始 hidden 列
         const int land_id = threadIdx.x % warp_size;
         const int m_oob = m < m_idx + num_rows ? (m - m_idx) : num_rows;
-        //! 1/(1+exp(-x)). On __gfx946__ only, add the perf-model workaround described at
+        //! 1/(1+exp(-x)). On __gfx946__ only, add the PMD workaround described at
         //! AITER_MHC_PMD_RECIP_GUARD: exp(-x) > 1e20 means the true sigmoid is below 1e-20,
         //! which is irrelevant next to hc_pre_eps = 1e-6, so short-circuit instead of
         //! dividing (the simulator would return ~0.38 there). Other architectures keep the
@@ -1657,7 +1656,7 @@ namespace aiter {
             float row_max = reduce_in_4threads(comb_mix_v, fmaxf);
             comb_mix_v = expf(comb_mix_v - row_max);
 #if AITER_MHC_PMD_RECIP_GUARD
-            //! perf-model workaround (see AITER_MHC_PMD_RECIP_GUARD): keep the divisions below
+            //! PMD workaround (see AITER_MHC_PMD_RECIP_GUARD): keep the divisions below
             //! out of the extreme-ratio range the simulator mis-handles. Anything below 1e-20
             //! is negligible once hc_sinkhorn_eps (default 1e-6) is added.
             comb_mix_v = comb_mix_v < 1e-20f ? 0.0f : comb_mix_v;
@@ -1776,7 +1775,7 @@ namespace aiter {
         const int lane_id = tid & (warp_size - 1);
         const int warp_id = tid / warp_size;
 
-        //! 1/(1+exp(-x)). On __gfx946__ only, add the perf-model workaround described at
+        //! 1/(1+exp(-x)). On __gfx946__ only, add the PMD workaround described at
         //! AITER_MHC_PMD_RECIP_GUARD: exp(-x) > 1e20 means the true sigmoid is below 1e-20,
         //! which is irrelevant next to hc_pre_eps = 1e-6, so short-circuit instead of
         //! dividing (the simulator would return ~0.38 there). Other architectures keep the
@@ -1871,7 +1870,7 @@ namespace aiter {
                 float row_max = reduce_in_4threads(comb_mix_v, fmaxf);
                 comb_mix_v = expf(comb_mix_v - row_max);
 #if AITER_MHC_PMD_RECIP_GUARD
-                //! Same perf-model workaround as the legacy stage-2 kernel.
+                //! Same PMD workaround as the legacy stage-2 kernel.
                 comb_mix_v = comb_mix_v < 1e-20f ? 0.0f : comb_mix_v;
 #endif
                 float row_sum = reduce_in_4threads(comb_mix_v, sum_f);

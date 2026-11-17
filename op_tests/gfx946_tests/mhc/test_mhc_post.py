@@ -9,7 +9,7 @@ on CPU, the reference is an independent CPU float32 implementation of
 
 and every case calls the operator exactly once: no warmup, no timing loop.
 
-Run inside the perf-model container with the PMD chip selector exported:
+Run inside the PMD container with the PMD chip selector exported:
     export PMD_PATH=/opt/rocm/pmd GPU_CHIP=sb GPU_ARCHS=gfx946
     python op_tests/gfx946_tests/mhc/test_mhc_post.py --suite v3probe \
         --expect-xcds 1 --json ../../../test_mhc_post/mhc_post_sb_v3probe.json

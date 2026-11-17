@@ -29,7 +29,7 @@ actually ran.
 x must be fp16 or bf16 (the host entries dispatch on AITER_DISPATCH_FLOATING16_TYPES);
 fn is float32, as built by aiter.ops.mhc.
 
-Usage inside the perf-model container, started from a scratch directory because
+Usage inside the PMD container, started from a scratch directory because
 PMD writes ``m5out/`` into the current working directory:
     PMD_PATH=/opt/rocm/pmd GPU_CHIP=sb AITER_MHC_PRE_GEMM_MMAC_K=4 \\
     python <repo>/op_tests/gfx946_tests/mhc/bench_mhc_pre_stage1.py \\

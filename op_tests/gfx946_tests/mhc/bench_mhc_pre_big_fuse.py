@@ -7,7 +7,7 @@ measured interval contains no stage-1 GEMM and no Python-side path selection.
 Stage-1 inputs are synthesised (deterministic randn) rather than computed: stage-2
 timing does not depend on their provenance, only on their shape and range.
 
-Usage inside the perf-model container:
+Usage inside the PMD container:
     PMD_PATH=/opt/rocm/pmd GPU_CHIP=sb GPU_ARCHS=gfx946 \
     python op_tests/gfx946_tests/mhc/bench_mhc_pre_big_fuse.py \
         --variant default --warmup 3 --iters 7 --json out.json

@@ -10,7 +10,7 @@ timing. Passing cells are timed with CUDA events (warmup then iters, median).
 If --auto-selection is on (default), each shape is first run once with the
 environment unset to record which version the auto rule selects now.
 
-Usage inside the perf-model container:
+Usage inside the PMD container:
     PMD_PATH=/opt/rocm/pmd GPU_CHIP=sb GPU_ARCHS=gfx946 \
     python op_tests/gfx946_tests/mhc/bench_mhc_post.py --variant v3 \
         --warmup 1 --iters 3 --expect-xcds 1 --json bench_v3.json
