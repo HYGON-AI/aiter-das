@@ -14,10 +14,11 @@ For gfx936/gfx938 use that target and omit `-DAITER_ENABLE_MULTIDIE=1`.
 Configure the target device or Perf Model before running (single `sb`, dual
 `sbx2`). The executable initializes HIP then removes `GPU_CHIP`.
 
-The five policies share typed argument conversion (int32 to int64, float to
+The eight policies share typed argument conversion (int32 to int64, float to
 double), dynamic LDS, and a non-default stream. Coverage includes auto with
 one/five TGs, off, linear chunk 2, invalid mode/chunk/mask, and TopK/Sum empty
-grid validation order. Expected counts: 29 on hardware/single XCD, 39 on dual
+grid validation order, 3D grid coverage, and the all-dimensions auto gate.
+Expected counts: 70 on hardware/single XCD, 94 on dual
 XCD. PMD TG routing must be checked separately in StatLog; eager results do
 not establish Graph support.
 

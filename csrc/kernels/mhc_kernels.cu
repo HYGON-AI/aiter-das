@@ -45,6 +45,7 @@
 
 
 #include "aiter_hip_common.h"
+#include "hip_kernel_launch.h"
 #include "py_itfs_common.h"
 #include "opus/opus.hpp"
 // #include "hip_reduce.h"
@@ -939,7 +940,10 @@ namespace aiter {
         dim3 grid(m_blocks, n_blocks, split_k); \
         TORCH_CHECK(hc_hidden_size % (tile_k * split_k) == 0, "hc_hidden_size must be divisible by tile_k * split_k"); \
         TORCH_CHECK(hc_hidden_size >= (tile_k * split_k) * 2, "hc_hidden_size must >= tile_k * split_k * 2 stages prefetch"); \
-        mhc_pre_gemm_sqrsum_kernel<DTYPE_I, block_size, tile_m, tile_n, tile_k, (use_k8), (use_tf32_kernel)><<<grid, block, 0, stream>>>( \
+        aiter::launch_kernel( \
+            aiter::launch_policy::mhc_pre, \
+            mhc_pre_gemm_sqrsum_kernel<DTYPE_I, block_size, tile_m, tile_n, tile_k, (use_k8), (use_tf32_kernel)>, \
+            grid, block, stream, \
             reinterpret_cast<float*>(out.data_ptr()), \
             reinterpret_cast<float*>(sqrsum.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
@@ -1110,7 +1114,10 @@ namespace aiter {
 #define MHC_PRE_GEMM_SQRSUM_STAGE1_M128_IMPL(use_k8, use_tf32_kernel) \
     AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_pre_gemm_sqrsum_stage1_m128", [&] { \
         using DTYPE_I = typename t2opus<scalar_t>::type; \
-        mhc_pre_gemm_sqrsum_stage1_m128_kernel<DTYPE_I, (use_k8), (use_tf32_kernel)><<<grid, block, 0, stream>>>( \
+        aiter::launch_kernel( \
+            aiter::launch_policy::mhc_pre, \
+            mhc_pre_gemm_sqrsum_stage1_m128_kernel<DTYPE_I, (use_k8), (use_tf32_kernel)>, \
+            grid, block, stream, \
             reinterpret_cast<float*>(out.data_ptr()), \
             reinterpret_cast<float*>(sqrsum.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
@@ -1261,7 +1268,8 @@ namespace aiter {
         constexpr int warps_per_block = block_size / 64;
         dim3 grid((m + warps_per_block - 1) / warps_per_block);
         dim3 block(block_size);
-        mhc_pre_reduce_splitk_kernel<<<grid, block, 0, stream>>>(
+        aiter::launch_kernel(aiter::launch_policy::mhc_pre, mhc_pre_reduce_splitk_kernel,
+                             grid, block, stream,
             reinterpret_cast<float*>(out_red.data_ptr()),
             reinterpret_cast<float*>(sqrsum_red.data_ptr()),
             reinterpret_cast<float*>(out.data_ptr()),
@@ -1976,7 +1984,10 @@ namespace aiter {
     dim3 block(block_size); \
     AITER_DISPATCH_FLOATING16_TYPES(layer_input.scalar_type(), "mhc_pre_big_fuse", [&] { \
         using DTYPE_I = typename t2opus<scalar_t>::type; \
-        mhc_pre_big_fuse_kernel<DTYPE_I, block_size, hc_mult, num_rows, residual_block, use_parallel_splitk_reduce><<<grid, block, 0, stream>>>( \
+        aiter::launch_kernel( \
+            aiter::launch_policy::mhc_pre, \
+            mhc_pre_big_fuse_kernel<DTYPE_I, block_size, hc_mult, num_rows, residual_block, use_parallel_splitk_reduce>, \
+            grid, block, stream, \
             reinterpret_cast<float*>(post_mix.data_ptr()), \
             reinterpret_cast<float*>(comb_mix.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(layer_input.data_ptr()), \
@@ -2013,7 +2024,10 @@ namespace aiter {
         dim3 block(128); \
         AITER_DISPATCH_FLOATING16_TYPES(layer_input.scalar_type(), "mhc_pre_big_fuse_v3", [&] { \
             using DTYPE_I = typename t2opus<scalar_t>::type; \
-            mhc_pre_big_fuse_kernel_v3<DTYPE_I, 4, elems_per_thread><<<grid, block, 0, stream>>>( \
+            aiter::launch_kernel( \
+                aiter::launch_policy::mhc_pre, \
+                mhc_pre_big_fuse_kernel_v3<DTYPE_I, 4, elems_per_thread>, \
+                grid, block, stream, \
                 reinterpret_cast<float*>(post_mix.data_ptr()), \
                 reinterpret_cast<float*>(comb_mix.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(layer_input.data_ptr()), \
@@ -3508,7 +3522,10 @@ namespace aiter {
     dim3 block(block_size); \
     AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post", [&] { \
         using DTYPE_I = typename t2opus<scalar_t>::type; \
-        kernel_name<DTYPE_I, block_size, 4, residual_block><<<grid, block, 0, stream>>>( \
+        aiter::launch_kernel( \
+            aiter::launch_policy::mhc_post, \
+            kernel_name<DTYPE_I, block_size, 4, residual_block>, \
+            grid, block, stream, \
             reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
@@ -3547,7 +3564,10 @@ namespace aiter {
         dim3 block(block_size_v2); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v2", [&] { \
             using DTYPE_I = typename t2opus<scalar_t>::type; \
-            mhc_post_kernel_v2<DTYPE_I, block_size_v2, 4, elems_per_thread><<<grid, block, 0, stream>>>( \
+            aiter::launch_kernel( \
+                aiter::launch_policy::mhc_post, \
+                mhc_post_kernel_v2<DTYPE_I, block_size_v2, 4, elems_per_thread>, \
+                grid, block, stream, \
                 reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
@@ -3584,7 +3604,10 @@ namespace aiter {
         dim3 block(block_size_v3); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v3", [&] { \
             using DTYPE_I = typename t2opus<scalar_t>::type; \
-            mhc_post_kernel_v3<DTYPE_I, block_size_v3, 4, elems_per_thread><<<grid, block, 0, stream>>>( \
+            aiter::launch_kernel( \
+                aiter::launch_policy::mhc_post, \
+                mhc_post_kernel_v3<DTYPE_I, block_size_v3, 4, elems_per_thread>, \
+                grid, block, stream, \
                 reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
@@ -3622,7 +3645,10 @@ namespace aiter {
         dim3 block(block_size_v4); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v4", [&] { \
             using DTYPE_I = typename t2opus<scalar_t>::type; \
-            mhc_post_kernel_v4<DTYPE_I, block_size_v4, 4, elems_per_thread><<<grid, block, 0, stream>>>( \
+            aiter::launch_kernel( \
+                aiter::launch_policy::mhc_post, \
+                mhc_post_kernel_v4<DTYPE_I, block_size_v4, 4, elems_per_thread>, \
+                grid, block, stream, \
                 reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
@@ -3660,7 +3686,10 @@ namespace aiter {
         dim3 block(block_size_v6); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v6", [&] { \
             using DTYPE_I = typename t2opus<scalar_t>::type; \
-            mhc_post_kernel_v6<DTYPE_I, block_size_v6, 4, elems_per_thread><<<grid, block, 0, stream>>>( \
+            aiter::launch_kernel( \
+                aiter::launch_policy::mhc_post, \
+                mhc_post_kernel_v6<DTYPE_I, block_size_v6, 4, elems_per_thread>, \
+                grid, block, stream, \
                 reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
@@ -3697,7 +3726,10 @@ namespace aiter {
         dim3 block(block_size_v7); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v7", [&] { \
             using DTYPE_I = typename t2opus<scalar_t>::type; \
-            mhc_post_kernel_v7<DTYPE_I, block_size_v7, 4, elems_per_thread><<<grid, block, 0, stream>>>( \
+            aiter::launch_kernel( \
+                aiter::launch_policy::mhc_post, \
+                mhc_post_kernel_v7<DTYPE_I, block_size_v7, 4, elems_per_thread>, \
+                grid, block, stream, \
                 reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
@@ -3740,7 +3772,10 @@ namespace aiter {
         dim3 block(block_size_v5); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v5", [&] { \
             using DTYPE_I = typename t2opus<scalar_t>::type; \
-            mhc_post_kernel_v5<DTYPE_I, block_size_v5, hc_mult_v5, elems_per_lane><<<grid, block, 0, stream>>>( \
+            aiter::launch_kernel( \
+                aiter::launch_policy::mhc_post, \
+                mhc_post_kernel_v5<DTYPE_I, block_size_v5, hc_mult_v5, elems_per_lane>, \
+                grid, block, stream, \
                 reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \

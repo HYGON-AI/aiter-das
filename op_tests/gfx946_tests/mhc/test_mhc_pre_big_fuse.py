@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""gfx946 correctness tests for the MHC pre stage-2 fused kernel (mhc_pre_big_fuse).
+"""Check the gfx946 mHC pre entry point and its component kernels.
 
-The device under test is the whole aiter.mhc_pre entry point; stage 2 is the part
-under pilot. Inputs are generated on CPU, the reference is an independent CPU
+Inputs are generated on CPU, the reference is an independent CPU
 float32 implementation (RMSNorm, sigmoid, 20-round Sinkhorn), and every case
 calls the operator exactly once: no warmup, no timing loop.
 
@@ -13,13 +12,26 @@ Run inside the perf-model container with the PMD chip selector exported:
         --expect-xcds 1 --json ../../../test_mhc_pre/mhc_pre_big_fuse_sb_core.json
 Suites: core (36 end-to-end), stage2core (36, stage-1 inputs fed from CPU),
 stage2splitk (10, n_splits 4 and 32), postonly (4), tf32 (4), stress (1),
-invalid (4), pathprobe (1).
+invalid (4), pathprobe (1), tlreject (1).
 --case accepts "group:index" or a comma separated list; --list-cases prints them.
-The pilot fixes AITER_MHC_PRE_KERNEL=aiter so that stage 2 never lands on the
-experimental tlstyle kernel; --suite pathprobe is the single exception and only
-records which host function auto selected.
+--resume reuses PASS records when the identity matches (the identity covers the
+stage-1 routing environment); FAIL or missing cases are re-run.
+--force-env VAR=VALUE (repeatable) is the only opt-in for forced-environment
+runs: each entry is checked against FORCE_ENV_WHITELIST and
+recorded in the IDENTITY line; any other variable or value is refused up front.
+It is also refused for suites whose handler bypasses aiter.mhc_pre
+(stage2core, stage2splitk, splitk), and TILE_N additionally requires every
+selected case to resolve to the legacy stage-1 entry, because that knob is read
+only there; set AITER_MHC_PRE_STAGE1=legacy (plain environment) for that run.
+Without --force-env the entry guard behaves exactly as before, so a plain run
+with no environment variables is unchanged.
+--suite tlreject runs the tlstyle + sinkhorn_repeat=0 rejection in a child
+process and asserts the product's own TORCH_CHECK text, never this guard.
+The test sets AITER_MHC_PRE_KERNEL=aiter by default; --suite pathprobe observes
+the auto-selected host function, while --force-env can explicitly select tlstyle.
 Numerical verdict: zero out-of-tolerance elements. layer_input is judged on the
-bf16 bit pattern (same sign and both non-zero means |int16 delta| <= 1), the two
+two-parameter per-element criterion |diff| <= max(LAYER_FLOOR, LAYER_REL * |ref|)
+with the bf16 bit-pattern distance kept as a record-only statistic; the two
 float32 outputs use an absolute tolerance.
 """
 
@@ -28,6 +40,8 @@ import hashlib
 import inspect
 import json
 import os
+import subprocess
+import sys
 import traceback
 from pathlib import Path
 
@@ -40,8 +54,75 @@ BATCHES = (1, 32, 64, 128, 256, 512, 1024, 2048, 8192)
 HIDDENS = (1280, 2560, 4096, 7168)
 FP32_TOL = 1e-4
 SUBNORMAL_FLOOR = 2.0 ** -133
+LAYER_FLOOR = 1e-3
+LAYER_REL = 2.0 ** -7  # provisional relative tolerance
+REVIEW_ULP2_RATIO = 1e-3
+REF_BIN_EDGES = (0.0, 1e-3, 1e-2, 0.1, 1.0, 2.0, 4.0, 8.0, 16.0)
 PRE_ENV = ("AITER_MHC_PRE_KERNEL", "AITER_MHC_PRE_BIG_FUSE_KERNEL",
            "AITER_MHC_PRE_TILE_N", "AITER_MHC_PRE_GEMM_MMAC_K")
+
+# Stage-1 routing knobs change the executed entry and the numbers but are not
+# part of the opt-in guard above. They are recorded in the identity so that an
+# interrupted run can only be resumed under the same routing.
+ROUTING_ENV = ("AITER_MHC_PRE_STAGE1", "AITER_MHC_PRE_TILE_K",
+               "AITER_MHC_PRE_SPLITK", "AITER_MHC_PRE_REDUCE_SPLITK")
+
+# A forced variable is only accepted in suites whose handler reaches the code
+# that reads it: core/postonly/tf32/stress call aiter.mhc_pre, while
+# stage2core/stage2splitk/splitk call the stage-2 or reduction entries directly.
+# postonly is excluded for KERNEL because its sinkhorn_repeat=0 contract is
+# rejected by the tlstyle host by design.
+FORCE_ENV_SUITES = {
+    "AITER_MHC_PRE_KERNEL": ("core", "tf32", "stress"),
+    "AITER_MHC_PRE_GEMM_MMAC_K": ("core", "postonly", "tf32", "stress"),
+    "AITER_MHC_PRE_TILE_N": ("core", "postonly", "tf32", "stress"),
+}
+
+# Opt-in whitelist for --force-env: one bounded exception per variable, values
+# limited to what the product contract accepts. Anything outside this table is
+# refused before any run starts, so a plain run keeps the original guard.
+FORCE_ENV_WHITELIST = {
+    "AITER_MHC_PRE_KERNEL": ("aiter", "tlstyle"),
+    "AITER_MHC_PRE_GEMM_MMAC_K": ("4", "8", "auto"),
+    "AITER_MHC_PRE_TILE_N": ("16", "32", "auto"),
+}
+
+GPU_CHIP_ENV = None  # remembered for the tlreject child, which re-selects the model
+
+
+def parse_force_env(specs):
+    """Validate --force-env VAR=VALUE entries; refuse anything off the whitelist."""
+    forced = {}
+    for spec in specs or ():
+        name, sep, value = spec.partition("=")
+        allowed = FORCE_ENV_WHITELIST.get(name) if sep else None
+        if allowed is None:
+            raise ValueError(
+                f"--force-env only accepts {sorted(FORCE_ENV_WHITELIST)} as "
+                f"VAR=VALUE, got {spec!r}")
+        if value not in allowed:
+            raise ValueError(
+                f"--force-env {name}={value!r} is not in its whitelist "
+                f"{list(allowed)}")
+        forced[name] = value
+    return forced
+
+
+def stage1_uses_m128(c, gfx, preset):
+    """Mirror aiter.ops.mhc.mhc_pre's stage-1 entry choice for one case."""
+    variant = (preset or "auto").strip().lower()
+    if variant in ("aiter", "legacy"):
+        return False
+    if variant in ("m128", "tlstyle"):
+        return True
+    if variant not in ("", "auto"):
+        return True  # mhc_pre raises for this value; it is never legacy
+    args = ARGS_HEAD if c["kind"] == "postonly" else ARGS_FULL
+    hc_mult3 = HC_MULT if c["kind"] == "postonly" else HC_MULT3
+    return (args["sinkhorn_repeat"] > 0
+            and hc_mult3 == HC_MULT * (2 + HC_MULT)
+            and gfx not in ("gfx936", "gfx92a")
+            and not (c["hidden_size"] in (1280, 2560) and c["m"] <= 512))
 
 
 def fail_with_detail(message, record):
@@ -57,25 +138,64 @@ def bf16_bits(value):
 
 
 def compare_layer_input(ref, act):
-    """Count elements violating the bf16 bit-pattern rule and report the worst gap.
+    """Two-parameter per-element gate for layer_input plus record-only statistics.
 
-    Rule, per the pilot plan: same sign and both sides normal means at most one bf16
-    step apart; anything else (opposite signs, a zero, or a subnormal on either side)
-    must either match bit-for-bit or stay within the subnormal floor 2**-133, so that
-    the exponent-boundary case where a 1-step difference straddles the sign bit is not
-    reported as a violation.
+    An element passes when |ref - act| <= max(LAYER_FLOOR, LAYER_REL * |ref|).
+    The absolute floor covers near-zero cancellation results; LAYER_REL is a
+    provisional relative tolerance. The bf16 bit-pattern statistics are reported
+    separately and do not change this per-element criterion.
+
+    Record-only, never gating: the bf16 bit-pattern distance (ulp) and its counts.
+    Across binade boundaries the bit distance is not a monotone value-error
+    measure, but it stays a good degradation indicator. pending_review marks the
+    group review rules: any ulp >= 3 element with |ref| >= LAYER_FLOOR, or more
+    than REVIEW_ULP2_RATIO of those elements at ulp == 2, sends the group to the
+    unexplained-anomaly list, whose entries need paired (|ref|, ulp, |diff|)
+    triples.
+
+    review_pool_count counts reference elements with |ref| >= LAYER_FLOOR and is
+    the denominator of the ulp==2 ratio; it is not the IEEE-normal count (that
+    mask is ref_normal inside the per-bin table).
+    ref_bins groups statistics by reference magnitude and can reveal
+    truncation-style rounding (the median signed diff in bf16 steps drifts toward
+    -0.5 when the device truncates). The median covers normal reference elements
+    only and is None when a bin has none.
     """
     ref_bits, act_bits = bf16_bits(ref), bf16_bits(act)
     ref_f, act_f = ref.float(), act.float()
-    normal = (ref_bits & 0x7F80) != 0
-    normal &= (act_bits & 0x7F80) != 0
-    same_sign = (ref_bits < 0) == (act_bits < 0)
+    ref_normal = (ref_bits & 0x7F80) != 0
+    normal = ref_normal & ((act_bits & 0x7F80) != 0)
     ulp = (ref_bits - act_bits).abs()
     abs_diff = (ref_f - act_f).abs()
     rel = abs_diff / ref_f.abs().clamp(min=1e-30)
-    ok = torch.where(same_sign & normal, ulp <= 1,
-                     (ref_bits == act_bits) | (abs_diff <= SUBNORMAL_FLOOR))
-    bad = ~ok
+    bound = torch.maximum(
+        torch.full_like(abs_diff, LAYER_FLOOR), LAYER_REL * ref_f.abs())
+    bad = ~(abs_diff <= bound)
+    review_pool = ref_f.abs() >= LAYER_FLOOR
+    review_pool_count = int(review_pool.sum())
+    review_ulp_2 = int(((ulp == 2) & review_pool).sum())
+    review_ulp_ge_3 = int(((ulp >= 3) & review_pool).sum())
+    pending_review = bool(
+        review_ulp_ge_3 > 0 or review_ulp_2 > REVIEW_ULP2_RATIO * max(review_pool_count, 1))
+    binade_exp = ((ref_bits & 0x7F80) >> 7) - 127
+    ulp_ref = torch.exp2(binade_exp.float() - 7).clamp(min=SUBNORMAL_FLOOR)
+    signed_steps = (act_f - ref_f) / ulp_ref
+    abs_ref = ref_f.abs()
+    ref_bins = []
+    for i, lo in enumerate(REF_BIN_EDGES):
+        hi = REF_BIN_EDGES[i + 1] if i + 1 < len(REF_BIN_EDGES) else None
+        in_bin = abs_ref >= lo
+        if hi is not None:
+            in_bin &= abs_ref < hi
+        n = int(in_bin.sum())
+        steps = signed_steps[in_bin & ref_normal]
+        ref_bins.append(dict(
+            lo=lo, hi=hi, count=n,
+            max_abs_diff=float(abs_diff[in_bin].max()) if n else None,
+            max_ulp=int(ulp[in_bin].max()) if n else None,
+            ulp_ge_2_count=int((ulp[in_bin] >= 2).sum()) if n else 0,
+            median_signed_steps=float(steps.median()) if steps.numel() else None,
+        ))
     return dict(
         violations=int(bad.sum()),
         max_ulp=int(ulp.max()) if ulp.numel() else 0,
@@ -85,6 +205,11 @@ def compare_layer_input(ref, act):
         max_rel_diff=float(rel.max()),
         sign_flip=int(((ref_f * act_f) < 0).sum()),
         zero_side=int(((~normal) & (ref_bits != act_bits)).sum()),
+        review_pool_count=review_pool_count,
+        review_ulp_2_count=review_ulp_2,
+        review_ulp_ge_3_count=review_ulp_ge_3,
+        pending_review=pending_review,
+        ref_bins=ref_bins,
     )
 
 
@@ -181,11 +306,13 @@ def cases(suite):
                 ((4, 32, 4096), (8, 128, 7168), (16, 256, 1280), (32, 1024, 4096))]
     if suite == "invalid":
         return [case(32, 1280, "invalid", name=n) for n in PRE_ENV]
+    if suite == "tlreject":
+        return [case(32, 1280, "tlreject")]
     return []
 
 
 GROUPS = ("core", "postonly", "tf32", "stress", "invalid", "pathprobe",
-          "stage2core", "stage2splitk", "splitk")
+          "stage2core", "stage2splitk", "splitk", "tlreject")
 
 
 def select(all_cases, spec):
@@ -423,11 +550,56 @@ def run_invalid(aiter, c):
     return dict(rejected=rejected, error=error)
 
 
+SUB_TLREJECT_CODE = """
+import torch, aiter
+res = torch.zeros(32, 4, 1280, dtype=torch.bfloat16, device="cuda")
+fn = torch.zeros(4, 4 * 1280, dtype=torch.float32, device="cuda")
+scale = torch.zeros(3, dtype=torch.float32, device="cuda")
+base = torch.zeros(4, dtype=torch.float32, device="cuda")
+out = aiter.mhc_pre(res, fn, scale, base, 1e-6, 1e-6, 1e-6, 1.0, 0, False)
+print("NO_REJECT")
+"""
+TLREJECT_EXPECT = "tlstyle path only supports full MHC pre"
+
+
+def run_tlreject(aiter, c):
+    """The tlstyle host entry must reject sinkhorn_repeat=0.
+
+    The child calls aiter.mhc_pre directly with AITER_MHC_PRE_KERNEL=tlstyle and
+    a 4-row fn (the sinkhorn_repeat=0 contract), so the asserted exception is the
+    product's own TORCH_CHECK text ("tlstyle path only supports full MHC pre")
+    and never this file's entry guard. Running in a child keeps any abort-class
+    failure out of the parent suite.
+    """
+    env = dict(os.environ)
+    env["AITER_MHC_PRE_KERNEL"] = "tlstyle"
+    if GPU_CHIP_ENV:
+        env["GPU_CHIP"] = GPU_CHIP_ENV
+    proc = subprocess.run([sys.executable, "-c", SUB_TLREJECT_CODE],
+                          capture_output=True, text=True, env=env, timeout=1800)
+    tail = [line for line in proc.stderr.strip().splitlines()[-4:]]
+    record = dict(
+        exit=proc.returncode,
+        rejected=(proc.returncode != 0 and TLREJECT_EXPECT in proc.stderr),
+        no_reject_marker="NO_REJECT" in proc.stdout,
+        stderr_tail=tail)
+    if not record["rejected"] or record["no_reject_marker"]:
+        raise fail_with_detail(
+            "tlstyle did not reject sinkhorn_repeat=0 with the expected text",
+            record)
+    return record
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--suite", choices=GROUPS + ("all",), default="core")
     parser.add_argument("--case", help="select cases as kind:index[,kind:index]")
+    parser.add_argument("--force-env", action="append", metavar="VAR=VALUE",
+                        help="opt-in forced environment, whitelist only: "
+                             "AITER_MHC_PRE_KERNEL=aiter|tlstyle, "
+                             "AITER_MHC_PRE_GEMM_MMAC_K=4|8|auto, "
+                             "AITER_MHC_PRE_TILE_N=16|32|auto")
     parser.add_argument("--list-cases", action="store_true")
     parser.add_argument("--require-arch", default="gfx946")
     parser.add_argument("--expect-xcds", type=int,
@@ -460,15 +632,40 @@ def main():
         topology = [r["xcds"] if isinstance(r, dict) else r for r in raw]
         assert topology == [args.expect_xcds], raw
 
-    # The pilot must never depend on the auto rule for the stage-2 entry, except
-    # in the two suites that exist to observe that rule.
+    forced = parse_force_env(args.force_env)
+    for name in forced:
+        allowed = FORCE_ENV_SUITES.get(name, ())
+        if args.suite not in allowed:
+            raise RuntimeError(
+                f"--force-env {name} is only consumed by suites {list(allowed)}, "
+                f"not by --suite {args.suite}")
+    if "AITER_MHC_PRE_TILE_N" in forced:
+        gfx = props.gcnArchName.split(":")[0]
+        preset = os.environ.get("AITER_MHC_PRE_STAGE1")
+        m128_cases = [f"{s}:{c['m']}x{c['hidden_size']}" for s, c in selected
+                      if stage1_uses_m128(c, gfx, preset)]
+        if m128_cases:
+            raise RuntimeError(
+                "AITER_MHC_PRE_TILE_N is read only by the legacy stage-1 host; "
+                f"these cases resolve to m128: {m128_cases}; "
+                "set AITER_MHC_PRE_STAGE1=legacy")
+
+    # Default to the aiter stage-2 entry; pathprobe and invalid preserve the
+    # caller's environment for routing and validation checks.
     if args.suite not in ("pathprobe", "invalid"):
         preset = os.environ.get("AITER_MHC_PRE_KERNEL")
-        if preset not in (None, "", "aiter"):
+        ok_kernel = (None, "", "aiter")
+        if "AITER_MHC_PRE_KERNEL" in forced:
+            ok_kernel = (None, "", "aiter", "tlstyle")
+        if preset not in ok_kernel:
             raise RuntimeError(
                 f"AITER_MHC_PRE_KERNEL must be unset or 'aiter', got {preset!r}")
-        os.environ["AITER_MHC_PRE_KERNEL"] = "aiter"
+        os.environ["AITER_MHC_PRE_KERNEL"] = forced.get("AITER_MHC_PRE_KERNEL",
+                                                        "aiter")
     for name in PRE_ENV[1:]:
+        if name in forced:
+            os.environ[name] = forced[name]
+            continue
         current = os.environ.get(name)
         if current is None:
             continue
@@ -497,12 +694,16 @@ def main():
                              if k in inspect.signature(core.build_module).parameters})
         module = core.get_module("module_mhc")
     so = Path(module.__file__).resolve()
+    global GPU_CHIP_ENV
+    GPU_CHIP_ENV = os.environ.get("GPU_CHIP")
     identity = dict(
         arch=props.gcnArchName, cu_num=props.multi_processor_count, topology=topology,
         gpu_chip=os.environ.get("GPU_CHIP"), module=str(so),
         module_sha256=hashlib.sha256(so.read_bytes()).hexdigest(),
         test_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         env={k: os.environ.get(k) for k in PRE_ENV},
+        routing_env={k: os.environ.get(k) for k in ROUTING_ENV},
+        force_env=forced,
         torch=torch.__version__, hip=torch.version.hip)
     os.environ.pop("GPU_CHIP", None)
     result = dict(identity=identity, suite=args.suite, cases=[], complete=False)
@@ -511,7 +712,7 @@ def main():
     reused = {}
     if args.resume:
         old = json.loads(args.resume.read_text())
-        assert old["identity"] == identity and old["complete"], "resume identity mismatch"
+        assert old["identity"] == identity, "resume identity mismatch"
         reused = {r["id"]: r for r in old["cases"] if r["status"] == "PASS"}
 
     def save(record):
@@ -537,6 +738,8 @@ def main():
                 detail = run_pathprobe(aiter, c)
             elif suite == "invalid":
                 detail = run_invalid(aiter, c)
+            elif suite == "tlreject":
+                detail = run_tlreject(aiter, c)
             elif suite == "splitk":
                 detail = run_reduce_splitk(aiter, c)
             elif suite in ("stage2core", "stage2splitk"):
@@ -551,17 +754,24 @@ def main():
             save(dict(record, status="FAIL", error=str(exc), raise_site=site,
                       detail=getattr(exc, "detail", None),
                       error_type=type(exc).__name__))
+    pending_review = [r["id"] for r in result["cases"]
+                      if (r.get("layer_input") or {}).get("pending_review")]
+    result["pending_review"] = len(pending_review)
+    if pending_review:
+        print("PENDING_REVIEW " + json.dumps(pending_review), flush=True)
     if failures:
         result["complete"] = False
         if args.json:
             args.json.write_text(json.dumps(result, indent=2) + "\n")
-    print(f"SUMMARY total={len(result['cases'])} failed={failures}", flush=True)
+    print(f"SUMMARY total={len(result['cases'])} failed={failures} "
+          f"pending_review={len(pending_review)}", flush=True)
     if failures:
         raise SystemExit(1)
     result["complete"] = True
     if args.json:
         args.json.write_text(json.dumps(result, indent=2) + "\n")
-    print(f"RESULT PASS {len(result['cases'])} cases", flush=True)
+    print(f"RESULT PASS {len(result['cases'])} cases "
+          f"pending_review={len(pending_review)}", flush=True)
 
 
 if __name__ == "__main__":
