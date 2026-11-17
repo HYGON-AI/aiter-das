@@ -32,6 +32,17 @@ import torch
 
 BATCHES = (1, 32, 64, 128, 256, 512, 1024, 2048, 8192)
 HIDDENS = (1280, 2560, 4096, 7168)
+# AITER_MHC_POST_KERNEL values exercised by the bench. Keep the strings verbatim:
+# they are the product contract (env / trace "selected=" / JSON identity.variant).
+# Order: v3 (auto fallback baseline), then the auto-preferred v4/v5/v7, then the
+# legacy and the remaining experimental v2/v6.
+#   legacy: original 4-warp x hc_mult path, async_load b32 + LDS double buffer
+#   v2:     VGPR-resident b128 load (large-hidden occupancy collapse; reference)
+#   v3:     128 threads, 1 token/block, LDS-staged b128 (auto fallback)
+#   v4:     tile-style single buffer + batched store (auto-preferred)
+#   v5:     warp-partitioned tile-style (32-thread group per head; small hidden)
+#   v6:     split-h register path + batched store
+#   v7:     residual LDS + x VGPR + batched store
 VARIANTS = ("v3", "v4", "v5", "v7", "legacy", "v2", "v6")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
