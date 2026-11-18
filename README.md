@@ -56,39 +56,81 @@ python -m op_tests.test_***   # note that there is no '.py' suffix
 
 ## Continuous integration
 
-GitHub Actions workflow definitions are in `.github/workflows/`; CI test source
-files remain in `op_tests/ci_tests/`. The GPU build-and-test workflow runs only
-on self-hosted runners in the `ci-general` Runner Group with the `ci` label.
-The workflow runs inside the DTK/Python 3.10 container declared in
-`.github/workflows/ci.yml`; the Runner passes through the HCU device nodes and
-the read-only Hygon runtime mount. For the current SGLang CI image,
-`optest` is the only package that needs an organisation-managed source today:
-configure `OPTEST_PIP_INDEX_URL` (and, if needed, `OPTEST_PIP_TRUSTED_HOST`) as
-a GitHub Actions Variable. The image lacks `optest`, `auditwheel`, and
-`patchelf`; the latter two are explicitly fetched from `https://pypi.org/simple`.
-It already provides
-Torch 2.11, Triton, BoltOps, and the project runtime dependencies, which this
-workflow deliberately does not reinstall. Once `optest` is preinstalled in the
-SGLang image, its two Variables can be removed as well.
-`AICC_NIGHTLY_DIR` is optional and only installs a newer AICC package when
-configured. Set `DTK_PKG` only when running the environment script
-outside that image and a replacement DTK archive is required.
-While `Moe` and `composable_kernel-das` are private, configure the read-only
-`AITER_SUBMODULE_TOKEN` Repository secret so CI can fetch their submodules.
-After both repositories are public, delete that secret; the workflow falls
-back to `github.token` for public submodules.
+Workflow definitions live in `.github/workflows/`; the operator test sources
+stay in `op_tests/ci_tests/`. The pipeline mirrors the previous GitLab stages:
 
-For an interactive local reproduction on a BW1100 host, run
-`bash ci_script/run_sglang_ci_container.sh`. Override `AITER_CI_IMAGE` or
-`AITER_CI_CONTAINER_NAME` when necessary; attach with
-`docker exec -it <container-name> /bin/bash`.
+| GitLab stage | GitHub workflow | Runner |
+|---|---|---|
+| `quality-gate` | `quality-gate.yml` (organization `HYGON-AI/quality-gate`) | its own pool |
+| `build` | `ci.yml` → `build`, torch 2.11.0 / 2.13.0 | `hygon-build` |
+| `test` | `ci.yml` → `test`, BW1100 / BW1000 × torch 2.11.0 / 2.13.0 | `hygon-bw1100-4card`, `hygon-bw1000-4card` |
+| `publish` | `publish.yml`, on push to `main` | `hygon-build` |
 
-Contributions from forks are verified through pull requests to `main`. The
-self-hosted CI Runner pool is network-isolated for this purpose.
-The workflow checks out GitHub's immutable pull-request merge ref.
-Test reports are published as GitHub Actions artifacts for each CI run.
-CI therefore validates the result proposed for merge into `main`.
-Each pull request run is associated with its GitHub Actions run identifier.
+Build and test jobs run inside
+`${HARBOR_SITE}/hcu/base/dtk:${DTK_VERSION}-rockylinux8.6-py${PY_VERSION}`; the
+Runner passes through the HCU device nodes and the read-only Hygon runtime
+mount. Each job installs torch/triton/boltops, amdsmi, the AICC LLVM toolchain
+and (for tests) `optest` from the DTK pip index, then
+`ci_script/build_wheel_and_manylinux.sh` builds and repairs the manylinux wheel.
+The test jobs install that exact wheel, so every result is tied to one build.
+
+### Pull requests
+
+There are two entry points, because the two kinds of pull request need a
+different pipeline source:
+
+* **Pull requests from branches of this repository** run `ci.yml` on
+  `pull_request`. The pipeline carried by the pull request itself runs, so a CI
+  change is validated by the pull request that makes it - the same semantics as
+  a GitLab merge-request pipeline.
+* **Pull requests from forks** run the pipeline on `main`: a maintainer applies
+  the `run-hygon-ci` label, which triggers `ci.yml` through
+  `pull_request_target`. The label is removed again once the run finishes, so
+  every approval is an explicit action. A fork cannot alter the pipeline it is
+  tested with, because the workflow file is always resolved from `main`.
+
+Both paths build GitHub's pull-request merge ref, i.e. the code the pull request
+would produce once merged into `main`. Test results are uploaded as GitHub
+Actions artifacts, and a summary is written to the job summary of each run.
+
+### Required configuration
+
+Actions **Variables** (repository or organization level):
+
+| Name | Purpose |
+|---|---|
+| `HARBOR_SITE` | container registry prefix, e.g. `10.16.1.152:5000` |
+| `DTK_VERSION` | DTK release, e.g. `26.10` |
+| `PY_VERSION` | Python version of the DTK image, e.g. `3.12` |
+| `PYPI_URL` | devpi root; the DTK index is `${PYPI_URL}/nightly/dtk<ver>/+simple/` and is also passed to `CIUpload NIGHTLY` |
+| `AICC_BASE_URL` | base URL of the AICC nightly that ships `hcu_llvm_installer.sh` |
+
+Actions **Secrets** (repository level):
+
+| Name | Purpose |
+|---|---|
+| `PYPI_NIGHTLY_PASSWORD` | devpi password used by `publish.yml` |
+
+The submodules `3rdparty/composable_kernel` and `3rdparty/moe_c` are public, so
+no token is needed to fetch them.
+
+### Local reproduction
+
+On a BW1100/BW1000 host, inside the same DTK container, the CI steps run by
+hand:
+
+```bash
+export PIP_TRUSTED_HOST=<devpi host>
+export DTK_PIP_INDEX_URL="${PYPI_URL%/}/nightly/dtk2610/+simple/"   # DTK 26.10
+python -m pip install --no-cache-dir -i "$DTK_PIP_INDEX_URL" --trusted-host "$PIP_TRUSTED_HOST" \
+  "torch==2.11.0" triton boltops "amdsmi==1.0.0+630c16a6.dirty" optest
+curl -fsSL "$AICC_BASE_URL/hcu_llvm_installer.sh" -o /tmp/hcu_llvm_installer.sh
+bash /tmp/hcu_llvm_installer.sh
+source /opt/dtk/env.sh
+
+bash ci_script/build_wheel_and_manylinux.sh
+optest --op_name aiter --test_mode all --test_dir "$PWD"
+```
 
 ## Aoubt the environment variable
 1. 'AITER_LOG_MORE': log more info about aiter internal process,params, etc.

@@ -10,6 +10,10 @@
 /op_tests/cpp/mha/smoke_test_bwd_v3.sh text eol=lf
 /op_tests/cpp/mha/smoke_test_fwd.sh text eol=lf
 
+# CI entry points run inside Linux containers and require LF line endings.
+/ci_script/*.sh text eol=lf
+/.github/workflows/*.yml text eol=lf
+
 # Files normalized by the 2026-09-11 quality review.
 /aiter/configs/asm_tune/untuned_awqgemm_NN.csv text eol=lf
 /aiter/configs/tuned_fmoe_asm_w8a8_group.csv text eol=lf
