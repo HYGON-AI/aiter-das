@@ -876,6 +876,7 @@ def build_module(
                 "module_cache",
                 "module_fused_qk_norm_rope_cache_quant_shuffle",
                 "module_fused_qk_norm_mrope_cache_quant_shuffle",
+                "module_mhc",
             }:
                 flags_hip.append("-DAITER_ENABLE_MULTIDIE=1")
         parallel_jobs = os.getenv("AITER_HIP_PARALLEL_JOBS")
@@ -1268,6 +1269,7 @@ def compile_ops(
                     namespace = {
                         "List": List,
                         "Optional": Optional,
+                        "Tuple": typing.Tuple,
                         "torch": torch,
                         "typing": typing,
                     }

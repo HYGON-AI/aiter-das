@@ -45,6 +45,7 @@
 
 
 #include "aiter_hip_common.h"
+#include "hip_kernel_launch.h"
 #include "py_itfs_common.h"
 #include "opus/opus.hpp"
 // #include "hip_reduce.h"
@@ -55,6 +56,7 @@
 #include <hipcub/hipcub.hpp>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 
 
 static_assert(opus::get_warp_size() == 64, "HCU expects wave64");
@@ -146,7 +148,47 @@ static_assert(opus::get_warp_size() == 64, "HCU expects wave64");
     #define AITER_HCU_HAS_MMAC_TF32_LIT_LTS 0
 #endif
 
+//! ====================================================================
+//! AITER_MHC_PMD_RECIP_GUARD —— PMD 仿真器的 fp32 倒数／除法 workaround
+//! --------------------------------------------------------------------
+//! 现象: 在 PMD 仿真器上, fp32 除法序列
+//!   v_div_scale_f32 / v_rcp_f32 / v_div_fmas_f32 / v_div_fixup_f32
+//! 在结果的二进制指数绝对值约 >= 96 时, 把指数偏移 96:
+//!   1/(1+2.075e29) -> 0.38179708 (正确 4.8e-30)
+//!   1/1e29         -> 0.792282   (正确 1e-29)
+//! PMD 的 gfx946 与 gfx938 两个模型错得逐位相同。
+//! 对照实验: 同一探针在 gfx938(BW1101) 真机上全部正确, 相对差 < 1e-6
+//!   ⇒ 触发源是仿真器的 defect, 不是硬件行为。
+//! 处理: 本文件两处「极端比值」除法只在 __gfx946__ 编译目标下加保护, 其余架构走
+//!   原始表达式、与改动前逐位一致。真机上这两处保护与原始表达式的差异 <= 1e-20。
+//! 待办: gfx946 真机实测确认没有该现象后, 把本宏置 0 并删除两处保护分支, 统一改回
+//!   原始除法; 在此之前不要把该 workaround 当作 kernel 缺陷的修复。
+//! ====================================================================
+#if defined(__gfx946__)
+    #define AITER_MHC_PMD_RECIP_GUARD 1
+#else
+    #define AITER_MHC_PMD_RECIP_GUARD 0
+#endif
+
 namespace aiter {
+    //! ====================================================================
+    //! hcu_mmac_k8_available —— K=8 MMAC 的运行时能力判定（主机侧）
+    //! --------------------------------------------------------------------
+    //! 架构名单与编译期门控 AITER_HCU_HAS_MMAC_K8 保持一致：只有 gfx928 /
+    //! gfx936 / gfx938 上 K=8 builtin 真实存在。其余目标（含 gfx946）即便
+    //! 申请 K=8 实例，编译期也只会展开成两条 K=4，宿主侧却多付一次判据与
+    //! 打包，且指令结构与直接申请 K=4 并不相同（gfx946 legacy tile_k=128
+    //! 实测：K=8 实例 80 条 v_mmac_16x16x4_f32，K=4 实例 128 条）。
+    //!
+    //! 第一阶段两个主机入口的 K=8 自动选择统一走这里，取代原先两处各写一套
+    //! 的判据（m128 用 "不等于 gfx936"、legacy 只看 m_blocks 与 hc_hidden_size）。
+    //! 环境变量 AITER_MHC_PRE_GEMM_MMAC_K 的显式覆盖优先级仍高于本函数。
+    //! ====================================================================
+    static inline bool hcu_mmac_k8_available(const std::string& arch)
+    {
+        return arch == "gfx928" || arch == "gfx936" || arch == "gfx938";
+    }
+
     void mhc_pre_gemm_sqrsum_stage1_m128(
         torch::Tensor& out,
         torch::Tensor& sqrsum,
@@ -842,6 +884,8 @@ namespace aiter {
         __syncthreads();
 
         //! Generated code stages C through shared memory to convert MMAC layout to row-major.
+#if defined(__gfx938__) || AITER_HCU_HAS_MMAC_K8
+        //! lit_lts / K=8 path keeps the 4 slots consecutive per lane (n = l/16*4 + s).
         #pragma unroll
         for (int i = 0; i < 4; i++) {
             int base = ((tid >> 6) * 1024)
@@ -851,6 +895,22 @@ namespace aiter {
             *reinterpret_cast<float4*>(s.f + base) =
                 *reinterpret_cast<float4*>(out_frag + i);
         }
+#else
+        //! HCU K=4 fallback (gfx946/gfx92a): lane quarter a holds n = s*4 + a, so the four slots
+        //! sit at stride 4, not consecutive. Stage every slot at its true column; the read-back
+        //! below then sees the same layout the lit_lts path produces.
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int row = (tid >> 6) * 32 + (i >> 1) * 16 + (tid & 15);
+            int a = (tid & 63) >> 4;
+            #pragma unroll
+            for (int slot = 0; slot < 4; slot++) {
+                int col = (i & 1) * 16 + slot * 4 + a;
+                int swz = (col >> 2) ^ (tid & 7);
+                s.f[row * 32 + swz * 4 + (col & 3)] = out_frag[i][slot];
+            }
+        }
+#endif
 
         __syncthreads();
 
@@ -879,7 +939,10 @@ namespace aiter {
         dim3 grid(m_blocks, n_blocks, split_k); \
         TORCH_CHECK(hc_hidden_size % (tile_k * split_k) == 0, "hc_hidden_size must be divisible by tile_k * split_k"); \
         TORCH_CHECK(hc_hidden_size >= (tile_k * split_k) * 2, "hc_hidden_size must >= tile_k * split_k * 2 stages prefetch"); \
-        mhc_pre_gemm_sqrsum_kernel<DTYPE_I, block_size, tile_m, tile_n, tile_k, (use_k8), (use_tf32_kernel)><<<grid, block, 0, stream>>>( \
+        aiter::launch_kernel( \
+            aiter::launch_policy::mhc_pre, \
+            mhc_pre_gemm_sqrsum_kernel<DTYPE_I, block_size, tile_m, tile_n, tile_k, (use_k8), (use_tf32_kernel)>, \
+            grid, block, stream, \
             reinterpret_cast<float*>(out.data_ptr()), \
             reinterpret_cast<float*>(sqrsum.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
@@ -993,10 +1056,23 @@ namespace aiter {
         //
         // 启发式: m_blocks >= 4 OR (m_blocks >= 2 且 hc_hidden_size >= 16384) → K=8;
         //         否则 → K=4。
-        // 优先级: env var > 启发式 (用户可显式覆盖)。
+        // 架构门控 + m 分档（2026-11-12 实测裁定）:
+        //   - K=8 builtin 真实存在的目标（gfx928/936/938）：原启发式原样生效，逐位不变。
+        //   - 其余目标（gfx946 等，K=8 在编译期被展开成另一套 K=4 结构）：
+        //     实测 m <= 1024 时直接申请 K=4 实例更快（128x1280 -22.5%、128x7168 -5.1%、
+        //     1024x1280 -21.9%、1024x7168 -4.3%）；m=8192x1280 反转 +0.64%，
+        //     即大 m 下 K=8 实例反而略快。故以 m=1024 为分界：不超过则 K=4，
+        //     超过则沿用原形状启发式（该区间 m_blocks >= 17，实际总取 K=8）。
+        //     大 shape 的进一步调优不在本轮范围。
+        // 优先级: env var > 架构门控与 m 分档 > 形状启发式 (用户可显式覆盖)。
         // ============================================================
-        bool use_k8_auto = (m_blocks >= 4) ||
-                           (m_blocks >= 2 && hc_hidden_size >= 16384);
+        constexpr int kMmacK8CrossoverM = 1024;
+        const std::string gfx_arch = get_gpu_arch();
+        const bool k8_capable = hcu_mmac_k8_available(gfx_arch);
+        const bool shape_prefers_k8 = (m_blocks >= 4) ||
+                                      (m_blocks >= 2 && hc_hidden_size >= 16384);
+        bool use_k8_auto = k8_capable ? shape_prefers_k8
+                                      : (m > kMmacK8CrossoverM && shape_prefers_k8);
         bool use_k8_runtime = use_k8_auto;
         if (const char* env_k = std::getenv("AITER_MHC_PRE_GEMM_MMAC_K")) {
             if (std::strcmp(env_k, "4") == 0) {
@@ -1006,6 +1082,11 @@ namespace aiter {
             } else if (std::strcmp(env_k, "auto") == 0 || std::strcmp(env_k, "AUTO") == 0) {
                 use_k8_runtime = use_k8_auto;
             }
+        }
+        if (std::getenv("AITER_MHC_PRE_TRACE")) {
+            fprintf(stderr, "[mhc_pre_stage1_trace] entry=legacy arch=%s m=%d hc_hidden=%d tile_k=%d split_k=%d auto=%d mmac_k=%d\n",
+                    gfx_arch.c_str(), m, hc_hidden_size, tile_k, split_k,
+                    use_k8_auto ? 1 : 0, use_k8_runtime ? 8 : 4);
         }
 
         if (forced_tile_n == 16) {
@@ -1032,7 +1113,10 @@ namespace aiter {
 #define MHC_PRE_GEMM_SQRSUM_STAGE1_M128_IMPL(use_k8, use_tf32_kernel) \
     AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_pre_gemm_sqrsum_stage1_m128", [&] { \
         using DTYPE_I = typename t2opus<scalar_t>::type; \
-        mhc_pre_gemm_sqrsum_stage1_m128_kernel<DTYPE_I, (use_k8), (use_tf32_kernel)><<<grid, block, 0, stream>>>( \
+        aiter::launch_kernel( \
+            aiter::launch_policy::mhc_pre, \
+            mhc_pre_gemm_sqrsum_stage1_m128_kernel<DTYPE_I, (use_k8), (use_tf32_kernel)>, \
+            grid, block, stream, \
             reinterpret_cast<float*>(out.data_ptr()), \
             reinterpret_cast<float*>(sqrsum.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
@@ -1079,7 +1163,19 @@ namespace aiter {
         dim3 block(block_size);
         dim3 grid(m_blocks, n_blocks, split_k);
 
-        bool use_k8_auto = get_gpu_arch() != "gfx936";
+        //! K=8 自动选择（2026-11-12 实测裁定，与 legacy 入口同一套规则）：
+        //!   - K=8 builtin 真实存在且本 kernel 上收益为正的目标（gfx928/938）→ K=8。
+        //!     gfx936 虽然 builtin 存在，但本 kernel 上收益为负，保持排除。
+        //!   - 其余目标（gfx946 / gfx92a / gfx942）：m <= 1024 直接申请 K=4 实例；
+        //!     m > 1024 沿用原行为（申请 K=8，编译期降级）。分界线依据为 legacy
+        //!     入口的实测（本入口两个模板实例指令条数相等，见 step3 记录）。
+        //!     原判据 "get_gpu_arch() != gfx936" 把「未知架构」当成「K=8 可用」，
+        //!     这是本轮修正的起点。
+        constexpr int kMmacK8CrossoverM = 1024;
+        const std::string gfx_arch = get_gpu_arch();
+        const bool k8_capable = hcu_mmac_k8_available(gfx_arch);
+        bool use_k8_auto = k8_capable ? (gfx_arch != "gfx936")
+                                      : (m > kMmacK8CrossoverM);
         bool use_k8_runtime = use_k8_auto;
         if (const char* env_k = std::getenv("AITER_MHC_PRE_GEMM_MMAC_K")) {
             if (std::strcmp(env_k, "4") == 0) {
@@ -1089,6 +1185,11 @@ namespace aiter {
             } else if (std::strcmp(env_k, "auto") == 0 || std::strcmp(env_k, "AUTO") == 0) {
                 use_k8_runtime = use_k8_auto;
             }
+        }
+        if (std::getenv("AITER_MHC_PRE_TRACE")) {
+            fprintf(stderr, "[mhc_pre_stage1_trace] entry=m128 arch=%s m=%d hc_hidden=%d split_k=%d auto=%d mmac_k=%d\n",
+                    gfx_arch.c_str(), m, hc_hidden_size, split_k,
+                    use_k8_auto ? 1 : 0, use_k8_runtime ? 8 : 4);
         }
 
         if (use_tf32) {
@@ -1166,7 +1267,8 @@ namespace aiter {
         constexpr int warps_per_block = block_size / 64;
         dim3 grid((m + warps_per_block - 1) / warps_per_block);
         dim3 block(block_size);
-        mhc_pre_reduce_splitk_kernel<<<grid, block, 0, stream>>>(
+        aiter::launch_kernel(aiter::launch_policy::mhc_pre, mhc_pre_reduce_splitk_kernel,
+                             grid, block, stream,
             reinterpret_cast<float*>(out_red.data_ptr()),
             reinterpret_cast<float*>(sqrsum_red.data_ptr()),
             reinterpret_cast<float*>(out.data_ptr()),
@@ -1291,7 +1393,19 @@ namespace aiter {
         const int k_offset = sub_hidden_size * blockIdx.y;   //! 本 block 起始 hidden 列
         const int land_id = threadIdx.x % warp_size;
         const int m_oob = m < m_idx + num_rows ? (m - m_idx) : num_rows;
-        auto sigmoid = [](float x) { return 1.0f / (1.0f + __expf(-x)); };
+        //! 1/(1+exp(-x)). On __gfx946__ only, add the PMD workaround described at
+        //! AITER_MHC_PMD_RECIP_GUARD: exp(-x) > 1e20 means the true sigmoid is below 1e-20,
+        //! which is irrelevant next to hc_pre_eps = 1e-6, so short-circuit instead of
+        //! dividing (the simulator would return ~0.38 there). Other architectures keep the
+        //! plain expression, bit-identical to before the workaround existed.
+        auto sigmoid = [](float x) {
+            float t = __expf(-x);
+#if AITER_MHC_PMD_RECIP_GUARD
+            return t > 1e20f ? 0.0f : 1.0f / (1.0f + t);
+#else
+            return 1.0f / (1.0f + t);
+#endif
+        };
         static_assert(block_size >= num_rows * hc_mult3, "block_size must be >= num_rows * hc_mult3");
         //! ---- STEP 0: 已合并到 STEP 2 ----
         //! 新版 STEP 2 中每个 s_hc_mult3 slot 只被一个线程写入一次（无 atomic），
@@ -1541,6 +1655,12 @@ namespace aiter {
             // comb = comb.softmax(-1) + eps
             float row_max = reduce_in_4threads(comb_mix_v, fmaxf);
             comb_mix_v = expf(comb_mix_v - row_max);
+#if AITER_MHC_PMD_RECIP_GUARD
+            //! PMD workaround (see AITER_MHC_PMD_RECIP_GUARD): keep the divisions below
+            //! out of the extreme-ratio range the simulator mis-handles. Anything below 1e-20
+            //! is negligible once hc_sinkhorn_eps (default 1e-6) is added.
+            comb_mix_v = comb_mix_v < 1e-20f ? 0.0f : comb_mix_v;
+#endif
             float row_sum = reduce_in_4threads(comb_mix_v, sum_f);
             comb_mix_v = comb_mix_v / row_sum + hc_sinkhorn_eps;
             // comb = comb / (comb.sum(-2) + eps)
@@ -1655,7 +1775,19 @@ namespace aiter {
         const int lane_id = tid & (warp_size - 1);
         const int warp_id = tid / warp_size;
 
-        auto sigmoid = [](float x) { return 1.0f / (1.0f + __expf(-x)); };
+        //! 1/(1+exp(-x)). On __gfx946__ only, add the PMD workaround described at
+        //! AITER_MHC_PMD_RECIP_GUARD: exp(-x) > 1e20 means the true sigmoid is below 1e-20,
+        //! which is irrelevant next to hc_pre_eps = 1e-6, so short-circuit instead of
+        //! dividing (the simulator would return ~0.38 there). Other architectures keep the
+        //! plain expression, bit-identical to before the workaround existed.
+        auto sigmoid = [](float x) {
+            float t = __expf(-x);
+#if AITER_MHC_PMD_RECIP_GUARD
+            return t > 1e20f ? 0.0f : 1.0f / (1.0f + t);
+#else
+            return 1.0f / (1.0f + t);
+#endif
+        };
         auto sum_f = [](float a, float b) { return a + b; };
 
         //! ============================================================
@@ -1737,6 +1869,10 @@ namespace aiter {
 
                 float row_max = reduce_in_4threads(comb_mix_v, fmaxf);
                 comb_mix_v = expf(comb_mix_v - row_max);
+#if AITER_MHC_PMD_RECIP_GUARD
+                //! Same PMD workaround as the legacy stage-2 kernel.
+                comb_mix_v = comb_mix_v < 1e-20f ? 0.0f : comb_mix_v;
+#endif
                 float row_sum = reduce_in_4threads(comb_mix_v, sum_f);
                 comb_mix_v = comb_mix_v / row_sum + hc_sinkhorn_eps;
                 float col_sum = reduce_cross_4threads(comb_mix_v, sum_f);
@@ -1847,7 +1983,10 @@ namespace aiter {
     dim3 block(block_size); \
     AITER_DISPATCH_FLOATING16_TYPES(layer_input.scalar_type(), "mhc_pre_big_fuse", [&] { \
         using DTYPE_I = typename t2opus<scalar_t>::type; \
-        mhc_pre_big_fuse_kernel<DTYPE_I, block_size, hc_mult, num_rows, residual_block, use_parallel_splitk_reduce><<<grid, block, 0, stream>>>( \
+        aiter::launch_kernel( \
+            aiter::launch_policy::mhc_pre, \
+            mhc_pre_big_fuse_kernel<DTYPE_I, block_size, hc_mult, num_rows, residual_block, use_parallel_splitk_reduce>, \
+            grid, block, stream, \
             reinterpret_cast<float*>(post_mix.data_ptr()), \
             reinterpret_cast<float*>(comb_mix.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(layer_input.data_ptr()), \
@@ -1884,7 +2023,10 @@ namespace aiter {
         dim3 block(128); \
         AITER_DISPATCH_FLOATING16_TYPES(layer_input.scalar_type(), "mhc_pre_big_fuse_v3", [&] { \
             using DTYPE_I = typename t2opus<scalar_t>::type; \
-            mhc_pre_big_fuse_kernel_v3<DTYPE_I, 4, elems_per_thread><<<grid, block, 0, stream>>>( \
+            aiter::launch_kernel( \
+                aiter::launch_policy::mhc_pre, \
+                mhc_pre_big_fuse_kernel_v3<DTYPE_I, 4, elems_per_thread>, \
+                grid, block, stream, \
                 reinterpret_cast<float*>(post_mix.data_ptr()), \
                 reinterpret_cast<float*>(comb_mix.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(layer_input.data_ptr()), \
@@ -1934,6 +2076,36 @@ namespace aiter {
         if (removed_v2_v4) { \
             TORCH_WARN("AITER_MHC_PRE_BIG_FUSE_KERNEL=", env_pre, " was removed after negative benchmarks; fallback to legacy dispatch."); \
         } \
+        int f_block = 0, f_rows = 0, f_cols = 0; \
+        const bool use_forced = \
+            !use_v3 && env_pre && \
+            std::sscanf(env_pre, "b%d,n%d,k%d", &f_block, &f_rows, &f_cols) == 3; \
+        const bool par = (n_splits >= 4 && (m) <= 2048); \
+        int sel_block, sel_rows, sel_cols; \
+        bool sel_par; \
+        const char* sel_src; \
+        if (use_forced) { \
+            sel_block = f_block; sel_rows = f_rows; sel_cols = f_cols; \
+            sel_par = par && f_block >= f_rows * 128; sel_src = "forced"; \
+        } else if ((m & 1) != 0) { \
+            /*! Odd token counts use 1 row/block to keep the main num_rows=2 path branch-free. */ \
+            sel_block = (64 + 64 * 2); sel_rows = 1; sel_cols = 256; \
+            sel_par = par; sel_src = "odd_m"; \
+        } else if ((m) <= cu_num * 12 || get_gpu_arch() != "gfx942") { \
+            sel_block = (64 + 64 * 4); sel_rows = 2; sel_cols = 256; \
+            sel_par = par; sel_src = "default"; \
+        } else { \
+            sel_block = (64 + 64 * 2); sel_rows = 2; sel_cols = 128; \
+            sel_par = false; sel_src = "gfx942_large_m"; \
+        } \
+        if (std::getenv("AITER_MHC_PRE_TRACE")) { \
+            std::fprintf(stderr, \
+                "[mhc_stage2_dispatch] arch=%s cu=%d m=%d n_splits=%d hidden=%d env=%s src=%s " \
+                "block_size=%d num_rows=%d residual_block=%d parallel_splitk_reduce=%d\n", \
+                get_gpu_arch().c_str(), cu_num, (m), n_splits, hidden_size, \
+                env_pre ? env_pre : "<unset>", sel_src, sel_block, sel_rows, sel_cols, \
+                sel_par ? 1 : 0); \
+        } \
         if (use_v3) { \
             /*! v3: hidden_block_v3 = elems × 64 = 512/256/128, 选最大可用 b 粒度 */ \
             if (hidden_size % 512 == 0) { \
@@ -1945,21 +2117,34 @@ namespace aiter {
             } else { \
                 TORCH_CHECK(false, "hidden_size must be divisible by 128 for v3"); \
             } \
-        } else if ((m & 1) != 0) { \
-            /*! Odd token counts use 1 row/block to keep the main num_rows=2 path branch-free. */ \
-            if (n_splits >= 4 && m <= 2048) { \
-                MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 2), 4, 1, 256, true); \
-            } else { \
-                MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 2), 4, 1, 256, false); \
-            } \
-        } else if (m <= cu_num * 12 || get_gpu_arch() != "gfx942") { \
-            if (n_splits >= 4 && m <= 2048) { \
-                MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 4), 4, 2, 256, true); \
-            } else { \
-                MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 4), 4, 2, 256, false); \
-            } \
-        } else { \
+        } else if (sel_block == 320 && sel_rows == 2 && sel_cols == 256 && sel_par) { \
+            /*! 候选与强制组合共用这一条按编译期常量分派的结构。 */ \
+            /*! 强制取值只接受「block shape 候选范围」表里编译得过且整除成立的组合。 */ \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 4), 4, 2, 256, true); \
+        } else if (sel_block == 320 && sel_rows == 2 && sel_cols == 256 && !sel_par) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 4), 4, 2, 256, false); \
+        } else if (sel_block == 192 && sel_rows == 1 && sel_cols == 256 && sel_par) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 2), 4, 1, 256, true); \
+        } else if (sel_block == 192 && sel_rows == 1 && sel_cols == 256 && !sel_par) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 2), 4, 1, 256, false); \
+        } else if (sel_block == 192 && sel_rows == 2 && sel_cols == 256) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 2), 4, 2, 256, false); \
+        } else if (sel_block == 128 && sel_rows == 1 && sel_cols == 256 && sel_par) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64), 4, 1, 256, true); \
+        } else if (sel_block == 128 && sel_rows == 1 && sel_cols == 256 && !sel_par) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64), 4, 1, 256, false); \
+        } else if (sel_block == 128 && sel_rows == 2 && sel_cols == 128) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64), 4, 2, 128, false); \
+        } else if (sel_block == 320 && sel_rows == 4 && sel_cols == 256) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 4), 4, 4, 256, false); \
+        } else if (sel_block == 192 && sel_rows == 4 && sel_cols == 256) { \
+            MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 2), 4, 4, 256, false); \
+        } else if (sel_block == 192 && sel_rows == 2 && sel_cols == 128) { \
             MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 2), 4, 2, 128, false); \
+        } else { \
+            TORCH_CHECK(false, "unsupported stage-2 block shape: src=", sel_src, \
+                        " block_size=", sel_block, " num_rows=", sel_rows, \
+                        " residual_block=", sel_cols); \
         } \
     } while (0)
 
@@ -3287,6 +3472,37 @@ namespace aiter {
     }
 
 
+//! ---- 路径追踪: AITER_MHC_POST_TRACE=1 时每次调用向 stderr 打印实际选中的内核 ----
+//! 环境变量由主机函数读取一次（函数内静态变量），未设置、空串或 "0" 时不输出。
+//! 调用点固定在各实现宏算出 k_blocks 之后，使 auto 选中的版本与关键参数可追溯。
+#define MHC_POST_TRACE_EMIT(ver_name, elems, chunk_bytes, kblocks_value) \
+    do { \
+        if (mhc_post_trace_on) { \
+            std::fprintf(stderr, \
+                "[mhc_post_trace] arch=%s cu=%d m=%d hidden=%d env=%s selected=%s " \
+                "elems_per_thread=%d chunk_bytes=%d k_blocks=%d\n", \
+                arch_id.c_str(), cu_num, m, hidden_size, \
+                (env_post != nullptr ? env_post : "<unset>"), (ver_name), \
+                static_cast<int>(elems), static_cast<int>(chunk_bytes), \
+                static_cast<int>(kblocks_value)); \
+            std::fflush(stderr); \
+        } \
+    } while (0)
+
+//! legacy 没有 chunk_bytes 概念：三项粒度字段填 "-"，追加 residual_block。
+#define MHC_POST_TRACE_EMIT_LEGACY(resblock) \
+    do { \
+        if (mhc_post_trace_on) { \
+            std::fprintf(stderr, \
+                "[mhc_post_trace] arch=%s cu=%d m=%d hidden=%d env=%s selected=legacy " \
+                "elems_per_thread=- chunk_bytes=- k_blocks=- residual_block=%d\n", \
+                arch_id.c_str(), cu_num, m, hidden_size, \
+                (env_post != nullptr ? env_post : "<unset>"), \
+                static_cast<int>(resblock)); \
+            std::fflush(stderr); \
+        } \
+    } while (0)
+
 //! ---- IMPL 宏: 实例化并 launch 指定 mhc_post kernel (老版本，warp-specialized 4 输出路径) ----
 #define MHC_POST_KERNEL_IMPL(kernel_name, hidden_size, residual_block) \
     AITER_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
@@ -3300,11 +3516,15 @@ namespace aiter {
         if (hidden_size % (k_blocks * residual_block) == 0 && hidden_size / k_blocks >= residual_block) break; \
     } \
     int sub_hidden_size = hidden_size / k_blocks; \
+    MHC_POST_TRACE_EMIT_LEGACY(residual_block); \
     dim3 grid(m, k_blocks); \
     dim3 block(block_size); \
     AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post", [&] { \
         using DTYPE_I = typename t2opus<scalar_t>::type; \
-        kernel_name<DTYPE_I, block_size, 4, residual_block><<<grid, block, 0, stream>>>( \
+        aiter::launch_kernel( \
+            aiter::launch_policy::mhc_post, \
+            kernel_name<DTYPE_I, block_size, 4, residual_block>, \
+            grid, block, stream, \
             reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
@@ -3338,11 +3558,15 @@ namespace aiter {
             if (hidden_size % (k_blocks * round_elems_v2) == 0 && hidden_size / k_blocks >= round_elems_v2) break; \
         } \
         int sub_hidden_size = hidden_size / k_blocks; \
+        MHC_POST_TRACE_EMIT("v2", elems_per_thread, (elems_per_thread) * 2, k_blocks); \
         dim3 grid(m, k_blocks); \
         dim3 block(block_size_v2); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v2", [&] { \
             using DTYPE_I = typename t2opus<scalar_t>::type; \
-            mhc_post_kernel_v2<DTYPE_I, block_size_v2, 4, elems_per_thread><<<grid, block, 0, stream>>>( \
+            aiter::launch_kernel( \
+                aiter::launch_policy::mhc_post, \
+                mhc_post_kernel_v2<DTYPE_I, block_size_v2, 4, elems_per_thread>, \
+                grid, block, stream, \
                 reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
@@ -3374,11 +3598,15 @@ namespace aiter {
             if (hidden_size % (k_blocks * round_elems_v3) == 0 && hidden_size / k_blocks >= round_elems_v3) break; \
         } \
         int sub_hidden_size = hidden_size / k_blocks; \
+        MHC_POST_TRACE_EMIT("v3", elems_per_thread, (elems_per_thread) * 2, k_blocks); \
         dim3 grid(m, k_blocks); \
         dim3 block(block_size_v3); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v3", [&] { \
             using DTYPE_I = typename t2opus<scalar_t>::type; \
-            mhc_post_kernel_v3<DTYPE_I, block_size_v3, 4, elems_per_thread><<<grid, block, 0, stream>>>( \
+            aiter::launch_kernel( \
+                aiter::launch_policy::mhc_post, \
+                mhc_post_kernel_v3<DTYPE_I, block_size_v3, 4, elems_per_thread>, \
+                grid, block, stream, \
                 reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
@@ -3411,11 +3639,15 @@ namespace aiter {
             if (hidden_size % (k_blocks * round_elems_v4) == 0 && hidden_size / k_blocks >= round_elems_v4) break; \
         } \
         int sub_hidden_size = hidden_size / k_blocks; \
+        MHC_POST_TRACE_EMIT("v4", elems_per_thread, (elems_per_thread) * 2, k_blocks); \
         dim3 grid(m, k_blocks); \
         dim3 block(block_size_v4); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v4", [&] { \
             using DTYPE_I = typename t2opus<scalar_t>::type; \
-            mhc_post_kernel_v4<DTYPE_I, block_size_v4, 4, elems_per_thread><<<grid, block, 0, stream>>>( \
+            aiter::launch_kernel( \
+                aiter::launch_policy::mhc_post, \
+                mhc_post_kernel_v4<DTYPE_I, block_size_v4, 4, elems_per_thread>, \
+                grid, block, stream, \
                 reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
@@ -3448,11 +3680,15 @@ namespace aiter {
             if (hidden_size % (k_blocks * round_elems_v6) == 0 && hidden_size / k_blocks >= round_elems_v6) break; \
         } \
         int sub_hidden_size = hidden_size / k_blocks; \
+        MHC_POST_TRACE_EMIT("v6", elems_per_thread, (elems_per_thread) * 2, k_blocks); \
         dim3 grid(m, k_blocks); \
         dim3 block(block_size_v6); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v6", [&] { \
             using DTYPE_I = typename t2opus<scalar_t>::type; \
-            mhc_post_kernel_v6<DTYPE_I, block_size_v6, 4, elems_per_thread><<<grid, block, 0, stream>>>( \
+            aiter::launch_kernel( \
+                aiter::launch_policy::mhc_post, \
+                mhc_post_kernel_v6<DTYPE_I, block_size_v6, 4, elems_per_thread>, \
+                grid, block, stream, \
                 reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
@@ -3484,11 +3720,15 @@ namespace aiter {
             if (hidden_size % (k_blocks * round_elems_v7) == 0 && hidden_size / k_blocks >= round_elems_v7) break; \
         } \
         int sub_hidden_size = hidden_size / k_blocks; \
+        MHC_POST_TRACE_EMIT("v7", elems_per_thread, (elems_per_thread) * 2, k_blocks); \
         dim3 grid(m, k_blocks); \
         dim3 block(block_size_v7); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v7", [&] { \
             using DTYPE_I = typename t2opus<scalar_t>::type; \
-            mhc_post_kernel_v7<DTYPE_I, block_size_v7, 4, elems_per_thread><<<grid, block, 0, stream>>>( \
+            aiter::launch_kernel( \
+                aiter::launch_policy::mhc_post, \
+                mhc_post_kernel_v7<DTYPE_I, block_size_v7, 4, elems_per_thread>, \
+                grid, block, stream, \
                 reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
@@ -3526,11 +3766,15 @@ namespace aiter {
             if (hidden_size % (k_blocks * warp_chunk_v5) == 0 && hidden_size / k_blocks >= warp_chunk_v5) break; \
         } \
         int sub_hidden_size = hidden_size / k_blocks; \
+        MHC_POST_TRACE_EMIT("v5", elems_per_lane, (elems_per_lane) * 2, k_blocks); \
         dim3 grid(m, k_blocks); \
         dim3 block(block_size_v5); \
         AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_v5", [&] { \
             using DTYPE_I = typename t2opus<scalar_t>::type; \
-            mhc_post_kernel_v5<DTYPE_I, block_size_v5, hc_mult_v5, elems_per_lane><<<grid, block, 0, stream>>>( \
+            aiter::launch_kernel( \
+                aiter::launch_policy::mhc_post, \
+                mhc_post_kernel_v5<DTYPE_I, block_size_v5, hc_mult_v5, elems_per_lane>, \
+                grid, block, stream, \
                 reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
                 reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
@@ -3737,7 +3981,14 @@ namespace aiter {
         const hipStream_t stream = at::hip::getCurrentHIPStream();
         const int cu_num = get_num_cu_func();
         const std::string arch_id = get_gpu_arch();
-        
+
+        //! AITER_MHC_POST_TRACE: 每次调用在 stderr 打印实际选中的内核与参数（只读取一次）
+        static const bool mhc_post_trace_on = []() {
+            const char* trace_env = std::getenv("AITER_MHC_POST_TRACE");
+            return trace_env != nullptr && trace_env[0] != '\0'
+                && std::strcmp(trace_env, "0") != 0;
+        }();
+
         MHC_POST_KERNEL_DISPATCH(hidden_size);
     }
 

@@ -23,6 +23,10 @@ def _truthy_env(name: str) -> bool:
     return v in ("1", "true", "yes", "on")
 
 
+def _trace_env() -> bool:
+    return _truthy_env("AITER_MHC_PRE_TRACE")
+
+
 def _round_to_tf32_like_tilekernels(x: torch.Tensor) -> torch.Tensor:
     return (x.view(torch.int32) + 0x1000).view(torch.float32)
 
@@ -159,6 +163,9 @@ def mhc_pre(
         and hc_mult3 == hc_mult * (2 + hc_mult)
         and m > 128
         and not (hidden_size in (1280, 2560) and m <= 512)
+        # gfx946: the tlstyle (v3) stage2 kernel lost 20%-200% on gfx936/938 and was
+        # never benchmarked here, so auto must not select it on this architecture.
+        and gfx != "gfx946"
     )
     if env_kernel in ("aiter", "legacy"):
         use_tlstyle = False
@@ -326,6 +333,18 @@ def mhc_pre(
     comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
     layer_input = torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device)
     big_fuse = mhc_pre_big_fuse_tlstyle if use_tlstyle else mhc_pre_big_fuse
+    if _trace_env():
+        print(
+            "[mhc_pre_trace] "
+            f"gfx={gfx} cu={get_cu_num()} m={m} hidden_size={hidden_size} "
+            f"sinkhorn_repeat={sinkhorn_repeat} env_kernel={env_kernel or 'auto'} "
+            f"use_tlstyle_auto={use_tlstyle_auto} use_tlstyle={use_tlstyle} "
+            f"stage2_is_mhc_pre_big_fuse={big_fuse is mhc_pre_big_fuse} "
+            f"stage2_is_tlstyle={big_fuse is mhc_pre_big_fuse_tlstyle} "
+            f"stage1={'m128' if use_stage1_m128 else 'legacy'} "
+            f"tile_k={selected_tile_k} splitk={selected_splitk}",
+            flush=True,
+        )
     big_fuse(
         post_mix,
         comb_mix,

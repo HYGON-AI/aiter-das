@@ -484,6 +484,8 @@ def _try_get_triton_config(
         return None
 
 
+_triton_default_config_logged = False
+
 def _try_get_triton_default_config(
     quant_type: str,
     m: int,
@@ -493,6 +495,7 @@ def _try_get_triton_default_config(
     k: int,
     top_k: int,
 ) -> Optional[Dict[str, Any]]:
+    global _triton_default_config_logged
     # Only enable quant types represented by aiter_moe's Triton execution flags.
     dtype_names = {
         MoeQuantType.W16A16: None,
@@ -524,11 +527,13 @@ def _try_get_triton_default_config(
         )
         if not config:
             return None
-        logger.info(
-            "No tuned MoE config found; using default untuned Triton config for MoE execution: "
-            "quant_type=%s, M=%s, E=%s, N=%s, K=%s, top_k=%s, block_size=%s, config=%s",
-            quant_type, m, e, n, k, top_k, block_size, config,
-        )
+        if not _triton_default_config_logged:
+            logger.info(
+                "No tuned MoE config found; using default untuned Triton config for MoE execution: "
+                "quant_type=%s, M=%s, E=%s, N=%s, K=%s, top_k=%s, block_size=%s, config=%s",
+                quant_type, m, e, n, k, top_k, block_size, config,
+            )
+            _triton_default_config_logged = True
         return config
     except Exception as exc:
         logger.debug("Triton default config lookup failed for %s: %s", quant_type, exc)

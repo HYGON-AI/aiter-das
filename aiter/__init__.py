@@ -96,6 +96,13 @@ from .ops.fused_qk_norm_rope_cache_quant import (
     fused_qk_rmsnorm,
 )
 from .ops.sample import *
+from .ops.subblock_sparse_attn import (
+    bsa_attn_blk64_fwd,
+    bsa_attn_blk64_fwd_lse,
+    block_sizes_for,
+    subblock_sparse_attention,
+    subblock_sparse_attention_varlen,
+)
 from .ops.moe_routing import (
     RoutingBuffers, allocate_moe_routing, moe_routing_workspace_size,
     moe_routing_prepare_out, moe_routing_scatter_out, moe_routing_gather_out,

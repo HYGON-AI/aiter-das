@@ -1024,5 +1024,30 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": "''"
+    },
+    "module_subblock_sparse_attn": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/subblock_sparse_attn_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/subblock_sparse_attn/bsa_attn_host.cu'",
+            "f'{AITER_CSRC_DIR}/subblock_sparse_attn/bsa_attn_entry.cpp'",
+            "f'{AITER_CSRC_DIR}/subblock_sparse_attn/gfx936/bsa_fwd_launch_gfx936.cu'",
+            "f'{AITER_CSRC_DIR}/subblock_sparse_attn/gfx938/bsa_fwd_launch_gfx938.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "module_vgpr_compiler_flag(module_name)",
+            "'-ffast-math'",
+            "'-fno-finite-math-only'",
+            "'-DAITER_SBSA_HAS_GFX936' if 'gfx936' in get_gfx().split(';') else None",
+            "'-DAITER_SBSA_HAS_GFX938' if 'gfx938' in get_gfx().split(';') else None"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/subblock_sparse_attn/include'",
+            "f'{AITER_CSRC_DIR}/subblock_sparse_attn'",
+            "f'{AITER_CSRC_DIR}/subblock_sparse_attn/common'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
     }
 }

@@ -4,6 +4,7 @@
 
 #include "ck_tile/host/hip_device_info.hpp"
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -28,6 +29,8 @@ struct LaunchPolicy
     const char* error_name;
     const char* log_name;
     bool skip_empty_grid;
+    // auto gate uses grid.x*grid.y*grid.z >= 2 when true; grid.x only when false.
+    bool count_all_grid_dimensions = false;
 };
 
 namespace launch_policy {
@@ -73,6 +76,12 @@ inline constexpr LaunchPolicy fla{
 inline constexpr LaunchPolicy kv_cache{
     "AITER_KV_CACHE_DIE_MODE", "AITER_KV_CACHE_DIE_CHUNK", "AITER_KV_CACHE_DIE_MASK",
     "AITER_KV_CACHE_LOG_LAUNCH", "KV cache", "kv_cache", false};
+inline constexpr LaunchPolicy mhc_pre{
+    "AITER_MHC_PRE_DIE_MODE", "AITER_MHC_PRE_DIE_CHUNK", "AITER_MHC_PRE_DIE_MASK",
+    "AITER_MHC_PRE_LOG_LAUNCH", "mHC pre", "mhc_pre", false, true};
+inline constexpr LaunchPolicy mhc_post{
+    "AITER_MHC_POST_DIE_MODE", "AITER_MHC_POST_DIE_CHUNK", "AITER_MHC_POST_DIE_MASK",
+    "AITER_MHC_POST_LOG_LAUNCH", "mHC post", "mhc_post", false, true};
 } // namespace launch_policy
 namespace launch_detail {
 inline unsigned int read_unsigned(const char* name, unsigned int fallback)
@@ -147,7 +156,10 @@ inline void launch_kernel(const LaunchPolicy& policy, void (*kernel)(Args...),
         if(!automatic && !multi)
             throw std::runtime_error(std::string(policy.error_name) +
                 " linear launch requires gfx946 with at least 2 reported XCDs");
-        multi = multi && (!automatic || grid.x >= 2);
+        const std::uint64_t groups = policy.count_all_grid_dimensions
+            ? std::uint64_t{grid.x} * grid.y * grid.z
+            : grid.x;
+        multi = multi && (!automatic || groups >= 2);
     }
 #else
     if(!automatic && !off)
