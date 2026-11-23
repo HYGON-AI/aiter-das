@@ -14,6 +14,7 @@
 #include "custom.h"
 #include "moe_op.h"
 #include "moe_sorting.h"
+#include "moe_c_align.h"
 #include "grouped_gemm_ck.h"
 #include "topk_gate.h"
 #include "quant_api.h"

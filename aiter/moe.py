@@ -160,21 +160,23 @@ def _try_get_moe_c_config(
 ) -> Optional[Dict[str, Any]]:
     """Look up a tuned moe_c config.
 
-    ``indtype`` is the channelwise CSV key (fp8_w8a8/int8_w8a8/int8_w4a8
-    only; other families ignore it) and must match the execute-time
-    ``str(compute_dtype)`` lookup.
+    ``indtype`` must match the runtime ``str(compute_dtype)`` for the
+    W4A16 and channelwise CSV lookups.
     """
     try:
         from .fused_moe_c import get_moe_configs_marlin
 
         if quant_type == MoeQuantType.W4A16:
-            configs = get_moe_configs_marlin(
-                E=e,
-                N=n,
-                dtype="int4_w4a16",
-                is_bottom=False,
-                use_moe_wna16_cuda=True,
+            device = torch.cuda.get_device_properties(torch.cuda.current_device())
+            lookup_args = dict(
+                E=e, N=n, dtype="int4_w4a16", block_n=0, block_k=block_size,
+                use_moe_wna16_cuda=True, K=k, top_k=top_k, indtype=indtype,
+                arch=device.gcnArchName.split(":")[0], num_cu=device.multi_processor_count,
             )
+            configs = get_moe_configs_marlin(**lookup_args)
+            if not configs or not get_moe_configs_marlin(is_bottom=True, **lookup_args):
+                return None
+            return dict(_pick_closest_config(configs, m), GROUP_SIZE=block_size or 32)
         elif quant_type == MoeQuantType.WFP4A16:
             configs = get_moe_configs_marlin(
                 E=e,
@@ -656,7 +658,9 @@ def get_aiter_moe_config(
                 quant_type=quant_type,
                 solution_type=spec_sol_type,
                 need_shuffle=((spec_sol_type == MoeSolutionType.MOE_C and (quant_type not in (MoeQuantType.W4A16, MoeQuantType.WFP4A16))) or (spec_sol_type == MoeSolutionType.ASM and bool(config.get("USE_SHUFFLE", use_shuffle)))),
-                need_shuffle_scale=((spec_sol_type == MoeSolutionType.MOE_C) and (quant_type in (MoeQuantType.W4A16, MoeQuantType.WFP4A16))),
+                need_shuffle_scale=(spec_sol_type == MoeSolutionType.MOE_C
+                                    and quant_type in (MoeQuantType.W4A16, MoeQuantType.WFP4A16)
+                                    and config.get("GROUP_SIZE") != 128),
                 config=config,
                 dtype=config_dtype,
             )
@@ -667,13 +671,13 @@ def get_aiter_moe_config(
     if quant_type == MoeQuantType.W4A16:
         if dtype == torch.float16:
             candidates = [
-                (MoeSolutionType.MOE_C, lambda: _try_get_moe_c_config(quant_type, M, E, n, block_size, K)),
+                (MoeSolutionType.MOE_C, lambda: _try_get_moe_c_config(quant_type, M, E, n, block_size, K, top_k, indtype=str(config_dtype))),
                 (MoeSolutionType.TRITON, lambda: _try_get_triton_config(quant_type, M, E, n, block_size, K, top_k)),
             ]
         elif dtype == torch.bfloat16:
             candidates = [
+                (MoeSolutionType.MOE_C, lambda: _try_get_moe_c_config(quant_type, M, E, n, block_size, K, top_k, indtype=str(config_dtype))),
                 (MoeSolutionType.ASM, lambda: _try_get_asm_config(quant_type, M, E, n, K, top_k, block_size, use_shuffle)),
-                (MoeSolutionType.MOE_C, lambda: _try_get_moe_c_config(quant_type, M, E, n, block_size)),
                 (MoeSolutionType.TRITON, lambda: _try_get_triton_config(quant_type, M, E, n, block_size, K, top_k)),
             ]
         else:
@@ -734,7 +738,9 @@ def get_aiter_moe_config(
                 quant_type=quant_type,
                 solution_type=solution_type,
                 need_shuffle=(((solution_type == MoeSolutionType.MOE_C) and (quant_type not in (MoeQuantType.W4A16, MoeQuantType.WFP4A16))) or (solution_type == MoeSolutionType.ASM and bool(config.get("USE_SHUFFLE", use_shuffle)))),
-                need_shuffle_scale=((solution_type == MoeSolutionType.MOE_C) and (quant_type in (MoeQuantType.W4A16, MoeQuantType.WFP4A16))),
+                need_shuffle_scale=(solution_type == MoeSolutionType.MOE_C
+                                    and quant_type in (MoeQuantType.W4A16, MoeQuantType.WFP4A16)
+                                    and config.get("GROUP_SIZE") != 128),
                 config=config,
                 dtype=config_dtype,
             )
@@ -827,6 +833,13 @@ def aiter_moe(
 
     if moe_config.solution_type == MoeSolutionType.MOE_C:
         from .fused_moe_c import moe_c_fused_experts
+
+        if use_int4_w4a16 and moe_config.config and "GROUP_SIZE" in moe_config.config:
+            configured_shape = [0, moe_config.config["GROUP_SIZE"]]
+            if block_shape is None:
+                block_shape = configured_shape
+            elif list(block_shape) != configured_shape:
+                raise ValueError(f"W4A16 block_shape={block_shape} disagrees with config {configured_shape}")
 
         float_dtypes = (torch.float16, torch.bfloat16, torch.float32)
         if hidden_states.dtype in float_dtypes:
@@ -1219,10 +1232,9 @@ def aiter_moe_shfl_scale(
 
     if sol_type == MoeSolutionType.MOE_C:
         if quant_type == MoeQuantType.W4A16:
-            return _apply_shfl(
-                lambda x: w4a16_marlin_scale(x),
-                lambda x: w4a16_marlin_scale(x),
-            )
+            if (moe_config.config or {}).get("GROUP_SIZE") == 128:
+                return _apply_shfl(torch.Tensor.contiguous, torch.Tensor.contiguous)
+            return _apply_shfl(w4a16_marlin_scale, w4a16_marlin_scale)
         if quant_type == MoeQuantType.WFP4A16:
             return _apply_shfl(
                 lambda x: wfp4a16_e8m0_scale(x),

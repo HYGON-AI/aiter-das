@@ -234,7 +234,10 @@ AITER_CONFIG_GEMM_BF16_FILE = get_config_file(
 # config_env end here
 
 find_aiter = importlib.util.find_spec("aiter")
-if find_aiter is not None:
+if __name__ == "jit.core":
+    # setup.py imports the build helpers before it generates aiter_meta.
+    AITER_META_DIR = AITER_ROOT_DIR
+elif find_aiter is not None:
     if find_aiter.submodule_search_locations:
         package_path = find_aiter.submodule_search_locations[0]
     elif find_aiter.origin:
