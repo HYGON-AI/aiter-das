@@ -210,6 +210,18 @@ namespace py = pybind11;
             py::arg("sorted_token_ids"),                                               \
             py::arg("experts_ids"),                                                    \
             py::arg("num_tokens_post_pad"));                                           \
+      m.def("moe_c_sgl_moe_align_block_size_dual",                                     \
+            &moe_c_sgl_moe_align_block_size_dual,                                       \
+            py::arg("topk_ids"),                                                       \
+            py::arg("num_experts"),                                                    \
+            py::arg("block_size"),                                                     \
+            py::arg("sorted_token_ids"),                                               \
+            py::arg("experts_ids"),                                                    \
+            py::arg("num_tokens_post_pad"),                                            \
+            py::arg("block_size2"),                                                    \
+            py::arg("sorted_token_ids2"),                                              \
+            py::arg("experts_ids2"),                                                   \
+            py::arg("num_tokens_post_pad2"));
 
 #define MOE_C_SUM_PYBIND                                                               \
       m.def("moe_c_moe_sum",                                                           \

@@ -253,17 +253,13 @@ def moe_c_moe_gemm_marlin_w4a16(
     top_k : int,
     mode :int,
     delta: int)-> torch.Tensor: 
-    """
-    ---------------------------------------------------------------
-    # MoE 场景下 4bit 量化的 GEMM 计算（Marlin 优化版）   
+    """Run one W4A16 stage with a shared HIPC mode.
 
-    ## 关键前置条件
-    必须配合对应的权重 Shuffle 函数使用，否则会导致计算结果完全错误：
-
-    
-    ---------------------------------------------------------------
+    Pack symmetric INT4 weights along K in uint32 words. Reorder group-32
+    scales with w4a16_marlin_scale and pass group-128 scales in K-group order.
+    GEMM1 passes no routing weights. GEMM2 passes
+    one routing weight per input row with top_k=1.
     """
-    
     pass
 
 @compile_ops("module_moe_c_wfp4a16_kernel")
@@ -760,5 +756,21 @@ def moe_c_sgl_moe_align_block_size(
     sorted_token_ids: torch.Tensor,
     experts_ids: torch.Tensor,
     num_tokens_post_pad: torch.Tensor
+) -> None:
+    pass
+
+
+@compile_ops("module_moe_c_align")
+def moe_c_sgl_moe_align_block_size_dual(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    experts_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    block_size2: int,
+    sorted_token_ids2: torch.Tensor,
+    experts_ids2: torch.Tensor,
+    num_tokens_post_pad2: torch.Tensor,
 ) -> None:
     pass

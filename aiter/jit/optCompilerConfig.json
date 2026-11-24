@@ -658,7 +658,8 @@
             "f'{AITER_CSRC_DIR}/pybind/moe_c_pybind.cu'",
             "f'{MOE_C_CSRC_FOR_AITER_DIR}'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/moe_c_api_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_moe_c/moe_c.cu'"
+            "f'{AITER_CSRC_DIR}/py_itfs_moe_c/moe_c.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_moe_c/moe_c_w4a16.cu'"
         ],
         "flags_extra_cc": [
             "module_vgpr_compiler_flag(module_name) ",
@@ -776,7 +777,8 @@
     "module_moe_c_align": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_c_align_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_moe_c/moe_c_align.cu'"
+            "f'{AITER_CSRC_DIR}/py_itfs_moe_c/moe_c_align.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_moe_c/moe_c_align_dual.cu'"
         ],
         "flags_extra_cc": [
             "module_vgpr_compiler_flag(module_name) ",
