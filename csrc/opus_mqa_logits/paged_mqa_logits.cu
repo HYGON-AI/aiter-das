@@ -24,7 +24,7 @@ void launch_hcu(const torch::Tensor& q, const torch::Tensor& cache,
     using namespace aiter_paged_mqa_hcu;
     const int batch=q.size(0), next=q.size(1), heads=q.size(2), page_size=cache.size(1);
     const int tokens=cache.size(0)*page_size, table_width=tables.size(1);
-    const uint64_t page_stride_bytes=cache.stride(0);
+    const uint64_t page_stride_bytes=cache.is_contiguous()?page_size*132:cache.stride(0);
     const auto stream=at::hip::getCurrentHIPStream();
     const bool grouped=kernel_id==7;
     const uint8_t* qp=static_cast<const uint8_t*>(q.data_ptr());
@@ -142,8 +142,8 @@ static torch::Tensor paged_mqa_logits_impl(const torch::Tensor& q, const torch::
                 (cache.size(1)==1 || cache.size(1)==64) && cache.size(2)==1 && cache.size(3)==132 &&
                 cache.size(0)<=INT_MAX/(cache.size(1)*132),
                 "paged_mqa_logits: cache must be uint8 [P,S,1,132], S=1/64, P*S*132<=INT_MAX");
-    TORCH_CHECK(cache.stride(3)==1 && cache.stride(1)==132 &&
-                cache.stride(0)>=cache.size(1)*132 && cache.stride(0)%4==0,
+    TORCH_CHECK(cache.is_contiguous() || (cache.stride(3)==1 && cache.stride(1)==132 &&
+                cache.stride(0)>=cache.size(1)*132 && cache.stride(0)%4==0),
                 "paged_mqa_logits: cache requires contiguous page payloads and aligned nonoverlapping pages");
     TORCH_CHECK(reinterpret_cast<uintptr_t>(q.data_ptr())%4==0 &&
                 reinterpret_cast<uintptr_t>(cache.data_ptr())%4==0,

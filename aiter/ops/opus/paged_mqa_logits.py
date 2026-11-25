@@ -131,7 +131,7 @@ def paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables,
             or tuple(kv_cache.shape[2:]) != (1,132)
             or not 0 < kv_cache.shape[0] <= (2**31-1)//(kv_cache.shape[1]*132)):
         raise ValueError("cache must be uint8 [P,S,1,132], S=1/64, P*S*132<=INT_MAX")
-    if (kv_cache.stride(3) != 1 or kv_cache.stride(1) != 132
+    if not kv_cache.is_contiguous() and (kv_cache.stride(3) != 1 or kv_cache.stride(1) != 132
             or kv_cache.stride(0) < kv_cache.shape[1]*132 or kv_cache.stride(0)%4):
         raise ValueError("cache requires contiguous page payloads and aligned nonoverlapping pages")
     if q.data_ptr()%4 or kv_cache.data_ptr()%4:
