@@ -76,4 +76,22 @@ for case in [
     (32, 32, 16384, 8452, 256, 4, False),
 ]:
     check(*case)
+with torch.inference_mode():
+    for page_size in (1, 64):
+        raw = torch.zeros((1, page_size, 1, 132), device='cuda', dtype=torch.uint8)
+        flat = raw.view(1, -1)
+        flat[:, :page_size * 128] = torch.randn(1, page_size * 128, device='cuda').to(torch.float8_e4m3fn).view(torch.uint8)
+        flat[:, page_size * 128:] = torch.ones(1, page_size, device='cuda').view(torch.uint8)
+        strides = (0, 7 if page_size == 1 else 132, 132, 1)
+        cache = raw.as_strided((1, page_size, 1, 132), strides)
+        assert cache.is_contiguous()
+        query = torch.randn(3, 1, 32, 128, device='cuda').to(torch.float8_e4m3fn)
+        weights = torch.randn(3, 32, device='cuda')
+        lengths = torch.full((3,), page_size, device='cuda', dtype=torch.int32)
+        table = torch.zeros(3, 1, device='cuda', dtype=torch.int32)
+        output = paged_mqa_logits(query, cache, weights, lengths, table, page_size)
+        expected = paged_mqa_logits(query, raw, weights, lengths, table, page_size)
+        torch.testing.assert_close(output, expected, atol=0, rtol=0)
+        print(json.dumps({'singleton_page_size': page_size, 'strides': strides, 'passed': True}), flush=True)
+
 print('COMPONENT_COMPLETE', len(results), flush=True)
