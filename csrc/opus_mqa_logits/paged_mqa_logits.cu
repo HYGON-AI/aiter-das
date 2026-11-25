@@ -126,6 +126,12 @@ static torch::Tensor paged_mqa_logits_impl(const torch::Tensor& q, const torch::
                           const torch::Tensor& tables, std::optional<torch::Tensor> supplied_output,
                           int64_t max_len, int64_t kernel_id, bool clean_logits)
 {
+    // Check metadata before device access and allocation. The existing FP8
+    // buffer padding path narrows its element offset to uint32_t.
+    if(q.dim()==4 && max_len>0 && q.size(1)>0) {
+        TORCH_CHECK(q.size(0)<=(1LL<<32)/max_len/q.size(1),
+                    "paged MQA output must contain at most 2**32 FP32 elements");
+    }
     TORCH_CHECK(q.is_cuda(), "paged_mqa_logits: q must be on GPU");
     for(const auto& t : {q,weights,context,tables}) {
         TORCH_CHECK(t.is_cuda() && t.device()==q.device() && t.is_contiguous() && !t.requires_grad(),

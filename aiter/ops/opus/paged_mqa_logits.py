@@ -99,8 +99,14 @@ def paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables,
     With ``clean_logits=True`` (default), invalid output is -inf, including
     the far tail. With False the caller owns tail initialization/masking.
     Allocation/fill occur on the current stream; no host synchronization is
-    performed. Warm up the JIT before capturing the call in a GPU graph.
+    performed. Outputs are limited to 2**32 FP32 elements (16 GiB).
+    Warm up the JIT before capturing the call in a GPU graph.
     """
+    # The buffer-load padding path uses an unsigned 32-bit element offset.
+    # Keep the last valid FP32 index representable, before any native allocation.
+    if (type(max_model_len) is int and max_model_len > 0 and q.ndim == 4
+            and q.shape[0] * q.shape[1] * max_model_len > 2**32):
+        raise ValueError("paged MQA output must contain at most 2**32 FP32 elements")
     # The eager allocating entry validates tensor metadata and allocates on the
     # current stream in C++. Compiled and supplied-output calls retain the
     # registered preallocated operator below.
