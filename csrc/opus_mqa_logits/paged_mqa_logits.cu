@@ -24,6 +24,7 @@ void launch_hcu(const torch::Tensor& q, const torch::Tensor& cache,
     using namespace aiter_paged_mqa_hcu;
     const int batch=q.size(0), next=q.size(1), heads=q.size(2), page_size=cache.size(1);
     const int tokens=cache.size(0)*page_size, table_width=tables.size(1);
+    const uint64_t page_stride_bytes=cache.stride(0);
     const auto stream=at::hip::getCurrentHIPStream();
     const bool grouped=kernel_id==7;
     const uint8_t* qp=static_cast<const uint8_t*>(q.data_ptr());
@@ -39,13 +40,13 @@ void launch_hcu(const torch::Tensor& q, const torch::Tensor& cache,
 #undef FUSED
         return;
     }
-    const bool mls_aligned=((reinterpret_cast<uintptr_t>(qp)|reinterpret_cast<uintptr_t>(kp))%16)==0;
+    const bool mls_aligned=((reinterpret_cast<uintptr_t>(qp)|reinterpret_cast<uintptr_t>(kp)|page_stride_bytes)%16)==0;
     if(!fp16_mmac && !grouped && page_size==64 && mls_aligned) {
         // Small grids favor less serial KV work per wave; large grids reuse Q.
         const int64_t elements=int64_t(batch)*next*max_len;
         const int tile=elements<=16384 ? 64 : elements<=32768 ? 128 : 256;
         const dim3 grid(((int64_t(max_len)+tile-1)/tile)*next,batch);
-#define MLS_TILE(H,R,I) hipLaunchKernelGGL((paged_mqa_mls_single<H,R,I>),grid,dim3(256),9216,stream,qp,kp,weights.data_ptr<float>(),context.data_ptr<int>(),tables.data_ptr<int>(),output.data_ptr<float>(),max_len,table_width)
+#define MLS_TILE(H,R,I) hipLaunchKernelGGL((paged_mqa_mls_single<H,R,I>),grid,dim3(256),9216,stream,qp,kp,weights.data_ptr<float>(),context.data_ptr<int>(),tables.data_ptr<int>(),output.data_ptr<float>(),max_len,table_width,page_stride_bytes)
 #define MLS(H,R) if(tile==64) { MLS_TILE(H,R,1); } else if(tile==128) { MLS_TILE(H,R,2); } else { MLS_TILE(H,R,4); }
 #define MLS_NEXT(H) if(next==1) { MLS(H,1); } else if(next==2) { MLS(H,2); } else { MLS(H,4); }
         if(heads==32) { MLS_NEXT(32) } else { MLS_NEXT(64) }
@@ -88,7 +89,7 @@ void launch_hcu(const torch::Tensor& q, const torch::Tensor& cache,
         const dim3 grid((int64_t(max_len)+255)/256,groups);
 #define GROUP_FP8(S) hipLaunchKernelGGL((paged_mqa_grouped<2,S>),grid,dim3(256),16384,stream, \
     qp,kp,weights.data_ptr<float>(),context.data_ptr<int>(),tables.data_ptr<int>(),output.data_ptr<float>(), \
-    batch,max_len,table_width,flags.data_ptr<int>(),compact_context.data_ptr<int>(),compact_tables.data_ptr<int>())
+    batch,max_len,table_width,flags.data_ptr<int>(),compact_context.data_ptr<int>(),compact_tables.data_ptr<int>(),page_stride_bytes)
 #define GROUP_FP16(S) hipLaunchKernelGGL((paged_mqa_half_grouped<2,S>),grid,dim3(256),16640,stream, \
     reinterpret_cast<const uint16_t*>(qp),reinterpret_cast<const uint16_t*>(kp),weights.data_ptr<float>(), \
     context.data_ptr<int>(),tables.data_ptr<int>(),output.data_ptr<float>(),batch,max_len,table_width,tokens, \
@@ -97,7 +98,7 @@ void launch_hcu(const torch::Tensor& q, const torch::Tensor& cache,
         else if(page_size==64 && mls_aligned) {
             hipLaunchKernelGGL(paged_mqa_mls_grouped,grid,dim3(256),10240,stream,qp,kp,weights.data_ptr<float>(),
                 context.data_ptr<int>(),tables.data_ptr<int>(),output.data_ptr<float>(),batch,max_len,table_width,
-                flags.data_ptr<int>(),compact_context.data_ptr<int>(),compact_tables.data_ptr<int>());
+                flags.data_ptr<int>(),compact_context.data_ptr<int>(),compact_tables.data_ptr<int>(),page_stride_bytes);
         } else { if(page_size==1) { GROUP_FP8(1); } else { GROUP_FP8(64); } }
 #undef GROUP_FP8
 #undef GROUP_FP16
@@ -110,7 +111,7 @@ void launch_hcu(const torch::Tensor& q, const torch::Tensor& cache,
         context.data_ptr<int>(),tables.data_ptr<int>(),output.data_ptr<float>(),batch,max_len,table_width,tokens); \
     } else { hipLaunchKernelGGL((paged_mqa_fp8_single<H,S,R>),grid,dim3(256),smem,stream, \
         qp,kp,weights.data_ptr<float>(),context.data_ptr<int>(),tables.data_ptr<int>(),output.data_ptr<float>(), \
-        batch,max_len,table_width); } } while(0)
+        batch,max_len,table_width,page_stride_bytes); } } while(0)
 #define NEXT(H,S) if(next==1) { SINGLE(H,S,1); } else if(next==2) { SINGLE(H,S,2); } else { SINGLE(H,S,4); }
         if(heads==32) { if(page_size==1) { NEXT(32,1) } else { NEXT(32,64) } }
         else { if(page_size==1) { NEXT(64,1) } else { NEXT(64,64) } }
@@ -126,7 +127,7 @@ static torch::Tensor paged_mqa_logits_impl(const torch::Tensor& q, const torch::
                           int64_t max_len, int64_t kernel_id, bool clean_logits)
 {
     TORCH_CHECK(q.is_cuda(), "paged_mqa_logits: q must be on GPU");
-    for(const auto& t : {q,cache,weights,context,tables}) {
+    for(const auto& t : {q,weights,context,tables}) {
         TORCH_CHECK(t.is_cuda() && t.device()==q.device() && t.is_contiguous() && !t.requires_grad(),
                     "paged_mqa_logits: tensors must be contiguous inference tensors on the same GPU");
     }
@@ -136,10 +137,14 @@ static torch::Tensor paged_mqa_logits_impl(const torch::Tensor& q, const torch::
     TORCH_CHECK(batch>0 && (next==1 || next==2 || next==4) &&
                 (heads==32 || heads==64) && q.size(3)==128 && batch*next<=65535,
                 "paged_mqa_logits: requires B>0, B*R<=65535, R=1/2/4, H=32/64, D=128");
-    TORCH_CHECK(cache.scalar_type()==at::kByte && cache.dim()==4 && cache.size(0)>0 &&
+    TORCH_CHECK(cache.is_cuda() && cache.device()==q.device() && !cache.requires_grad() &&
+                cache.scalar_type()==at::kByte && cache.dim()==4 && cache.size(0)>0 &&
                 (cache.size(1)==1 || cache.size(1)==64) && cache.size(2)==1 && cache.size(3)==132 &&
                 cache.size(0)<=INT_MAX/(cache.size(1)*132),
                 "paged_mqa_logits: cache must be uint8 [P,S,1,132], S=1/64, P*S*132<=INT_MAX");
+    TORCH_CHECK(cache.stride(3)==1 && cache.stride(1)==132 &&
+                cache.stride(0)>=cache.size(1)*132 && cache.stride(0)%4==0,
+                "paged_mqa_logits: cache requires contiguous page payloads and aligned nonoverlapping pages");
     TORCH_CHECK(reinterpret_cast<uintptr_t>(q.data_ptr())%4==0 &&
                 reinterpret_cast<uintptr_t>(cache.data_ptr())%4==0,
                 "paged_mqa_logits: Q/cache storage must be 4-byte aligned");
@@ -179,6 +184,8 @@ static torch::Tensor paged_mqa_logits_impl(const torch::Tensor& q, const torch::
     TORCH_CHECK(is_gfx946 ? (kernel_id==4 || kernel_id==5) :
                 is_gfx936 ? kernel_id>=6 : (kernel_id<=3 || kernel_id>=6),
                 "paged_mqa_logits: gfx936 requires ID6-7; gfx938 ID0-3/6-7; gfx946 ID4-5");
+    TORCH_CHECK(cache.is_contiguous() || (!is_gfx936 && !is_gfx946 && cache.size(1)==64 && kernel_id>=6),
+                "paged_mqa_logits: strided cache requires gfx938 page64 ID6/7");
     // Eager allocation and metadata validation share this native entry. The
     // supplied-output path retains storage-alias and inference-only checks.
     torch::Tensor output=supplied_output ? *supplied_output : torch::empty({batch*next,max_len},q.options().dtype(at::kFloat));

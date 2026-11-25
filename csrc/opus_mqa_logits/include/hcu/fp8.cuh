@@ -154,7 +154,7 @@ __device__ __forceinline__ void grouped_device(const Element* q,
         const int current_block_idx = kv_block_idx[BLOCK_KV == 1 ? 0 : page_delta];
         auto gKv = current_block_idx != -1 ?
             kv_block + (BLOCK_KV==1?int64_t(current_block_idx/64)*8448+(current_block_idx%64)*128:
-                        (int64_t)current_block_idx * BLOCK_KV * (kHeadDim + 4)) : kv_block;
+                        (int64_t)current_block_idx * kv_cache_stride_bytes) : kv_block;
         long glob_kv_desc[2];
         glob_kv_desc[0] = *reinterpret_cast<const long *>(&gKv);
         glob_kv_desc[0] = glob_kv_desc[0] | stride << 48;
@@ -193,7 +193,7 @@ __device__ __forceinline__ void grouped_device(const Element* q,
         const int current_block_idx = kv_block_idx[BLOCK_KV == 1 ? 0 : page_delta];
         auto gKv = current_block_idx != -1 ?
             kv_block + (BLOCK_KV==1?int64_t(current_block_idx/64)*8448+(current_block_idx%64)*128:
-                        (int64_t)current_block_idx * BLOCK_KV * (kHeadDim + 4)) : kv_block;
+                        (int64_t)current_block_idx * kv_cache_stride_bytes) : kv_block;
         long glob_kv_desc[2];
         glob_kv_desc[0] = *reinterpret_cast<const long *>(&gKv);
         glob_kv_desc[0] = glob_kv_desc[0] | stride << 48;
@@ -311,7 +311,7 @@ __device__ __forceinline__ void grouped_device(const Element* q,
         const bool valid=token<context_len-kNextN+next_n+1;
         const int page=valid?block_table[int64_t(q_idx)*block_table_stride+token/BLOCK_KV]:0;
         const int64_t offset=BLOCK_KV==1?(Repacked?int64_t(page/64)*8448+8192+(page%64)*4:int64_t(page)*132+128):
-            int64_t(page)*BLOCK_KV*132+BLOCK_KV*128+(token%BLOCK_KV)*4;
+            int64_t(page)*kv_cache_stride_bytes+BLOCK_KV*128+(token%BLOCK_KV)*4;
         const float sf=valid?*reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(kv_block)+offset):0.f;
         #pragma unroll
         for(int g=0;g<QGROUP;++g){

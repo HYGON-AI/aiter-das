@@ -30,7 +30,7 @@ template<int Control> __device__ __forceinline__ float mls_dpp(float value) {
 #define AITER_MLS_WAIT(OP) do { __builtin_amdgcn_sched_barrier(0); asm volatile(OP:::"memory"); __builtin_amdgcn_sched_barrier(0); } while(0)
 template<int H,int R,int G=1,int I=4>
 __device__ __forceinline__ void paged_mqa_mls_device(const uint8_t* q,const uint8_t* k,
-    const float* w,const int* ctx,const int* tb,float* out,int N,int tw,int batch) {
+    const float* w,const int* ctx,const int* tb,float* out,int N,int tw,int batch,uint64_t page_stride_bytes) {
     static_assert(I==1 || I==2 || I==4);
     constexpr int QI=H*G/16, T=64*I;
     const int tid=threadIdx.x,wave=tid/64,lane=tid%64;
@@ -46,7 +46,7 @@ __device__ __forceinline__ void paged_mqa_mls_device(const uint8_t* q,const uint
     for(int h=0;h<QI;++h)wr[h]=w[(batch*R*G+r)*H+h*16+lane%16];
     const bool valid=first+wave*16*I<len;
     const int page=valid?__builtin_amdgcn_readfirstlane(tb[int64_t(batch)*tw+first/64+wave*I/4]):0;
-    const uint8_t* kp=k+int64_t(page)*8448;
+    const uint8_t* kp=k+int64_t(page)*page_stride_bytes;
     AITER_MLS_WAIT("s_waitcnt vmcnt(0)");
     __syncthreads();
     f8x16_t qr[QI][2];
@@ -106,22 +106,22 @@ __device__ __forceinline__ void paged_mqa_mls_device(const uint8_t* q,const uint
 #endif
 template<int H,int R,int I=4>
 __global__ __launch_bounds__(256) void paged_mqa_mls_single(const uint8_t* q,const uint8_t* k,const float* w,
- const int* ctx,const int* tb,float* out,int N,int tw) {
+ const int* ctx,const int* tb,float* out,int N,int tw,uint64_t page_stride_bytes) {
 #if defined(__gfx938__)
-    paged_mqa_mls_device<H,R,1,I>(q,k,w,ctx,tb,out,N,tw,blockIdx.y);
+    paged_mqa_mls_device<H,R,1,I>(q,k,w,ctx,tb,out,N,tw,blockIdx.y,page_stride_bytes);
 #endif
 }
 __global__ __launch_bounds__(256) void paged_mqa_mls_grouped(const uint8_t* q,const uint8_t* k,const float* w,
- const int* ctx,const int* tb,float* out,int B,int N,int tw,const int* flags,const int* cctx,const int* ctb) {
+ const int* ctx,const int* tb,float* out,int B,int N,int tw,const int* flags,const int* cctx,const int* ctb,uint64_t page_stride_bytes) {
 #if defined(__gfx938__)
     const int g=blockIdx.y,chunks=(N-1)/(64*1024)+1;
     bool bad=false;
     for(int j=threadIdx.x%64;j<chunks;j+=64)bad|=flags[g*chunks+j]<0;
     if(__ballot(bad)==0) {
-        paged_mqa_mls_device<32,1,2>(q,k,w,cctx,ctb,out,N,(N-1)/64+1,g);
+        paged_mqa_mls_device<32,1,2>(q,k,w,cctx,ctb,out,N,(N-1)/64+1,g,page_stride_bytes);
     } else {
         for(int i=0;i<2&&g*2+i<B;++i) {
-            paged_mqa_mls_device<32,1>(q,k,w,ctx,tb,out,N,tw,g*2+i);
+            paged_mqa_mls_device<32,1>(q,k,w,ctx,tb,out,N,tw,g*2+i,page_stride_bytes);
             __syncthreads();
         }
     }
