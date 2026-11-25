@@ -9,6 +9,10 @@
  **************************************************************************************************/
 #pragma once
 
+#ifdef __HIPCC__
+#include <hip/hip_fp8.h>
+#endif
+
 // clang-format off
 #include <type_traits>
 #include <utility>
@@ -1266,8 +1270,12 @@ template<typename S, std::enable_if_t<std::is_same_v<S, fp8x4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp8_to_fp32_packed_x4(const S& s) {
     int bitwise = __builtin_bit_cast(int, s);
 #if defined(__gfx938__) || defined(__gfx946__)
-    auto x = __builtin_hcu_cvt_pk_f32_fp8(bitwise, 0); auto y = __builtin_hcu_cvt_pk_f32_fp8(bitwise, 1);
-    return fp32x4_t{x[0], x[1], y[0], y[1]};
+    __hip_fp8x2_e4m3 lo, hi;
+    lo.__x = static_cast<unsigned short>(bitwise);
+    hi.__x = static_cast<unsigned short>(static_cast<unsigned int>(bitwise) >> 16);
+    const float2 x = static_cast<float2>(lo);
+    const float2 y = static_cast<float2>(hi);
+    return fp32x4_t{x.x, x.y, y.x, y.y};
 #else
     // auto x = __builtin_amdgcn_cvt_pk_f32_fp8(bitwise, 0); auto y = __builtin_amdgcn_cvt_pk_f32_fp8(bitwise, 1);
     return fp32x4_t{0, 0, 0, 0};
