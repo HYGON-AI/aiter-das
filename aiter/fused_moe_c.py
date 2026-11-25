@@ -2584,6 +2584,9 @@ def invoke_fused_moe_kernel_marlin(A: torch.Tensor,
 
 def _mode_tiles(quant, stage, routing, family, bm, profile):
     up = stage == 1
+    if quant == "int8_w8a8" and family == 3:
+        assert routing in (0, 1) and bm in (128, 256) and profile in (101, 102)
+        return 256
     if quant == "int8_w4a8":
         assert routing == 1 and bm in (16, 32, 48, 64)
         if family == 0:
@@ -2659,6 +2662,8 @@ def validate_channelwise_reduce_k(quant, mode, reduce_k, is_bottom, out_n=None):
                              if family == 0 else
                              (192,) if family == 3 else
                              (128, 192, 256, 384, 512, 640, 768, 1024, 1536, 2048, 3072))
+    elif quant == "int8_w8a8" and family == 3:
+        pass  # WASP accepts reduction K aligned to BK=128.
     elif family == 0:
         if up:
             variants = ({(16, 101): 1024, (16, 102): 512, (16, 103): 256,
