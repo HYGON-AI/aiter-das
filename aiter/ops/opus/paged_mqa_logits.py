@@ -61,6 +61,8 @@ def paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables,
 
     Supported: gfx936/gfx938/gfx946; contiguous Q E4M3FN [B,R,H,128], R=1/2/4,
     H=32/64; uint8 KV [P,S,1,132]. S=1/64 on gfx936/gfx938; S=1 on gfx946.
+    gfx938 S=64 ID6/7 also accept aligned page strides with contiguous
+    page payloads. Other architecture/page/kernel combinations require contiguous KV.
     Each page contains S*128 K bytes
     followed by S positive finite FP32 scales (not interleaved for S=64).
     FP32 weights [B*R,H]; int32 lengths [B]
@@ -97,8 +99,14 @@ def paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables,
     With ``clean_logits=True`` (default), invalid output is -inf, including
     the far tail. With False the caller owns tail initialization/masking.
     Allocation/fill occur on the current stream; no host synchronization is
-    performed. Warm up the JIT before capturing the call in a GPU graph.
+    performed. Outputs are limited to 2**32 FP32 elements (16 GiB).
+    Warm up the JIT before capturing the call in a GPU graph.
     """
+    # The buffer-load padding path uses an unsigned 32-bit element offset.
+    # Keep the last valid FP32 index representable, before any native allocation.
+    if (type(max_model_len) is int and max_model_len > 0 and q.ndim == 4
+            and q.shape[0] * q.shape[1] * max_model_len > 2**32):
+        raise ValueError("paged MQA output must contain at most 2**32 FP32 elements")
     # The eager allocating entry validates tensor metadata and allocates on the
     # current stream in C++. Compiled and supplied-output calls retain the
     # registered preallocated operator below.
@@ -117,7 +125,7 @@ def paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables,
     if any(not t.is_cuda or t.device != q.device for t in inputs):
         raise ValueError("inputs must be on the same GPU")
     arch = _require_arch(q.device.index)
-    if any(not t.is_contiguous() or t.requires_grad for t in inputs):
+    if any(t.requires_grad for t in inputs) or any(not t.is_contiguous() for t in (q, weights, context_lens, block_tables)):
         raise ValueError("inputs must be contiguous inference tensors")
     if q.ndim != 4 or q.dtype != torch.float8_e4m3fn:
         raise ValueError("q must be E4M3FN [B,R,H,128]")
@@ -129,6 +137,9 @@ def paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables,
             or tuple(kv_cache.shape[2:]) != (1,132)
             or not 0 < kv_cache.shape[0] <= (2**31-1)//(kv_cache.shape[1]*132)):
         raise ValueError("cache must be uint8 [P,S,1,132], S=1/64, P*S*132<=INT_MAX")
+    if not kv_cache.is_contiguous() and (kv_cache.stride(3) != 1 or kv_cache.stride(1) != 132
+            or kv_cache.stride(0) < kv_cache.shape[1]*132 or kv_cache.stride(0)%4):
+        raise ValueError("cache requires contiguous page payloads and aligned nonoverlapping pages")
     if q.data_ptr()%4 or kv_cache.data_ptr()%4:
         raise ValueError("Q/cache must have 4-byte aligned storage")
     if weights.dtype != torch.float32 or tuple(weights.shape) != (b*r,h):
@@ -142,6 +153,8 @@ def paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables,
         raise ValueError("max_model_len must be a positive int32 value")
     kid = _resolve_paged_mqa_kernel(kernelId,rows=b*r,max_len=max_model_len,arch=arch,
                                      heads=h,next_n=r,cache_tokens=kv_cache.shape[0]*kv_cache.shape[1])
+    if not kv_cache.is_contiguous() and not (arch == "gfx938" and kv_cache.shape[1] == 64 and kid >= 6):
+        raise ValueError("strided cache requires gfx938 page64 ID6/7")
     if kid < 6 and kv_cache.shape[1] != 1:
         raise ValueError("kernel IDs 0-5 require cache page size S=1")
     if type(clean_logits) is not bool:
@@ -157,3 +170,6 @@ def paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables,
         out.fill_(-float("inf"))
     _paged_mqa_logits_opus(q,kv_cache,weights,context_lens,block_tables,out,max_model_len,kid)
     return out
+
+# Public capability for callers selecting layouts before native dispatch.
+paged_mqa_logits.supports_page_stride = True
