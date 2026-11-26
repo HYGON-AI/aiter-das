@@ -6,7 +6,7 @@ import argparse
 import torch
 import pandas as pd
 
-from aiter.fused_moe import fused_topk, torch_moe
+from aiter.fused_moe import fused_topk
 from aiter import dtypes, ActivationType
 from aiter.test_common import checkAllclose, perftest
 from aiter.moe import (
@@ -18,22 +18,14 @@ from aiter.moe import (
 )
 from aiter.ops.quant import pertoken_quant
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.moe_c_golden import compare_tensors, run_fp8_channelwise_golden
+from aiter.moe_c_golden import (
+    run_fp8_channelwise_golden,
+    run_int8_channelwise_golden,
+)
 import aiter
 
 
 torch.set_default_device("cuda")
-
-
-@perftest(num_warmup=1, num_iters=2)
-def _run_torch_ref(hidden_states, w1, w2, topk_weights, topk_ids):
-    return torch_moe(
-        hidden_states,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-    )
 
 
 @perftest(num_warmup=10, num_iters=100, num_rotate_args=1,testGraph=True)
@@ -225,12 +217,17 @@ def test_aiter_moe_w8a8_channelwise(m, k, n, e, topk, in_dtype, out_dtype, quant
             e,
         )
     else:
-        ref_out, _ = _run_torch_ref(
-            data["input_ref"],
-            data["w1_ref"],
-            data["w2_ref"],
+        ref_out = run_int8_channelwise_golden(
+            data["input"],
+            data["w1_qweight"],
+            data["w2_qweight"],
             data["topk_weights"],
             data["topk_ids"],
+            out_dtype,
+            data["w1_scales"],
+            data["w2_scales"],
+            data["a1_scales"],
+            e,
         )
 
     # Shuffle weights if the backend requires it (e.g. moe_c marlin layout)
@@ -263,7 +260,6 @@ def test_aiter_moe_w8a8_channelwise(m, k, n, e, topk, in_dtype, out_dtype, quant
     )
 
 
-    # compare_tensors(aiter_out, ref_out.to(aiter_out.dtype))
     # Compare in aiter_out's dtype since reference dtype may differ by backend.
     msg = f"[{tag}] {m=}, backend={moe_cfg.solution_type}"
     assert torch.isfinite(aiter_out).all(), (
