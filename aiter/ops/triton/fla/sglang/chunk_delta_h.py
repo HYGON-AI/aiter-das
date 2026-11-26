@@ -124,6 +124,7 @@ def launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     V: int,
     BT: int,
     kernel_cfg: dict | None,
+    inplace_update: bool = True,
 ):
     global HAS_DUMPED_CHUNK_DELTA_H_KERNEL_METADATA
 
@@ -142,6 +143,7 @@ def launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         h=h,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
+        stride_state_slot=initial_state.stride(0) if initial_state is not None else 0,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
@@ -151,7 +153,7 @@ def launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         V=V,
         BT=BT,
         BV=cfg["BV"],
-        INPLACE_UPDATE=True,
+        INPLACE_UPDATE=inplace_update and initial_state is not None,
         num_warps=cfg["num_warps"],
         num_stages=cfg["num_stages"],
     )
@@ -192,6 +194,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     h,
     initial_state,
     initial_state_indices,
+    stride_state_slot: tl.constexpr,
     cu_seqlens,
     chunk_offsets,
     T,
@@ -243,16 +246,21 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_k = Hg * K
     stride_w = H * K
 
-    index = tl.load(initial_state_indices + i_n).to(tl.int32)
-    h0 = initial_state + index * stride_h
-    ht = initial_state + index * stride_h
+    index = (
+        tl.load(initial_state_indices + i_n).to(tl.int64)
+        if initial_state_indices is not None
+        else i_n.to(tl.int64)
+    )
+    valid_state = index >= 0
+    h0 = initial_state
+    ht = initial_state
     if USE_INITIAL_STATE:
-        h0 = h0 + i_h * V * K
+        h0 = initial_state + index * stride_state_slot + i_h * V * K
     if INPLACE_UPDATE:
-        ht = ht + i_h * V * K
+        ht = initial_state + index * stride_state_slot + i_h * V * K
 
     # load initial state
-    if USE_INITIAL_STATE:
+    if USE_INITIAL_STATE and valid_state:
         p_h0_1 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
         b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
         if K > 64:
@@ -411,7 +419,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_h4 += tl.trans(tl.dot(b_k4, b_v))
 
     # epilogue
-    if INPLACE_UPDATE:
+    if INPLACE_UPDATE and valid_state:
         p_ht = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
         tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
         if K > 64:
@@ -447,25 +455,22 @@ def chunk_gated_delta_rule_fwd_h(
     use_exp2: bool = False,
     transpose_state_layout: bool = True,
     kernel_cfg: dict | None = None,
+    chunk_offsets: torch.LongTensor | None = None,
+    inplace_update: bool = True,
 ):
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = chunk_size
 
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, chunk_size)
-        if cu_seqlens is not None
-        else None
-    )
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     # N: the actual number of sequences in the batch with either equal or variable lengths
     if cu_seqlens is None:
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
     else:
-        N, NT, chunk_offsets = (
-            len(cu_seqlens) - 1,
-            len(chunk_indices),
-            prepare_chunk_offsets(cu_seqlens, BT),
-        )
+        N, NT = len(cu_seqlens) - 1, len(chunk_indices)
+        if chunk_offsets is None:
+            chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
     h = k.new_empty(B, NT, H, V, K)
@@ -494,5 +499,6 @@ def chunk_gated_delta_rule_fwd_h(
         # use_exp2=use_exp2,
         # transpose_state_layout=transpose_state_layout,
         kernel_cfg=kernel_cfg,
+        inplace_update=inplace_update,
     )
     return h, v_new
