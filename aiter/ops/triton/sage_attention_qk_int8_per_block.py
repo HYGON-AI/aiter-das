@@ -18,8 +18,7 @@ import json
 import torch, math
 import triton
 import triton.language as tl
-from triton.utils.hcutuner import get_gpu_label
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.core import get_sage_attention_config_path
 import functools
 
 @triton.jit
@@ -156,7 +155,9 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
 def _get_config(key, head_dim):
     if not hasattr(_get_config, "_config_dict"):
         try:
-            config_path = f"{AITER_TRITON_CONFIGS_PATH}/sage_attention/_attn_fwd-device={get_gpu_label()}-dtype=f16_f16_f16_f32_f32_f16_f32.json"
+            config_path = get_sage_attention_config_path(
+                "_attn_fwd", "f16_f16_f16_f32_f32_f16_f32"
+            )
             print(f"config_path={config_path}")
             with open(config_path, "r") as file:
                 config = json.load(file)
