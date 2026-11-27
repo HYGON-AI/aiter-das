@@ -18,8 +18,7 @@ import json
 import torch
 import triton
 import triton.language as tl
-from triton.utils.hcutuner import get_gpu_label
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.core import get_sage_attention_config_path
 import functools
 
 
@@ -66,7 +65,9 @@ def quant_per_block_int8_kernel(Input, Output, Scale, L,
 def _get_config(key, blk):
     if not hasattr(_get_config, "_config_dict"):
         try:
-            config_path = f"{AITER_TRITON_CONFIGS_PATH}/sage_attention/quant_per_block_int8_kernel-device={get_gpu_label()}-dtype=f16_i8_f32.json"
+            config_path = get_sage_attention_config_path(
+                "quant_per_block_int8_kernel", "f16_i8_f32"
+            )
             print(f"config_path={config_path}")
             with open(config_path, "r") as file:
                 config = json.load(file)

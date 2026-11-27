@@ -7,6 +7,8 @@
 # See LICENSE and LICENSE.Apache-2.0.
 #
 # Modified by Hygon in 2026: Hygon SageAttention tuning and benchmarking.
+# When copying tuned JSONs into AITER, use device=<arch>_cu_<count> in the
+# filename (for example, device=gfx936_cu_80).
 
 import os
 import torch

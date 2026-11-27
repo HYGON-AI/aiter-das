@@ -18,8 +18,7 @@ limitations under the License.
 import torch, math
 import triton
 import triton.language as tl
-from triton.utils.hcutuner import get_gpu_label
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.core import get_sage_attention_config_path
 import functools
 import json
 
@@ -146,7 +145,9 @@ def _attn_causal_fwd(Q, K, V, Q_scale, K_scale, Out, Lse,
 def _get_config(key, head_dim):
     if not hasattr(_get_config, "_config_dict"):
         try:
-            config_path = f"{AITER_TRITON_CONFIGS_PATH}/_attn_causal_fwd-device={get_gpu_label()}-dtype=f16_f16_f16_f16_f32.json"
+            config_path = get_sage_attention_config_path(
+                "_attn_causal_fwd", "f16_f16_f16_f16_f32", subdir=""
+            )
             print(f"config_path={config_path}")
             with open(config_path, "r") as file:
                 config = json.load(file)
