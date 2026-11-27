@@ -200,6 +200,84 @@ def per_token_quant_int8(x):
 
     return x_q, scales
 
+
+@triton.jit
+def _silu_and_mul_quant_int8_kernel(
+    x_ptr,
+    xq_ptr,
+    scale_ptr,
+    topk_ids_ptr,
+    expert_mask_ptr,
+    stride_x,
+    stride_xq,
+    inter_dim,
+    num_experts: tl.constexpr,
+    HAS_EXPERT_MASK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    if HAS_EXPERT_MASK:
+        expert = tl.load(topk_ids_ptr + row_id)
+        valid = (expert >= 0) & (expert < num_experts)
+        enabled = tl.load(expert_mask_ptr + expert.to(tl.int64), mask=valid, other=0)
+        if enabled == 0:
+            return
+
+    cols = tl.arange(0, BLOCK)
+    mask = cols < inter_dim
+    row_offset = row_id.to(tl.int64) * stride_x
+    gate = tl.load(x_ptr + row_offset + cols, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(x_ptr + row_offset + inter_dim + cols, mask=mask, other=0.0).to(tl.float32)
+    y = (gate * tl.sigmoid(gate)) * up
+
+    absmax = tl.maximum(tl.max(tl.abs(y)), 1e-10)
+    scale_x = absmax / 127.0
+    y_q = libdevice.nearbyint(y * (127.0 / absmax)).to(tl.int8)
+
+    tl.store(xq_ptr + row_id.to(tl.int64) * stride_xq + cols, y_q, mask=mask)
+    tl.store(scale_ptr + row_id, scale_x)
+
+
+def silu_and_mul_quant_int8(
+    x: torch.Tensor,
+    out_q: torch.Tensor,
+    out_scale: torch.Tensor,
+    *,
+    topk_ids: Optional[torch.Tensor] = None,
+    num_experts: int = 0,
+    expert_mask: Optional[torch.Tensor] = None,
+):
+    """Fused SiLU-and-mul + per-token INT8 quantization, skipping non-local EP slots."""
+    assert x.is_contiguous() and out_q.is_contiguous() and out_scale.is_contiguous()
+    M = x.shape[0]
+    inter_dim = out_q.shape[-1]
+    assert x.shape[-1] == 2 * inter_dim
+    BLOCK = triton.next_power_of_2(inter_dim)
+    if BLOCK >= 4096:
+        num_warps = 4
+    elif BLOCK >= 2048:
+        num_warps = 2
+    else:
+        num_warps = min(max(BLOCK // 256, 1), 8)
+    has_mask = expert_mask is not None and topk_ids is not None
+    _silu_and_mul_quant_int8_kernel[(M,)](
+        x,
+        out_q,
+        out_scale,
+        topk_ids.reshape(-1) if has_mask else x,
+        expert_mask if has_mask else x,
+        stride_x=x.stride(-2),
+        stride_xq=out_q.stride(-2),
+        inter_dim=inter_dim,
+        num_experts=num_experts if has_mask else 0,
+        HAS_EXPERT_MASK=has_mask,
+        BLOCK=BLOCK,
+        num_warps=num_warps,
+        num_stages=1,
+    )
+    return out_q, out_scale
+
+
 # ck_sorting算子
 def moe_sorting_ck(
     topk_ids,
@@ -4223,9 +4301,31 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
         (M, topk_ids.shape[1], w2.shape[1]))
 
     # This needs separate memory since it's used concurrently with cache1
-    intermediate_cache2 = torch.empty((M * top_k_num, N // 2),
-                                      device=hidden_states.device,
-                                      dtype=compute_dtype)
+    use_fused_silu_quant_int8 = (
+        use_int8_w8a8
+        and block_shape is None
+        and a2_scale is None
+        and activation == "silu"
+        and is_gated
+        and gemm1_alpha is None
+        and gemm1_limit is None
+    )
+    if use_fused_silu_quant_int8:
+        intermediate_cache2 = torch.empty((M * top_k_num, N // 2),
+                                          device=hidden_states.device,
+                                          dtype=torch.int8)
+        fused_a2_scale = torch.empty((M * top_k_num, 1),
+                                     device=hidden_states.device,
+                                     dtype=torch.float32)
+    else:
+        intermediate_cache2 = torch.empty((M * top_k_num, N // 2),
+                                          device=hidden_states.device,
+                                          dtype=compute_dtype)
+        fused_a2_scale = None
+    expert_mask = (
+        (expert_map >= 0).to(dtypes.i32).contiguous()
+        if expert_map is not None else None
+    )
 
     compute_type = _torch_dtype_to_triton(compute_dtype)
 
@@ -4268,6 +4368,9 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
             intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
             intermediate_cache2 = intermediate_cache2[:tokens_in_chunk *
                                                       topk_ids.shape[1]]
+            if fused_a2_scale is not None:
+                fused_a2_scale = fused_a2_scale[:tokens_in_chunk *
+                                                topk_ids.shape[1]]
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
 
         if use_w16a16 and w16a16_config is not None:
@@ -4373,7 +4476,7 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                                                                                     model_dim,
                                                                                     compute_dtype,
                                                                                     BM,
-                                                                                    expert_mask=None,
+                                                                                    expert_mask=expert_mask,
                                                                                 )
 
         else:
@@ -4399,7 +4502,7 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                                                                                     model_dim,
                                                                                     compute_dtype,
                                                                                     config["BLOCK_SIZE_M"],
-                                                                                    expert_mask=None,
+                                                                                    expert_mask=expert_mask,
                                                                                 )
 
         invoke_fused_moe_kernel_marlin(curr_hidden_states,
@@ -4434,6 +4537,16 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
 
         if fuse_silu:
             pass  # GEMM1 wrote the activated intermediate directly.
+        elif use_fused_silu_quant_int8:
+            silu_and_mul_quant_int8(
+                intermediate_cache1.view(-1, N),
+                intermediate_cache2,
+                fused_a2_scale,
+                topk_ids=curr_topk_ids,
+                num_experts=global_num_experts,
+                expert_mask=expert_mask,
+            )
+            curr_a2_scale = fused_a2_scale
         elif (activation == "silu" and is_gated
                 and gemm1_alpha is None and gemm1_limit is None):
             moe_c_silu_and_mul(
@@ -4510,15 +4623,27 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
 
         mode_use_triton_moe_sum = True
 
-        if top_k_num == 1:
+        if top_k_num == 1 and expert_mask is None:
             moe_out = intermediate_cache3[:, 0, :out_hidden_states.shape[1]]
             out_hidden_states[begin_chunk_idx:end_chunk_idx].copy_(moe_out)
             if routed_scaling_factor != 1.0:
                 out_hidden_states[begin_chunk_idx:end_chunk_idx].mul_(routed_scaling_factor)
         elif mode_use_triton_moe_sum:
-            # triton_moe_sum(intermediate_cache3.view(*intermediate_cache3.shape),
-            #                out_hidden_states[begin_chunk_idx:end_chunk_idx])
-            triton_moe_sum(intermediate_cache3.view(*intermediate_cache3.shape), out_hidden_states[begin_chunk_idx:end_chunk_idx] , routed_scaling_factor)
+            if expert_mask is not None:
+                triton_moe_sum(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                    routed_scaling_factor,
+                    topk_ids=curr_topk_ids.contiguous(),
+                    num_experts=global_num_experts,
+                    expert_mask=expert_mask,
+                )
+            else:
+                triton_moe_sum(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                    routed_scaling_factor,
+                )
         else:
             moe_c_moe_sum_opt_v2(intermediate_cache3.view(*intermediate_cache3.shape),
                         out_hidden_states[begin_chunk_idx:end_chunk_idx],routed_scaling_factor)

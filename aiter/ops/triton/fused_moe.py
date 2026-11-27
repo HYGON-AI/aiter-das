@@ -106,16 +106,29 @@ def moe_sum_kernel(
                 enabled = tl.load(expert_mask_ptr + expert.to(tl.int64),
                                   mask=route_valid, other=0)
                 route_valid = route_valid & (enabled != 0)
-        input_ptrs = input_row_ptr + (
-            k * stride_input_k
-            + offs_n * stride_input_n
-        )
-        if n_dividable and not has_route_ids:
-            x = tl.load(input_ptrs)
+        if not has_route_ids:
+            input_ptrs = input_row_ptr + (
+                k * stride_input_k
+                + offs_n * stride_input_n
+            )
+            if n_dividable:
+                x = tl.load(input_ptrs)
+            else:
+                x = tl.load(input_ptrs, mask=mask_n, other=0.0)
+            acc += x.to(tl.float32)
         else:
-            # Skipped routes can contain stale values or NaNs; do not read them.
-            x = tl.load(input_ptrs, mask=mask_n & route_valid, other=0.0)
-        acc += x.to(tl.float32)
+            # Skipped routes can contain stale values or NaNs; branch past them
+            # so non-local EP slots issue zero vector HBM loads.
+            if route_valid:
+                input_ptrs = input_row_ptr + (
+                    k * stride_input_k
+                    + offs_n * stride_input_n
+                )
+                if n_dividable:
+                    x = tl.load(input_ptrs)
+                else:
+                    x = tl.load(input_ptrs, mask=mask_n, other=0.0)
+                acc += x.to(tl.float32)
 
     acc *= routed_scaling_factor
     acc = acc.to(compute_type)
